@@ -18,6 +18,7 @@ omp calls `consult.py` through its existing bash tool when a materially importan
 
 - default: `railway-codex/gpt-6-astra` through CLIProxyAPI's Responses API. model fallback and automatic agent retries are disabled.
 - omp: `18.3.2`, Bun: `1.4.2`. the image includes Node 22, Corepack, git, gh and build tools. target dependencies are installed by omp using the repository's own instructions.
+- runner commits use `autokas <autokas-omp@kasthe.dev>` as both author and committer. GitHub comments still use the account that owns the configured PAT.
 - tools: read, bash, edit, write, grep, glob, lsp and todo. no custom skills are currently selected. extension discovery is disabled. normal repository instructions remain available.
 - one single-use worker container, one input at a time, 2 CPU, 8 GiB, one-hour timeout. waiting inputs use Modal's queue. each invocation has a fresh temporary home and checkout, and Modal shuts down the container after that job.
 - each job fetches `refs/pull/N/head`, checks out the PR branch and verifies its head SHA. worktrunk is unnecessary for a disposable single-job clone and was removed at kas's request.
