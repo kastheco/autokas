@@ -177,6 +177,9 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if not prompt:
         return None
     fingerprint = hashlib.sha256(prompt.encode()).hexdigest()
+    approval = CONFIG["owner_approvals"].get(f"{repo}#{number}", "")
+    if approval:
+        fingerprint += ":approval:" + hashlib.sha256(approval.encode()).hexdigest()
     return {"repo": repo, "pr": number, "comment": comment["id"], "kind": event, "prompt": prompt,
             "key": f"{repo}:{event}:{comment['id']}:{fingerprint}"}
 
