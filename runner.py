@@ -52,7 +52,7 @@ IMAGE = (
 )
 
 PROMPT_SECTION = re.compile(
-    r"<summary>[^<]*Prompt for AI Agents[^<]*</summary>\s*\n+"
+    r"<summary>[^<]*(?P<heading>Prompt for AI Agents|Prompt to fix review comments)[^<]*</summary>\s*\n+"
     r"(?P<fence>`{3,})[^\n]*\n(?P<prompt>.*?)\n(?P=fence)\s*\n+\s*</details>",
     re.DOTALL | re.IGNORECASE,
 )
@@ -131,7 +131,9 @@ def log(event: str, **fields: Any) -> None:
 
 def agent_prompt(body: str) -> str:
     """Extract only CodeRabbit's fenced agent prompt, never its shell examples."""
-    return "\n\n".join(match["prompt"].strip() for match in PROMPT_SECTION.finditer(body))
+    matches = list(PROMPT_SECTION.finditer(body))
+    individual = [match for match in matches if match["heading"].lower() == "prompt for ai agents"]
+    return "\n\n".join(match["prompt"].strip() for match in (individual or matches))
 
 
 def bot(user: dict[str, Any]) -> bool:
@@ -140,15 +142,18 @@ def bot(user: dict[str, Any]) -> bool:
 
 
 def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Accept only approved PR comment events containing an agent prompt."""
-    if event not in {"issue_comment", "pull_request_review_comment"} or payload.get("action") not in {"created", "edited"}:
+    """Accept approved CodeRabbit comments and completed reviews with fix prompts."""
+    actions = {"submitted", "edited"} if event == "pull_request_review" else {"created", "edited"}
+    if event not in {"issue_comment", "pull_request_review_comment", "pull_request_review"} or payload.get("action") not in actions:
         return None
     repo = payload.get("repository", {}).get("full_name")
     if not isinstance(repo, str) or (
         repo not in CONFIG["repositories"] and repo.split("/", 1)[0] not in CONFIG["repository_owners"]
     ) or not bot(payload.get("sender", {})):
         return None
-    comment = payload.get("comment", {})
+    comment = payload.get("review" if event == "pull_request_review" else "comment", {})
+    if event == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
+        return None
     if not bot(comment.get("user", {})):
         return None
     pr = payload.get("issue" if event == "issue_comment" else "pull_request", {})
@@ -269,8 +274,13 @@ def worker(job: dict[str, Any]) -> None:
                     raise RuntimeError("configured model is not available from the proxy")
             log("proxy_connected", model=CONFIG["model"])
             repo, number = job["repo"], job["pr"]
-            comment_path = "issues/comments" if job["kind"] == "issue_comment" else "pulls/comments"
+            if job["kind"] == "pull_request_review":
+                comment_path = f"pulls/{number}/reviews"
+            else:
+                comment_path = "issues/comments" if job["kind"] == "issue_comment" else "pulls/comments"
             comment = github(f"repos/{repo}/{comment_path}/{job['comment']}")
+            if job["kind"] == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
+                raise RuntimeError("review is pending or dismissed")
             relation = comment.get("issue_url" if job["kind"] == "issue_comment" else "pull_request_url")
             relation_type = "issues" if job["kind"] == "issue_comment" else "pulls"
             if not bot(comment["user"]) or relation != f"https://api.github.com/repos/{repo}/{relation_type}/{number}" or agent_prompt(comment.get("body") or "") != job["prompt"]:

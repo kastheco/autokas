@@ -79,6 +79,8 @@ for rollback, deploy the last known-good source with the same command after acti
 
 
 
+GitHub sends comments attached to a submitted review as `pull_request_review`, even though the interface calls them comments. the runner accepts submitted and edited completed reviews, rejects pending or dismissed reviews, and re-fetches the exact review under its PR before starting omp. individual fenced “Prompt for AI Agents” sections take precedence over the aggregate “Prompt to fix review comments” block, so the same findings are not duplicated within a review. an aggregate-only review is also supported.
+
 ## provider accounts
 
 use the existing Railway service's native login commands. these thin helpers target the exact existing project/environment/service:
@@ -104,12 +106,12 @@ add and verify a replacement account before changing the default. select its nat
 ## one live verification path
 
 1. select an approved repository and an open PR with an authorized publication scope. ensure its webhook is active. material changes still require the configured real consultation and any exact owner approval.
-2. obtain a fresh real CodeRabbit comment containing its fenced “Prompt for AI Agents”. no hand-forged event or direct worker invocation counts.
+2. obtain a fresh real CodeRabbit comment or submitted review containing a fenced “Prompt for AI Agents” or “Prompt to fix review comments”. automatic-trigger verification requires a real GitHub delivery. a user-authorized manual replay may fetch an existing review from GitHub and submit that unchanged review through the signed receiver, but must be reported as manual rather than proof of automatic delivery.
 3. observe `dispatched`, `started`, `proxy_connected` and `worktree_ready` in native Modal logs. confirm the source revision, selected provider/model and fetched PR head in the disposable checkout.
 4. inspect omp's diff, repository checks and behavioral smoke evidence. confirm its commit is the PR's remote head and the process terminated. `update_confirmed` checks head equality, not whether the diff meets the business requirement. kas confirms that separately.
 5. after Jarvis integration, exercise the material-change rule through this same path. consultation is advice, not owner approval. unavailable consultation, disagreement or missing approval must prevent publication.
 
-repeat the same path after an update or provider switch, and with a later fresh job to prove credentials survive without another login. no workstation tunnel or old runner may be required. there is no separate verification runner or permanent test framework.
+repeat the same path after an update or provider switch, and with a later fresh job to prove credentials survive without another login. no workstation tunnel or old runner may be required. `python -m unittest test_runner` covers review intake, identity and relationship boundaries, review state, and prompt selection without external calls.
 
 ## logs, stopping and duplicates
 
