@@ -17,6 +17,7 @@ failed commands are not automatic stop conditions. omp must diagnose and repair 
 
 
 
+
 ## configuration
 
 `config.json` contains the repository and owner allowlists, PR-specific owner approvals, timeout, tools, versions, git author and model. `omp_models` is native omp `models.yml` content and `omp_settings` is native `config.yml` content. the worker writes these unchanged into its fresh agent home. credentials remain environment references, never model-file values.
