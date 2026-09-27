@@ -119,6 +119,8 @@ add and verify a replacement account before changing the default. select its nat
 
 repeat the same path after an update or provider switch, and with a later fresh job to prove credentials survive without another login. no workstation tunnel or old runner may be required. `python -m unittest test_runner` covers review intake, identity and relationship boundaries, review state, prompt selection, and docs follow-up merge safety without external calls.
 
+docs updates skip merged source PRs whose changed files are all inside the configured documentation folders. an empty file list also skips the agent. code-only and mixed source changes continue to the docs agent, which may edit only those configured folders. `python -m unittest test_runner.DocsMergeTests` covers this routing, including folder-name lookalikes such as `docs-extra/` and `src/docs/` that aren't inside a configured `docs` folder.
+
 docs follow-up squash merges send the validated `final_head` as GitHub's `sha` precondition. if the head changes before the merge request, GitHub rejects the mismatch instead of merging an unvalidated commit. the runner keeps its existing fallback reads and merge-confirmation checks without retrying the merge against a new head. `python -m unittest test_runner.DocsMergeTests` covers a changed head, a successful merge, a lost successful response, and missing merge confirmation.
 
 ## logs, stopping and duplicates

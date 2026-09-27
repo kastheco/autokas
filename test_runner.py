@@ -129,6 +129,7 @@ class DocsMergeTests(unittest.TestCase):
             "source_branch": "feature",
         }
         self.api = "repos/example/docs/pulls"
+        self.source_files = [{"filename": "src/service.py"}]
         self.branch = f'{CONFIG["docs_update"]["branch_prefix"]}1-{"a" * 12}'
         self.followup = {
             "number": 2,
@@ -151,6 +152,7 @@ class DocsMergeTests(unittest.TestCase):
             mocks.append(patcher.start())
             self.addCleanup(patcher.stop)
         mocks[3].return_value.wait.return_value = 0
+        self.process = mocks[3]
         self.log = mocks[5]
 
     def read_github(self, path):
@@ -160,8 +162,10 @@ class DocsMergeTests(unittest.TestCase):
                 "merge_commit_sha": self.job["source_sha"],
                 "base": self.followup["base"], "head": self.followup["head"],
             }
-        if path in (f"{self.api}/1/files?per_page=100", f"{self.api}/2/files?per_page=100"):
-            if path == f"{self.api}/2/files?per_page=100" and self.move_head:
+        if path == f"{self.api}/1/files?per_page=100":
+            return self.source_files
+        if path == f"{self.api}/2/files?per_page=100":
+            if self.move_head:
                 self.current_head = "c" * 40
             return [{"filename": "docs/guide.md"}]
         if path == f"{self.api}?state=open&head=example:{self.branch}&base=main":
@@ -204,6 +208,31 @@ class DocsMergeTests(unittest.TestCase):
         docs_worker(self.job, self.root, {}, self.run_command,
                     time.monotonic() + 60, self.root / "settings.json")
 
+    def test_docs_only_and_empty_sources_stop_before_agent_work(self) -> None:
+        for files in ([], [{"filename": "docs/guide.md"}, {"filename": "docs/api/auth.md"}]):
+            with self.subTest(files=files), patch.object(
+                self, "run_command", side_effect=AssertionError("source must be skipped")
+            ) as run:
+                self.source_files = files
+                self.run_worker()
+                run.assert_not_called()
+                self.process.assert_not_called()
+                self.assertIsNone(self.merged_head)
+                self.assertEqual(self.merge_attempts, 0)
+
+    def test_mixed_source_reaches_docs_update(self) -> None:
+        self.source_files.append({"filename": "docs/guide.md"})
+        self.run_worker()
+        self.assertEqual(self.merged_head, self.final_head)
+
+    def test_docs_folder_lookalikes_do_not_skip_code_changes(self) -> None:
+        for path in ("docs-extra/service.py", "src/docs/service.py"):
+            with self.subTest(path=path):
+                self.source_files = [{"filename": path}]
+                self.merged_head = None
+                self.run_worker()
+                self.assertEqual(self.merged_head, self.final_head)
+
     def test_changed_head_is_not_merged_or_retried(self) -> None:
         self.move_head = True
         with self.assertRaisesRegex(RuntimeError, "docs pull request merge failed or is uncertain"):
@@ -212,7 +241,7 @@ class DocsMergeTests(unittest.TestCase):
         self.assertEqual(self.merge_attempts, 1)
         self.log.assert_not_called()
 
-    def test_validated_head_is_merged(self) -> None:
+    def test_validated_head_is_merged_for_code_only_source(self) -> None:
         self.run_worker()
         self.assertEqual(self.merged_head, self.final_head)
         self.assertEqual(self.log.call_args.args[0], "docs_update_complete")

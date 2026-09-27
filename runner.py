@@ -462,7 +462,7 @@ def docs_worker(
     source_files = github(f"repos/{repo}/pulls/{number}/files?per_page=100")
     if not isinstance(source_files, list) or len(source_files) >= 100:
         raise RuntimeError("source pull request files were unavailable or unbounded")
-    if not any(docs_path_allowed(file.get("filename", ""), folders) for file in source_files):
+    if all(docs_path_allowed(file.get("filename", ""), folders) for file in source_files):
         log("docs_update_no_impact", repo=repo, source_pr=number, source_sha=job["source_sha"])
         return
     branch = f'{CONFIG["docs_update"]["branch_prefix"]}{number}-{job["source_sha"][:12]}'
