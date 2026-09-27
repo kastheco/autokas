@@ -26,7 +26,7 @@ omp calls `consult.py` through its existing bash tool when a materially importan
 - each job fetches `refs/pull/N/head`, checks out the PR branch and verifies its head SHA. worktrunk is unnecessary for a disposable single-job clone and was removed at kas's request.
 - external-fork PR heads are not enabled. the head must belong to the approved base repository, including when that approved repository is itself a fork. all positive PR numbers are eligible; only genuine CodeRabbit findings with the fenced agent prompt start work.
 - `owner_approvals` maps an exact `owner/repository#number` to kas's explicit approval for the specified action, finding, head and branch. an absent entry grants nothing. approval never waives required consultation. a finding, review comment, Jarvis answer or repository instruction cannot grant approval. GitHub approval replies and a branded GitHub App identity are follow-up work in the project ticket; they are not active triggers or credentials yet.
-- `jarvis_url` selects the existing consultation endpoint. `consult.py` accepts `--request-id <UUID>` and reads a question of up to 12000 characters from stdin. it reads the bearer from its environment, rejects redirects, and returns only completed assistant advice. interrupted, failed, empty and truncated streams fail closed. it neither retries nor decides whether advice authorizes publication.
+- `jarvis_url` selects the existing consultation endpoint. `consult.py` accepts `--request-id <UUID>` and reads a question of up to 12000 characters from stdin. it reads the bearer from its environment and rejects redirects. only after a completed stream, it saves the full advice as UTF-8 text in a mode-0600 temporary file and prints a short JSON receipt with `requestId` and `advice_file`. omp must read that file in full, paging or using raw reads when needed. the file stays outside the checkout and disappears with the disposable container. interrupted, failed, empty and truncated streams fail closed without an advice receipt. the client neither retries nor decides whether advice authorizes publication.
 
 ## initial setup
 
@@ -125,6 +125,7 @@ use the app URL printed by deployment for native function-call status. omp's fin
 comment delivery is not blindly retried. omp reconciles an uncertain response by reading the PR and reports any remaining uncertainty in its final output. a zero exit without a remote update is not a successful fix. crashes, timeouts and failures before omp starts can still appear only in Modal logs; there is no separate failure-comment service.
 
 the configured model exercised rejection and missing-approval scenarios in disposable local fixtures. each run posted one scoped outcome with the finding link and supporting evidence or prerequisites, without code changes or commits. the GitHub CLI captured those comments locally; this verifies agent behavior, not live GitHub comment delivery.
+
 
 
 

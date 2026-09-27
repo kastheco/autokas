@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 import uuid
@@ -77,7 +78,15 @@ def main() -> int:
     except (OSError, urllib.error.URLError, ValueError, KeyError, TypeError):
         print("blocked: Jarvis response failed or was incomplete; no automatic retry", file=sys.stderr)
         return 1
-    print(json.dumps({"requestId": str(args.request_id), "advice": answer.replace(token, "[redacted]")}))
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="jarvis-advice-", suffix=".txt", delete=False,
+        ) as advice:
+            advice.write(answer.replace(token, "[redacted]"))
+    except OSError:
+        print("blocked: Jarvis completed but advice could not be saved; no automatic retry", file=sys.stderr)
+        return 1
+    print(json.dumps({"requestId": str(args.request_id), "advice_file": advice.name}))
     return 0
 
 
