@@ -10,7 +10,8 @@ the project ticket defines the scope. `runner.py` dispatches the job, not the ag
 
 omp calls `consult.py` through its existing bash tool when a materially important or business-logic change requires consultation. Jarvis owns any Kimmy consultation. unavailable or incomplete consultation, pending Kimmy advice, disagreement, or missing required owner approval stops edits and publication. the bootstrap consultation bypass is gone.
 
-failed commands are not automatic stop conditions. omp must diagnose and repair in-scope code, dependency resolution, test setup and its own smoke harness, then rerun the affected checks. it must not weaken assertions, hide failures or publish with failing relevant checks. existing approval covers these repair steps; only an unresolved blocker outside the available scope or authority ends the attempt. consultation, uncertain external actions and PR-head safety checks remain unchanged.
+failed commands are not automatic stop conditions. omp must diagnose and repair in-scope code, dependency resolution, test setup and its own smoke harness, then rerun affected checks. after required completed Jarvis advice supports the change and required owner approval is present, the default is to publish the best reasoned, in-scope fix to the PR branch even if validation remains incomplete or some checks still fail. this is not permission to skip available checks, weaken assertions or hide failures. the PR comment must separate passed, failed and unrun checks, explain the approach and remaining risks, and explicitly label a limited result as “published with validation limits.” existing approval covers in-scope repairs without repeated approval requests. consultation, uncertain external actions and PR-head safety boundaries remain unchanged, and this policy never authorizes merging, deployment or live account/business actions.
+
 
 
 
