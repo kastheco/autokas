@@ -71,10 +71,10 @@ provider OAuth credentials stay in the existing Railway proxy volume, not Modal.
 with the approved Modal profile and `main` environment active, the initial and update command is the same:
 
 ```sh
-modal deploy runner.py
+modal deploy --strategy rolling runner.py
 ```
 
-keep the app/function names stable. Modal prints the webhook URL and app logs link. before an update, disable intake and let active work finish. a source push does not deploy. automatic deployment is deferred in the project ticket; jobs continue to execute on Modal. the logs' `revision` hashes the paths and bytes of `runner.py`, `config.json`, `consult.py`, the voice profile and every bundled skill asset, including uncommitted changes. the job also logs its selected model, PR, starting head, local head, remote head and process exit.
+keep the app/function names stable. Modal prints the webhook URL and app logs link. ordinary code and policy updates use [rolling deployment](https://modal.com/docs/guide/managing-deployments#deployment-strategies): existing inputs finish on the old version while traffic moves to new containers. do not wait for global idleness or interrupt those jobs. a source push does not deploy. automatic deployment is deferred in the project ticket; jobs continue to execute on Modal. the logs' `revision` hashes the paths and bytes of `runner.py`, `config.json`, `consult.py`, the voice profile and every bundled skill asset, including uncommitted changes. the job also logs its selected model, PR, starting head, local head, remote head and process exit.
 
 after changing a Modal secret, use `modal deploy --strategy recreate runner.py` once intake is disabled and active jobs have finished. a normal rolling deploy kept a warm receiver on the previous signing key during the bootstrap trial. the recreate deployment refreshed it, and the same signed request then passed. verify the receiver before enabling deliveries.
 
