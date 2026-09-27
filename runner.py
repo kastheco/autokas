@@ -561,7 +561,7 @@ def docs_worker(
     ):
         raise RuntimeError("docs pull request contains non-doc or unbounded changes")
     try:
-        github_request("PUT", f"{api_base}/pulls/{followup_number}/merge", {"merge_method": "squash"})
+        github_request("PUT", f"{api_base}/pulls/{followup_number}/merge", {"merge_method": "squash", "sha": final_head})
     except Exception as error:
         merged = github(f"{api_base}/pulls/{followup_number}")
         if not merged.get("merged_at") or not merged.get("merge_commit_sha"):
