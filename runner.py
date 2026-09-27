@@ -366,7 +366,7 @@ def github(path: str) -> Any:
 
 
 
-@app.function(image=BASE_IMAGE, secrets=[WEBHOOK_SECRET, WORKER_SECRET], timeout=120)
+@app.function(image=BASE_IMAGE.add_local_file(ROOT / "config.json", "/root/config.json"), secrets=[WEBHOOK_SECRET, WORKER_SECRET], timeout=120)
 def register_webhooks() -> None:
     def set_hook_events(path: str, expected: list[str]) -> None:
         try:
