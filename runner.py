@@ -564,7 +564,11 @@ def docs_worker(
         github_request("PUT", f"{api_base}/pulls/{followup_number}/merge", {"merge_method": "squash", "sha": final_head})
     except Exception as error:
         merged = github(f"{api_base}/pulls/{followup_number}")
-        if not merged.get("merged_at") or not merged.get("merge_commit_sha"):
+        if (
+            not merged.get("merged_at")
+            or not merged.get("merge_commit_sha")
+            or merged.get("head", {}).get("sha") != final_head
+        ):
             raise RuntimeError("docs pull request merge failed or is uncertain") from error
     merged = github(f"{api_base}/pulls/{followup_number}")
     if not merged.get("merged_at") or not merged.get("merge_commit_sha"):

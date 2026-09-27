@@ -122,6 +122,7 @@ class DocsMergeTests(unittest.TestCase):
         self.merged_head = None
         self.merge_attempts = 0
         self.move_head = False
+        self.concurrent_merge = False
         self.lose_response = False
         self.omit_merge_commit = False
         self.job = {
@@ -173,6 +174,7 @@ class DocsMergeTests(unittest.TestCase):
         if path == f"{self.api}/2":
             return {
                 **self.followup,
+                "head": {**self.followup["head"], "sha": self.current_head},
                 "merged_at": "2026-09-27T00:00:00Z" if self.merged_head else None,
                 "merge_commit_sha": "d" * 40 if self.merged_head and not self.omit_merge_commit else None,
             }
@@ -184,6 +186,8 @@ class DocsMergeTests(unittest.TestCase):
         if method == "PUT" and path == f"{self.api}/2/merge":
             self.merge_attempts += 1
             if payload.get("sha", self.current_head) != self.current_head:
+                if self.concurrent_merge:
+                    self.merged_head = self.current_head
                 raise HTTPError(path, 409, "Head branch was modified", {}, None)
             self.merged_head = self.current_head
             if self.lose_response:
@@ -238,6 +242,16 @@ class DocsMergeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "docs pull request merge failed or is uncertain"):
             self.run_worker()
         self.assertIsNone(self.merged_head)
+        self.assertEqual(self.merge_attempts, 1)
+        self.log.assert_not_called()
+
+    def test_concurrent_merge_of_changed_head_is_not_confirmed(self) -> None:
+        self.move_head = True
+        self.concurrent_merge = True
+        with self.assertRaisesRegex(RuntimeError, "docs pull request merge failed or is uncertain"):
+            self.run_worker()
+        self.assertNotEqual(self.merged_head, self.final_head)
+        self.assertEqual(self.merged_head, self.current_head)
         self.assertEqual(self.merge_attempts, 1)
         self.log.assert_not_called()
 

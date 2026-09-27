@@ -121,7 +121,7 @@ repeat the same path after an update or provider switch, and with a later fresh 
 
 docs updates skip merged source PRs whose changed files are all inside the configured documentation folders. an empty file list also skips the agent. code-only and mixed source changes continue to the docs agent, which may edit only those configured folders. `python -m unittest test_runner.DocsMergeTests` covers this routing, including folder-name lookalikes such as `docs-extra/` and `src/docs/` that aren't inside a configured `docs` folder.
 
-docs follow-up squash merges send the validated `final_head` as GitHub's `sha` precondition. if the head changes before the merge request, GitHub rejects the mismatch instead of merging an unvalidated commit. the runner keeps its existing fallback reads and merge-confirmation checks without retrying the merge against a new head. `python -m unittest test_runner.DocsMergeTests` covers a changed head, a successful merge, a lost successful response, and missing merge confirmation.
+docs follow-up squash merges send the validated `final_head` as GitHub's `sha` precondition. if the head changes before the merge request, GitHub rejects the mismatch instead of merging an unvalidated commit. after a failed or lost merge response, fallback confirmation requires `merged_at`, `merge_commit_sha` and a PR head SHA matching `final_head`. the runner keeps its existing fallback reads and final merge-confirmation check without retrying the merge against a new head. `python -m unittest test_runner.DocsMergeTests` covers a changed head, a concurrent merge of a different head, a successful merge, a lost successful response, and missing merge confirmation.
 
 ## logs, stopping and duplicates
 
