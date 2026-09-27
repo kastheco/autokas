@@ -1,0 +1,8 @@
+{
+  "name": "omp-runner",
+  "private": true,
+  "scripts": {
+    "login:codex": "railway ssh --project 00000000-0000-4000-8000-000000000002 --environment 00000000-0000-4000-8000-000000000004 --service 00000000-0000-4000-8000-000000000003 -- sh -c 'umask 077; exec /CLIProxyAPI/CLIProxyAPI -config /CLIProxyAPI/config.yaml --codex-device-login'",
+    "login:claude": "railway ssh --project 00000000-0000-4000-8000-000000000002 --environment 00000000-0000-4000-8000-000000000004 --service 00000000-0000-4000-8000-000000000003 -- sh -c 'umask 077; exec /CLIProxyAPI/CLIProxyAPI -config /CLIProxyAPI/config.yaml --claude-login --no-browser'"
+  }
+}

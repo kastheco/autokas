@@ -1,0 +1,51 @@
+{
+  "app": "omp-runner",
+  "repositories": {
+    "example-org/example-app": {
+      "pull_requests": [],
+      "owner_approval": ""
+    }
+  },
+  "coderabbit": {
+    "login": "coderabbitai[bot]",
+    "id": 136622811
+  },
+  "timeout_seconds": 3600,
+  "omp_version": "18.3.2",
+  "bun_version": "1.4.2",
+  "model": "railway-codex/gpt-6-astra",
+  "jarvis_url": "https://advisor.example.invalid/api/jarvis/consult",
+  "tools": ["read", "bash", "edit", "write", "grep", "glob", "lsp", "todo"],
+  "skills": [],
+  "omp_models": {
+    "providers": {
+      "railway-codex": {
+        "baseUrl": "https://proxy.example.invalid/v1",
+        "api": "openai-responses",
+        "apiKey": "CLI_PROXY_API_KEY",
+        "models": [
+          {
+            "id": "gpt-6-astra",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "contextWindow": 272000,
+            "maxTokens": 32768
+          }
+        ]
+      }
+    }
+  },
+  "omp_settings": {
+    "retry": {"enabled": false, "modelFallback": false},
+    "modelRoles": {
+      "default": "railway-codex/gpt-6-astra",
+      "smol": "railway-codex/gpt-6-astra",
+      "slow": "railway-codex/gpt-6-astra",
+      "plan": "railway-codex/gpt-6-astra"
+    }
+  },
+  "git_author": {
+    "name": "omp runner",
+    "email": "omp-runner@users.noreply.github.com"
+  }
+}
