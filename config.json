@@ -1,11 +1,13 @@
 {
   "app": "omp-runner",
-  "repositories": {
-    "example-org/example-app": {
-      "pull_requests": [],
-      "owner_approval": ""
-    }
-  },
+  "repository_owners": ["kastheco"],
+  "repositories": [
+    "example-org/example-app",
+    "example-owner-1/example-repo-1",
+    "example-owner-1/example-repo-4",
+    "example-owner-1/example-repo-5"
+  ],
+  "owner_approvals": {},
   "coderabbit": {
     "login": "coderabbitai[bot]",
     "id": 136622811
@@ -16,7 +18,6 @@
   "model": "railway-codex/gpt-6-astra",
   "jarvis_url": "https://advisor.example.invalid/api/jarvis/consult",
   "tools": ["read", "bash", "edit", "write", "grep", "glob", "lsp", "todo"],
-  "skills": [],
   "omp_models": {
     "providers": {
       "railway-codex": {
