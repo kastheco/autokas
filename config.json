@@ -7,6 +7,19 @@
     "example-owner-1/example-repo-4",
     "example-owner-1/example-repo-5"
   ],
+  "docs_update": {
+    "webhook_url": "https://runner.example.invalid",
+    "branch_prefix": "docs-update/",
+    "repositories": {
+      "example-org/example-app": {"branch": "main", "folders": ["docs"]},
+      "example-org/example-repo-9": {"branch": "staging", "folders": ["docs"]},
+      "example-org/example-repo-7": {"branch": "staging", "folders": ["docs"]},
+      "example-org/example-repo-6": {"branch": "main", "folders": ["docs"]},
+      "example-org/example-repo-8": {"branch": "main", "folders": ["docs"]},
+      "example-org/example-repo-2": {"branch": "main", "folders": ["docs"]}
+    },
+    "tower_hook_id": 9000000009
+  },
   "owner_approvals": {
     "example-org/example-app#144": ""
   },
