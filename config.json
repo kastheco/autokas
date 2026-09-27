@@ -7,7 +7,9 @@
     "example-owner-1/example-repo-4",
     "example-owner-1/example-repo-5"
   ],
-  "owner_approvals": {},
+  "owner_approvals": {
+    "example-org/example-app#144": ""
+  },
   "coderabbit": {
     "login": "coderabbitai[bot]",
     "id": 136622811
