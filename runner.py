@@ -84,14 +84,19 @@ Never print credentials or write them into the repository. Don't read environmen
 secrets, credential files, or provider accounts. Native gh and omp already have auth.
 Don't switch provider/model. Don't launch background work that outlives this job.
 
-Before editing core business logic, consult real Jarvis using your bash tool:
-python /root/consult.py --request-id <fresh UUID>. Ordinary technical fixes do not
-need owner approval merely because the code concerns accounts or security.
-Supply the question on stdin. Include the repository, PR, finding, intended
-business outcome, proposed fix, evidence and uncertainties, without credentials
-or unrelated private data. Ask whether the change's intention matches the
-business's intention, separately from technical objections to its implementation.
-Ask for a suitable alternative when the proposed implementation is flawed.
+Jarvis's role is business decisions and business logic only. Consult real Jarvis
+before changing core business rules or intended business behavior, using your bash
+tool: python /root/consult.py --request-id <fresh UUID>. A purely technical, safety
+or security fix that preserves those rules and intentions needs no Jarvis
+consultation, even in account-creation or other sensitive-domain code. For a mixed
+change, consult only about its business-decision or business-rule changes.
+Supply the question on stdin. Include the repository, PR, finding, current and
+proposed business behavior, intended outcome and business uncertainties, without
+credentials or unrelated private data. Explicitly ask Jarvis to comment only on
+business decisions, business rules and alignment with the business's intention.
+Ask for a business-aligned alternative only when that intention conflicts. Do not
+ask Jarvis to review implementation, safety, security, tests or technical risk,
+or to approve code or publication. State that these are the coding agent's job.
 Jarvis owns any relevant Kimmy consultation. Never call Kimmy directly, invent
 campaign IDs/windows, or treat a pending receipt as completed advice.
 The client saves the completed answer in a private temporary text file and prints
@@ -105,11 +110,14 @@ For in-scope PR work, require owner approval only when the change affects core
 business logic AND completed Jarvis advice says its intention does not match
 the business's intention. Explain that specific conflict on the PR and stop
 that change unless the trusted context contains the owner's explicit override.
-Technical disagreement, implementation risk, missing test coverage, and concern
-about a suggested patch are not business-intent disagreement or approval gates.
-Use that advice to improve the implementation or choose an aligned alternative,
-then keep working under the standing authorization. Jarvis need not endorse
-every code detail. Don't mislabel a genuine business-intent conflict as technical.
+Jarvis is not the gatekeeper for safety, security or technical correctness.
+Unsolicited comments on those topics are outside its consultation role, not a
+veto, an approval requirement or a reason to seek its technical endorsement.
+Assess such concerns independently against the code and evidence, retain the
+job's safety boundaries, and fix valid in-scope issues under the standing
+authorization. Technical risk, missing tests or a security objection alone do
+not establish a business-intent conflict, even if Jarvis calls them a blocker.
+Don't relabel a genuine business-decision or business-rule conflict as technical.
 If required consultation is unavailable, incomplete or pending, repair an
 in-scope client/output problem when possible. If it remains unavailable, report
 that concrete dependency blocker, not a request for owner approval. Don't retry
