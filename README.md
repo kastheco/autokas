@@ -22,11 +22,11 @@ failed commands are not automatic stop conditions. omp must diagnose and repair 
 
 ## configuration
 
-`config.json` contains the repository and owner allowlists, PR-specific owner approvals, timeout, tools, versions, git author and execution profiles. `omp_models` is native omp `models.yml` content. the worker combines native `omp_settings` with model roles selected for the job and writes both files into its fresh agent home. credentials remain environment references, never model-file values.
+`config.json` contains PR-specific owner approvals, timeout, tools, versions, git author and execution profiles. Repository eligibility comes from GitHub App installation scope, not a runner allowlist. `omp_models` is native omp `models.yml` content. the worker combines native `omp_settings` with model roles selected for the job and writes both files into its fresh agent home. credentials remain environment references, never model-file values.
 
 - coding jobs use `railway-codex/gpt-6-sol`, high reasoning and requested priority service. docs jobs use `railway-codex/gpt-6-luna`, medium reasoning and default service. both use CLIProxyAPI's Responses API. native omp flags set the model, reasoning effort and service tier explicitly. all model roles follow the selected job profile. model fallback and automatic agent retries are disabled.
 - omp: `18.3.2`, Bun: `1.4.2`. the image includes Node 22, Corepack, git, gh and build tools. target dependencies are installed by omp using the repository's own instructions.
-- runner commits use `autokas <autokas-omp@kasthe.dev>` as both author and committer. every commit must follow Conventional Commits 1.0.0, such as `fix(auth): preserve the session on refresh`, even if repository examples use another format. GitHub comments still use the account that owns the configured PAT.
+- runner commits use `autokas <autokas-omp@kasthe.dev>` as both author and committer. every commit must follow Conventional Commits 1.0.0, such as `fix(auth): preserve the session on refresh`, even if repository examples use another format. GitHub API calls, comments, review replies, thread resolution and pushes use the `autokas` GitHub App installation token. The App is owned by `kastheco`; its private key, App ID and installation ID stay in the Modal `omp-runner-worker` secret. The required repository permissions are contents read/write, workflows read/write, pull requests read/write and issues read/write.
 - tools: read, bash, edit, write, grep, glob, lsp and todo. extension discovery is disabled. normal repository instructions remain available.
 - `kas-voice-profile.md` is a byte-identical copy of kas's canonical local profile and is appended to every job's system policy. voice matching never depends on an optional skill invocation.
 - `skills/` contains the local unslop skill and all 38 Matt Pocock skills, including supporting files and licenses. `skills/SOURCES.json` records pinned upstream revisions and file hashes. the image carries these assets, and every fresh agent home links them into native omp skill discovery. matching skills are read on demand; they cannot expand the job's authority or override its safety policy. specialized skill workflows may still require their own repository tools.
@@ -60,8 +60,9 @@ create these native Modal secrets in the approved environment:
 | secret | values | scope |
 | --- | --- | --- |
 | `omp-runner-webhook` | `GITHUB_WEBHOOK_SECRET` | fresh random webhook signing key, receiver only |
-| `omp-runner-worker` | `GH_TOKEN`, `CLI_PROXY_API_KEY`, `JARVIS_RUNNER_TOKEN` | worker only |
+| `omp-runner-worker` | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY`, `CLI_PROXY_API_KEY`, `JARVIS_RUNNER_TOKEN` | worker only |
 
+`autokas` uses a GitHub App installation token with Contents, Workflows, Pull requests and Issues read/write permissions. Repository access is controlled only by the repositories selected when the App is installed. The runner does not apply a second repository allowlist.
 
 enter secrets through Modal's native secret form or SDK using hidden/local input. `modal.Secret.objects.create(name, values, environment_name="main")` creates a named secret without putting values in command arguments. `modal.Secret.from_name(name).update(values)` updates only the named keys. no new GitHub login or PAT is required for this approved reuse.
 
@@ -148,8 +149,14 @@ comment delivery is not blindly retried. omp reconciles an uncertain response by
 
 
 
-disable the repository's GitHub webhook to stop new intake, then allow existing work to finish. removing an explicit repository or owner from the allowlists and deploying also stops new matching deliveries, but does not cancel already queued calls from an older deployment. use Modal's native call cancellation when an active job must be stopped. a canceled or uncertain push must be reconciled against the PR before taking another action.
+disable the repository's GitHub webhook to stop new intake, then allow existing work to finish. uninstalling `autokas` from a repository stops new deliveries for that repository, but does not cancel already queued calls from an older deployment. use Modal's native call cancellation when an active job must be stopped. a canceled or uncertain push must be reconciled against the PR before taking another action.
 
 Modal Dict atomically claims each repository/comment/prompt fingerprint before dispatch and each execution before starting. identical prompt deliveries, including comment edits that don't change the prompt, are suppressed. different prompts are new jobs. when an exact owner approval is configured, its hash also participates in the claim key: an explicitly authorized resumed attempt gets a distinct key, while repeated deliveries under that same approval stay duplicates. reconcile the previous outcome before recording a new approval; changing approval text is not an uncertainty-retry mechanism. entries expire after seven days without activity. this is bounded duplicate protection, not permanent exactly-once execution. claims remain after failure or uncertain dispatch so the runner never blindly replays a possible push. inspect logs and the PR rather than deleting claims and retrying. workspaces are temporary, and there is no custom archive.
 
 references: [Modal deployment](https://modal.com/docs/guide/apps), [secrets](https://modal.com/docs/sdk/py/latest/Secret), [Dict](https://modal.com/docs/sdk/py/latest/Dict), [GitHub fine-grained tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
+
+### autokas GitHub App setup
+
+Create the `autokas` GitHub App under the `kastheco` organization with contents, workflows, pull requests and issues read/write permissions. Install it only on approved repositories, then add `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY` to the `omp-runner-worker` Modal secret. The worker mints short-lived installation tokens and does not use a personal GitHub PAT.
+
+Run `./setup_autokas.py` from the repository root to create the `autokas` App through GitHub, discover its `kastheco` installation, optionally write the Modal secret, and deploy the cutover. The wizard asks before account creation and deployment.

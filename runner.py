@@ -31,12 +31,35 @@ app = modal.App(CONFIG["app"])
 CLAIMS = modal.Dict.from_name(f'{CONFIG["app"]}-comments', create_if_missing=True)
 WEBHOOK_SECRET = modal.Secret.from_name("omp-runner-webhook", required_keys=["GITHUB_WEBHOOK_SECRET"])
 WORKER_SECRET = modal.Secret.from_name(
-    "omp-runner-worker", required_keys=["GH_TOKEN", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN"]
+    "omp-runner-worker", required_keys=["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN"]
 )
+
+_github_token: tuple[str, float] | None = None
+
+def github_token() -> str:
+    """Mint a short-lived GitHub App installation token."""
+    import jwt
+    global _github_token
+    now = time.time()
+    if _github_token and _github_token[1] > now + 60:
+        return _github_token[0]
+    app_id = os.environ[CONFIG["github_app"]["app_id_env"]]
+    installation_id = os.environ[CONFIG["github_app"]["installation_id_env"]]
+    private_key = os.environ[CONFIG["github_app"]["private_key_env"]].replace("\\n", "\n")
+    assertion = jwt.encode({"iat": int(now) - 60, "exp": int(now) + 540, "iss": app_id}, private_key, algorithm="RS256")
+    request = urllib.request.Request(
+        f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+        headers={"Authorization": f"Bearer {assertion}", "Accept": "application/vnd.github+json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = json.load(response)
+    _github_token = (data["token"], time.time() + 3600)
+    return _github_token[0]
 BASE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi==0.135.1")
 IMAGE = (
     modal.Image.from_registry("node:22.22.0-bookworm-slim", add_python="3.12")
-    .pip_install("fastapi==0.135.1")
+    .pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1")
     .apt_install("git", "gh", "curl", "unzip", "ca-certificates", "build-essential")
     .run_commands(
         f"curl -fsSL https://github.com/oven-sh/bun/releases/download/bun-v{CONFIG['bun_version']}/bun-linux-x64.zip -o /tmp/bun.zip",
@@ -336,9 +359,7 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if event not in {"issue_comment", "pull_request_review_comment", "pull_request_review"} or payload.get("action") not in actions:
         return None
     repo = payload.get("repository", {}).get("full_name")
-    if not isinstance(repo, str) or (
-        repo not in CONFIG["repositories"] and repo.split("/", 1)[0] not in CONFIG["repository_owners"]
-    ) or not bot(payload.get("sender", {})):
+    if not isinstance(repo, str) or not bot(payload.get("sender", {})):
         return None
     comment = payload.get("review" if event == "pull_request_review" else "comment", {})
     if event == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
@@ -346,8 +367,6 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if not bot(comment.get("user", {})):
         return None
     pr = payload.get("issue" if event == "issue_comment" else "pull_request", {})
-    if generated_docs_pr(pr):
-        return None
     number = pr.get("number")
     if type(number) is not int or number <= 0:
         return None
@@ -373,6 +392,7 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         fingerprint += ":approval:" + hashlib.sha256(approval.encode()).hexdigest()
     return {"repo": repo, "pr": number, "comment": comment["id"], "kind": event, "prompt": prompt,
             "key": f"{repo}:{event}:{comment['id']}:{fingerprint}"}
+
 
 
 @app.function(
@@ -413,7 +433,7 @@ def github_request(method: str, path: str, payload: Any = None) -> Any:
     """Call GitHub without exposing the bearer in command arguments."""
     body = None if payload is None else json.dumps(payload).encode()
     headers = {
-        "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+        "Authorization": f"Bearer {github_token()}",
         "Accept": "application/vnd.github+json",
     }
     if body is not None:
@@ -473,87 +493,6 @@ def acknowledge_queued(job: dict[str, Any]) -> None:
         log("ack_reconciled" if confirmed else "ack_uncertain", key=job["key"],
             reason=type(error).__name__)
 
-
-@app.function(
-    image=BASE_IMAGE.add_local_file(ROOT / "config.json", "/root/config.json")
-    .add_local_file(ROOT / "consult.py", "/root/consult.py")
-    .add_local_file(ROOT / "kas-voice-profile.md", "/root/kas-voice-profile.md")
-    .add_local_dir(ROOT / "skills", "/root/skills"),
-    secrets=[WEBHOOK_SECRET, WORKER_SECRET], timeout=120, retries=0,
-)
-def register_webhooks() -> None:
-    def set_hook_events(path: str, expected: list[str]) -> None:
-        try:
-            updated = github_request("PATCH", path, {"events": expected})
-        except Exception as error:
-            observed = github(path)
-            if observed.get("events") != expected:
-                raise RuntimeError("GitHub hook update failed or is uncertain") from error
-            return
-        if updated.get("events") != expected:
-            raise RuntimeError("GitHub hook update was not confirmed")
-
-    docs_config = CONFIG["docs_update"]
-    webhook_url = docs_config["webhook_url"]
-    repos = list(docs_config["repositories"])
-    tower = "example-org/example-app"
-    if tower not in repos:
-        raise RuntimeError("Example-app is missing from docs-update configuration")
-    hook_path = f"repos/{tower}/hooks/{docs_config['tower_hook_id']}"
-    current = github(hook_path)
-    if current.get("config", {}).get("url") != webhook_url:
-        raise RuntimeError("Example-app hook target is not the configured webhook")
-    if current.get("active") is not True:
-        raise RuntimeError("Example-app hook is inactive")
-    events = current.get("events")
-    if not isinstance(events, list):
-        raise RuntimeError("Example-app hook events could not be read safely")
-    if "pull_request" not in events:
-        set_hook_events(hook_path, events + ["pull_request"])
-    for repo in (repo for repo in repos if repo != tower):
-        expected_events = ["pull_request"]
-        if repo in CONFIG["repositories"]:
-            expected_events = ["issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment"]
-        hooks = github(f"repos/{repo}/hooks")
-        if not isinstance(hooks, list):
-            raise RuntimeError(f"hooks for {repo} could not be read safely")
-        matches = [hook for hook in hooks if hook.get("config", {}).get("url") == webhook_url]
-        if len(matches) > 1:
-            raise RuntimeError(f"multiple configured hooks found for {repo}")
-        if matches:
-            hook = matches[0]
-            if hook.get("active") is not True:
-                raise RuntimeError(f"configured hook for {repo} is inactive")
-            set_hook_events(f"repos/{repo}/hooks/{hook['id']}", expected_events)
-        else:
-            try:
-                created = github_request("POST", f"repos/{repo}/hooks", {
-                    "name": "web",
-                    "active": True,
-                    "events": expected_events,
-                    "config": {
-                        "url": webhook_url,
-                        "content_type": "json",
-                        "insecure_ssl": "0",
-                        "secret": os.environ["GITHUB_WEBHOOK_SECRET"],
-                    },
-                })
-            except Exception as error:
-                observed = github(f"repos/{repo}/hooks")
-                confirmed = [
-                    hook for hook in observed
-                    if hook.get("config", {}).get("url") == webhook_url
-                    and hook.get("events") == expected_events
-                ]
-                if len(confirmed) == 1:
-                    continue
-                raise RuntimeError(f"pull_request hook creation for {repo} failed or is uncertain") from error
-            if (
-                created.get("active") is not True
-                or created.get("events") != expected_events
-                or created.get("config", {}).get("url") != webhook_url
-            ):
-                raise RuntimeError(f"pull_request hook creation for {repo} was not confirmed")
 
 
 def docs_worker(
@@ -747,7 +686,8 @@ class PRWorker:
             settings.write_text(json.dumps(CONFIG["omp_settings"] | {
                 "modelRoles": dict.fromkeys(("default", "smol", "slow", "plan"), execution["model"]),
             }))
-            env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL", "GH_TOKEN", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN")}
+            env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN")}
+            env["GH_TOKEN"] = github_token()
             env["JARVIS_CONSULT_URL"] = CONFIG["jarvis_url"]
             env.update(HOME=str(home), PI_CODING_AGENT_DIR=str(agent), CI="true", GH_PROMPT_DISABLED="1",
                        GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME=CONFIG["git_author"]["name"],
@@ -775,6 +715,7 @@ class PRWorker:
                     if model not in {entry["id"] for entry in json.load(response)["data"]}:
                         raise RuntimeError("configured model is not available from the proxy")
                 log("proxy_connected", model=execution["model"])
+                run(["gh", "auth", "setup-git"])
                 if job.get("mode") == "docs_update":
                     docs_worker(job, root, env, run, deadline, settings)
                     return

@@ -49,6 +49,17 @@ class ReviewIntakeTests(unittest.TestCase):
         edited["action"] = "edited"
         self.assertEqual(event_job("pull_request_review", edited), job)
 
+
+    def test_installed_repository_is_not_filtered_by_configured_allowlists(self) -> None:
+        event = review_event()
+        event["repository"]["full_name"] = "unlisted-owner/unlisted-repository"
+        event["pull_request"]["base"]["repo"]["full_name"] = "unlisted-owner/unlisted-repository"
+        event["review"]["pull_request_url"] = "https://api.github.com/repos/unlisted-owner/unlisted-repository/pulls/142"
+        job = event_job("pull_request_review", event)
+        self.assertIsNotNone(job)
+        assert job is not None
+        self.assertEqual(job["repo"], "unlisted-owner/unlisted-repository")
+
     def test_pending_and_dismissed_reviews_do_not_run(self) -> None:
         for state in ("pending", "dismissed"):
             event = review_event()
@@ -99,7 +110,7 @@ class ReviewIntakeTests(unittest.TestCase):
         event["review"]["body"] = "No actionable findings."
         self.assertIsNone(event_job("pull_request_review", event))
 
-    def test_generated_docs_findings_never_become_jobs(self) -> None:
+    def test_installed_repository_findings_are_not_blacklisted_by_branch_or_marker(self) -> None:
         for kind in ("pull_request_review", "pull_request_review_comment", "issue_comment"):
             event = review_event()
             pr = event["pull_request"]
@@ -116,11 +127,11 @@ class ReviewIntakeTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertIsNotNone(event_job(kind, event))
                 pr["body"] = "<!-- omp-runner:docs-update -->\n@coderabbitai ignore"
-                self.assertIsNone(event_job(kind, event))
+                self.assertIsNotNone(event_job(kind, event))
                 if kind != "issue_comment":
                     pr["body"] = "older generated docs PR without a marker"
                     pr["head"]["ref"] = CONFIG["docs_update"]["branch_prefix"] + "142-abc"
-                    self.assertIsNone(event_job(kind, event))
+                    self.assertIsNotNone(event_job(kind, event))
 
     def test_generated_docs_merge_does_not_schedule_another_update(self) -> None:
         event = {"action": "closed", "repository": {"full_name": REPO}, "pull_request": {

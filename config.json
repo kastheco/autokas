@@ -1,14 +1,5 @@
 {
   "app": "omp-runner",
-  "repository_owners": ["kastheco"],
-  "repositories": [
-    "example-org/example-app",
-    "example-org/example-repo-9",
-    "example-org/example-repo-7",
-    "example-owner-1/example-repo-1",
-    "example-owner-1/example-repo-4",
-    "example-owner-1/example-repo-5"
-  ],
   "docs_update": {
     "model": "railway-codex/gpt-6-luna",
     "thinking": "medium",
@@ -16,12 +7,42 @@
     "webhook_url": "https://runner.example.invalid",
     "branch_prefix": "docs-update/",
     "repositories": {
-      "example-org/example-app": {"branch": "main", "folders": ["docs"]},
-      "example-org/example-repo-9": {"branch": "staging", "folders": ["docs"]},
-      "example-org/example-repo-7": {"branch": "staging", "folders": ["docs"]},
-      "example-org/example-repo-6": {"branch": "main", "folders": ["docs"]},
-      "example-org/example-repo-8": {"branch": "main", "folders": ["docs"]},
-      "example-org/example-repo-2": {"branch": "main", "folders": ["docs"]}
+      "example-org/example-app": {
+        "branch": "main",
+        "folders": [
+          "docs"
+        ]
+      },
+      "example-org/example-repo-9": {
+        "branch": "staging",
+        "folders": [
+          "docs"
+        ]
+      },
+      "example-org/example-repo-7": {
+        "branch": "staging",
+        "folders": [
+          "docs"
+        ]
+      },
+      "example-org/example-repo-6": {
+        "branch": "main",
+        "folders": [
+          "docs"
+        ]
+      },
+      "example-org/example-repo-8": {
+        "branch": "main",
+        "folders": [
+          "docs"
+        ]
+      },
+      "example-org/example-repo-2": {
+        "branch": "main",
+        "folders": [
+          "docs"
+        ]
+      }
     },
     "tower_hook_id": 9000000009
   },
@@ -39,7 +60,16 @@
   "thinking": "high",
   "service_tier": "priority",
   "jarvis_url": "https://advisor.example.invalid/api/jarvis/consult",
-  "tools": ["read", "bash", "edit", "write", "grep", "glob", "lsp", "todo"],
+  "tools": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "glob",
+    "lsp",
+    "todo"
+  ],
   "omp_models": {
     "providers": {
       "railway-codex": {
@@ -50,14 +80,20 @@
           {
             "id": "gpt-6-sol",
             "reasoning": true,
-            "input": ["text", "image"],
+            "input": [
+              "text",
+              "image"
+            ],
             "contextWindow": 272000,
             "maxTokens": 32768
           },
           {
             "id": "gpt-6-luna",
             "reasoning": true,
-            "input": ["text", "image"],
+            "input": [
+              "text",
+              "image"
+            ],
             "contextWindow": 272000,
             "maxTokens": 32768
           }
@@ -66,10 +102,26 @@
     }
   },
   "omp_settings": {
-    "retry": {"enabled": false, "modelFallback": false}
+    "retry": {
+      "enabled": false,
+      "modelFallback": false
+    }
   },
   "git_author": {
     "name": "autokas",
     "email": "autokas-omp@kasthe.dev"
+  },
+  "github_app": {
+    "name": "autokas",
+    "owner": "kastheco",
+    "permissions": {
+      "contents": "read/write",
+      "workflows": "read/write",
+      "pull_requests": "read/write",
+      "issues": "read/write"
+    },
+    "app_id_env": "GITHUB_APP_ID",
+    "installation_id_env": "GITHUB_APP_INSTALLATION_ID",
+    "private_key_env": "GITHUB_APP_PRIVATE_KEY"
   }
 }

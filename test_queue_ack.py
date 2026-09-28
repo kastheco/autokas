@@ -64,7 +64,7 @@ class QueueAcknowledgmentTests(unittest.TestCase):
         self.claim_patch = patch.object(runner, "CLAIMS", self.claim)
         self.claim_patch.start()
         self.addCleanup(self.claim_patch.stop)
-        self.token_patch = patch.dict(runner.os.environ, {"GH_TOKEN": "fake-token"})
+        self.token_patch = patch.object(runner, "github_token", return_value="fake-installation-token")
         self.token_patch.start()
         self.addCleanup(self.token_patch.stop)
         self.logs = []
