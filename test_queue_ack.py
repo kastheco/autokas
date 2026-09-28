@@ -75,6 +75,12 @@ class QueueAcknowledgmentTests(unittest.TestCase):
         self.addCleanup(self.log_patch.stop)
 
 
+    def test_queue_comment_links_current_dispatcher(self):
+        fake = GitHubFake()
+        with patch.object(runner.modal, "current_function_call_id", return_value="fc-dispatch"), patch.object(runner.urllib.request, "urlopen", fake):
+            runner.acknowledge_review(job())
+        self.assertIn("[Modal dispatcher](https://modal.com/id/fc-dispatch)", fake.comments[0]["body"])
+
     def test_whole_review_and_issue_comment_link_their_exact_sources(self):
         for kind, anchor in (("pull_request_review", "pullrequestreview-123"),
                              ("issue_comment", "issuecomment-123")):

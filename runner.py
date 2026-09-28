@@ -109,6 +109,14 @@ Never print credentials or write them into the repository. Don't read environmen
 secrets, credential files, or provider accounts. Native gh and omp already have auth.
 Don't switch provider/model. Don't launch background work that outlives this job.
 
+Jarvis is available only for repositories owned by example-org (case-insensitive
+exact owner match). For every other owner, including example-owner-4 and example-owner-2, never
+contact Jarvis or Kimmy. Continue technical fixes that preserve business behavior.
+If a finding requires changing business logic, leave that change unimplemented,
+explain the proposed behavior change and missing business-owner decision on the PR,
+and complete independent technical findings where possible. Missing Jarvis access
+does not block technical fixes. The consultation and business-intent override
+rules below apply only to example-org repositories.
 Jarvis's role is business decisions and business logic only. Consult real Jarvis
 before changing core business rules or intended business behavior, using your bash
 tool: python /root/consult.py --request-id <fresh UUID>. A purely technical, safety
@@ -227,6 +235,9 @@ runner outcome, blocked, or uncertain.
 Except for that verified already-handled exit, before every normal exit post one
 concise outcome comment on this job's PR using
 gh pr comment <pr> --repo <repo> --body-file - with your own summary on stdin.
+Include trusted modal_run_links as Markdown links in the overall outcome and every
+acknowledgment update. Preserve the dispatcher link and add the coding run link.
+These show execution status and logs, not business workflow state.
 This reporting permission is separate from permission to edit or push code: rejected
 findings, disagreements, inability to assess a finding, missing approvals, unavailable
 consultation and failed checks must be visible on the PR, not only in terminal logs.
@@ -566,6 +577,9 @@ def acknowledge_review(job: dict[str, Any]) -> dict[str, Any] | None:
                 f"no fix run was needed. [review](https://github.com/{repo}/pull/{pr}#issuecomment-{source})"
                 f"\n\n{marker}")
 
+    call_id = modal.current_function_call_id()
+    if call_id:
+        body += f"\n\n[Modal dispatcher](https://modal.com/id/{call_id})"
     try:
         comment = github_request("POST", path, {"body": body})
         log("ack_posted", key=job["key"])
@@ -783,6 +797,8 @@ def worker(job: dict[str, Any]) -> None:
                 target["acknowledgment"] = acknowledge_review(target)
             except Exception as error:
                 log("ack_uncertain", key=target["key"], reason=type(error).__name__)
+    call_id = modal.current_function_call_id()
+    job["modal_run_links"] = {"Modal dispatcher": f"https://modal.com/id/{call_id}"} if call_id else {}
     pr_key = f"{job['repo'].lower()}#{job['pr']}"
     call = PRWorker(pr_key=pr_key).run.spawn(job)
     log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
@@ -816,9 +832,12 @@ class PRWorker:
             settings.write_text(json.dumps(CONFIG["omp_settings"] | {
                 "modelRoles": dict.fromkeys(("default", "smol", "slow", "plan"), execution["model"]),
             }))
-            env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN")}
+            env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL", "CLI_PROXY_API_KEY")}
             env["GH_TOKEN"] = github_token()
-            env["JARVIS_CONSULT_URL"] = CONFIG["jarvis_url"]
+            env["OMP_JOB_REPO"] = job["repo"]
+            if job["repo"].split("/")[0].lower() == "example-org":
+                env["JARVIS_RUNNER_TOKEN"] = os.environ["JARVIS_RUNNER_TOKEN"]
+                env["JARVIS_CONSULT_URL"] = CONFIG["jarvis_url"]
             env.update(HOME=str(home), PI_CODING_AGENT_DIR=str(agent), CI="true", GH_PROMPT_DISABLED="1",
                        GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME=CONFIG["git_author"]["name"],
                        GIT_AUTHOR_EMAIL=CONFIG["git_author"]["email"], GIT_COMMITTER_NAME=CONFIG["git_author"]["name"],
@@ -829,8 +848,9 @@ class PRWorker:
                                         timeout=max(1, deadline - time.monotonic()))
                 if result.returncode:
                     detail = result.stderr.strip()
-                    for secret in (env["GH_TOKEN"], env["CLI_PROXY_API_KEY"], env["JARVIS_RUNNER_TOKEN"]):
-                        detail = detail.replace(secret, "[redacted]")
+                    for secret in (env["GH_TOKEN"], env["CLI_PROXY_API_KEY"], env.get("JARVIS_RUNNER_TOKEN", "")):
+                        if secret:
+                            detail = detail.replace(secret, "[redacted]")
                     raise RuntimeError(f"{args[0]} {args[1]} failed ({result.returncode}): {detail[-2000:]}")
                 return result.stdout.strip()
 
@@ -881,7 +901,12 @@ class PRWorker:
                     raise RuntimeError("PR head changed while preparing its checkout")
                 log("worktree_ready", repo=repo, pr=number, head=head, branch=branch, worktree=str(worktree))
                 policy = root / "policy.txt"
+                modal_run_links = dict(job.get("modal_run_links", {}))
+                call_id = modal.current_function_call_id()
+                if call_id:
+                    modal_run_links["Modal coding run"] = f"https://modal.com/id/{call_id}"
                 context = {"repo": repo, "pr": number, "branch": branch, "starting_head": head,
+                           "modal_run_links": modal_run_links,
                            "source_kind": job["kind"], "source_comment_id": job["comment"],
                            "owner_approval": CONFIG["owner_approvals"].get(f"{repo}#{number}", ""),
                            "finding_url": comment["html_url"],

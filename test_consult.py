@@ -25,6 +25,7 @@ class ConsultationOutputTests(unittest.TestCase):
         with (
             patch.dict(os.environ, JARVIS_RUNNER_TOKEN="private-test-token",
                        JARVIS_CONSULT_URL="https://jarvis.invalid/consult"),
+            patch.dict(os.environ, OMP_JOB_REPO="example-org/example-app"),
             patch("sys.argv", ["consult.py", "--request-id", "89c72b1e-56f1-457e-aae8-1677a9cec379"]),
             patch("sys.stdin", io.StringIO("Assess the scoped refactor.")),
             patch("tempfile.tempdir", directory),
@@ -62,6 +63,19 @@ class ConsultationOutputTests(unittest.TestCase):
                 self.assertIn("blocked:", stderr)
                 self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_other_owners_and_missing_repo_cannot_contact_jarvis(self) -> None:
+        for repo in ("", "example-owner-4/app", "example-owner-2/app", "other/example-org",
+                     "example-org-else/example-app", "example-org/", "example-org/a/b"):
+            with (
+                self.subTest(repo=repo),
+                patch.dict(os.environ, OMP_JOB_REPO=repo, JARVIS_RUNNER_TOKEN="test",
+                           JARVIS_CONSULT_URL="https://jarvis.invalid/consult"),
+                patch("sys.argv", ["consult.py", "--request-id", "89c72b1e-56f1-457e-aae8-1677a9cec379"]),
+                patch("consult.urllib.request.build_opener") as opener,
+                redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(consult.main(), 1)
+                opener.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
