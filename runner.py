@@ -312,6 +312,8 @@ def docs_event_job(payload: dict[str, Any]) -> dict[str, Any] | None:
         or generated_docs_pr(pr)
     ):
         return None
+    if generated_docs_pr(pr):
+        return None
     number = pr.get("number")
     merge_sha = pr.get("merge_commit_sha")
     if type(number) is not int or number <= 0 or not isinstance(merge_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", merge_sha):
@@ -367,6 +369,8 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if not bot(comment.get("user", {})):
         return None
     pr = payload.get("issue" if event == "issue_comment" else "pull_request", {})
+    if generated_docs_pr(pr):
+        return None
     number = pr.get("number")
     if type(number) is not int or number <= 0:
         return None

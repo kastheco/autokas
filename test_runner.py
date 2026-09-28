@@ -110,7 +110,7 @@ class ReviewIntakeTests(unittest.TestCase):
         event["review"]["body"] = "No actionable findings."
         self.assertIsNone(event_job("pull_request_review", event))
 
-    def test_installed_repository_findings_are_not_blacklisted_by_branch_or_marker(self) -> None:
+    def test_generated_docs_findings_never_become_jobs(self) -> None:
         for kind in ("pull_request_review", "pull_request_review_comment", "issue_comment"):
             event = review_event()
             pr = event["pull_request"]
@@ -127,11 +127,11 @@ class ReviewIntakeTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertIsNotNone(event_job(kind, event))
                 pr["body"] = "<!-- omp-runner:docs-update -->\n@coderabbitai ignore"
-                self.assertIsNotNone(event_job(kind, event))
+                self.assertIsNone(event_job(kind, event))
                 if kind != "issue_comment":
                     pr["body"] = "older generated docs PR without a marker"
                     pr["head"]["ref"] = CONFIG["docs_update"]["branch_prefix"] + "142-abc"
-                    self.assertIsNotNone(event_job(kind, event))
+                    self.assertIsNone(event_job(kind, event))
 
     def test_generated_docs_merge_does_not_schedule_another_update(self) -> None:
         event = {"action": "closed", "repository": {"full_name": REPO}, "pull_request": {

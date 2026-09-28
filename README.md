@@ -157,6 +157,6 @@ references: [Modal deployment](https://modal.com/docs/guide/apps), [secrets](htt
 
 ### autokas GitHub App setup
 
-Create the `autokas` GitHub App under the `kastheco` organization with contents, workflows, pull requests and issues read/write permissions. Install it only on approved repositories, then add `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY` to the `omp-runner-worker` Modal secret. The worker mints short-lived installation tokens and does not use a personal GitHub PAT.
+create the `autokas` GitHub App under the `kastheco` organization with contents, workflows, pull requests and issues read/write permissions. install it only on approved repositories, then add `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY` to the `omp-runner-worker` Modal secret. the worker mints short-lived tokens for that configured installation, not a separate installation selected by repository owner, and does not use a personal GitHub PAT.
 
 Run `./setup_autokas.py` from the repository root to create the `autokas` App through GitHub, discover its `kastheco` installation, optionally write the Modal secret, and deploy the cutover. The wizard asks before account creation and deployment.
