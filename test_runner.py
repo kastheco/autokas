@@ -2,9 +2,13 @@
 
 import copy
 import unittest
+import tempfile
+import time
+from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
-from runner import CONFIG, agent_prompt, event_job
+from runner import CONFIG, agent_prompt, docs_worker, event_job
 
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
@@ -106,6 +110,168 @@ class ReviewIntakeTests(unittest.TestCase):
             self.assertNotEqual(approved["key"], original["key"])
             self.assertEqual(approved["prompt"], original["prompt"])
             self.assertEqual(event_job("pull_request_review", review_event()), approved)
+
+
+class DocsMergeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.final_head = "b" * 40
+        self.current_head = self.final_head
+        self.merged_head = None
+        self.merge_attempts = 0
+        self.move_head = False
+        self.concurrent_merge = False
+        self.lose_response = False
+        self.omit_merge_commit = False
+        self.job = {
+            "repo": "example/docs", "pr": 1, "source_sha": "a" * 40,
+            "source_branch": "feature",
+        }
+        self.api = "repos/example/docs/pulls"
+        self.source_files = [{"filename": "src/service.py"}]
+        self.branch = f'{CONFIG["docs_update"]["branch_prefix"]}1-{"a" * 12}'
+        self.followup = {
+            "number": 2,
+            "head": {"repo": {"full_name": "example/docs"},
+                     "ref": self.branch, "sha": self.final_head},
+            "base": {"repo": {"full_name": "example/docs"}, "ref": "main"},
+        }
+        patches = [
+            patch.dict(CONFIG["docs_update"]["repositories"], {
+                "example/docs": {"branch": "main", "folders": ["docs"]},
+            }),
+            patch("runner.github", side_effect=self.read_github),
+            patch("runner.github_request", side_effect=self.write_github),
+            patch("runner.subprocess.Popen"),
+            patch("runner.os.killpg"),
+            patch("runner.log"),
+        ]
+        mocks = []
+        for patcher in patches:
+            mocks.append(patcher.start())
+            self.addCleanup(patcher.stop)
+        mocks[3].return_value.wait.return_value = 0
+        self.process = mocks[3]
+        self.log = mocks[5]
+
+    def read_github(self, path):
+        if path == f"{self.api}/1":
+            return {
+                "state": "closed", "merged_at": "2026-09-27T00:00:00Z",
+                "merge_commit_sha": self.job["source_sha"],
+                "base": self.followup["base"], "head": self.followup["head"],
+            }
+        if path == f"{self.api}/1/files?per_page=100":
+            return self.source_files
+        if path == f"{self.api}/2/files?per_page=100":
+            if self.move_head:
+                self.current_head = "c" * 40
+            return [{"filename": "docs/guide.md"}]
+        if path == f"{self.api}?state=open&head=example:{self.branch}&base=main":
+            return []
+        if path == f"{self.api}/2":
+            return {
+                **self.followup,
+                "head": {**self.followup["head"], "sha": self.current_head},
+                "merged_at": "2026-09-27T00:00:00Z" if self.merged_head else None,
+                "merge_commit_sha": "d" * 40 if self.merged_head and not self.omit_merge_commit else None,
+            }
+        raise AssertionError(f"unexpected GitHub read: {path}")
+
+    def write_github(self, method, path, payload):
+        if method == "POST" and path == self.api:
+            return copy.deepcopy(self.followup)
+        if method == "PUT" and path == f"{self.api}/2/merge":
+            self.merge_attempts += 1
+            if payload.get("sha", self.current_head) != self.current_head:
+                if self.concurrent_merge:
+                    self.merged_head = self.current_head
+                raise HTTPError(path, 409, "Head branch was modified", {}, None)
+            self.merged_head = self.current_head
+            if self.lose_response:
+                raise TimeoutError("merge response lost")
+            return {"merged": True}
+        raise AssertionError(f"unexpected GitHub write: {method} {path}")
+
+    def run_command(self, args, cwd):
+        if args == ["git", "rev-parse", "origin/main"]:
+            return "0" * 40
+        if args == ["git", "rev-parse", "HEAD"]:
+            return self.final_head
+        if args[:3] == ["git", "diff", "--name-only"]:
+            return "docs/guide.md"
+        if args[:2] in (["gh", "auth"], ["git", "clone"], ["git", "fetch"],
+                        ["git", "checkout"], ["git", "ls-remote"],
+                        ["git", "status"], ["git", "push"]):
+            return ""
+        raise AssertionError(f"unexpected command: {args}")
+
+    def run_worker(self):
+        docs_worker(self.job, self.root, {}, self.run_command,
+                    time.monotonic() + 60, self.root / "settings.json")
+
+    def test_docs_only_and_empty_sources_stop_before_agent_work(self) -> None:
+        for files in ([], [{"filename": "docs/guide.md"}, {"filename": "docs/api/auth.md"}]):
+            with self.subTest(files=files), patch.object(
+                self, "run_command", side_effect=AssertionError("source must be skipped")
+            ) as run:
+                self.source_files = files
+                self.run_worker()
+                run.assert_not_called()
+                self.process.assert_not_called()
+                self.assertIsNone(self.merged_head)
+                self.assertEqual(self.merge_attempts, 0)
+
+    def test_mixed_source_reaches_docs_update(self) -> None:
+        self.source_files.append({"filename": "docs/guide.md"})
+        self.run_worker()
+        self.assertEqual(self.merged_head, self.final_head)
+
+    def test_docs_folder_lookalikes_do_not_skip_code_changes(self) -> None:
+        for path in ("docs-extra/service.py", "src/docs/service.py"):
+            with self.subTest(path=path):
+                self.source_files = [{"filename": path}]
+                self.merged_head = None
+                self.run_worker()
+                self.assertEqual(self.merged_head, self.final_head)
+
+    def test_changed_head_is_not_merged_or_retried(self) -> None:
+        self.move_head = True
+        with self.assertRaisesRegex(RuntimeError, "docs pull request merge failed or is uncertain"):
+            self.run_worker()
+        self.assertIsNone(self.merged_head)
+        self.assertEqual(self.merge_attempts, 1)
+        self.log.assert_not_called()
+
+    def test_concurrent_merge_of_changed_head_is_not_confirmed(self) -> None:
+        self.move_head = True
+        self.concurrent_merge = True
+        with self.assertRaisesRegex(RuntimeError, "docs pull request merge failed or is uncertain"):
+            self.run_worker()
+        self.assertNotEqual(self.merged_head, self.final_head)
+        self.assertEqual(self.merged_head, self.current_head)
+        self.assertEqual(self.merge_attempts, 1)
+        self.log.assert_not_called()
+
+    def test_validated_head_is_merged_for_code_only_source(self) -> None:
+        self.run_worker()
+        self.assertEqual(self.merged_head, self.final_head)
+        self.assertEqual(self.log.call_args.args[0], "docs_update_complete")
+
+    def test_lost_successful_merge_response_is_confirmed_without_retry(self) -> None:
+        self.lose_response = True
+        self.run_worker()
+        self.assertEqual(self.merged_head, self.final_head)
+        self.assertEqual(self.merge_attempts, 1)
+        self.assertEqual(self.log.call_args.args[0], "docs_update_complete")
+
+    def test_missing_merge_commit_is_not_confirmed(self) -> None:
+        self.omit_merge_commit = True
+        with self.assertRaisesRegex(RuntimeError, "docs squash merge was not confirmed"):
+            self.run_worker()
+        self.log.assert_not_called()
 
 
 if __name__ == "__main__":
