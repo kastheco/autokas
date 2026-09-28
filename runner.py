@@ -348,6 +348,20 @@ def agent_prompt(body: str) -> str:
     return "\n\n".join(match["prompt"].strip() for match in (individual or matches))
 
 
+def clean_review_head(body: str) -> str:
+    """Read the reviewed head only from CodeRabbit's completed recent review."""
+    if agent_prompt(body) or "<!-- review_in_progress" in body:
+        return ""
+    _, start, recent = body.partition("<!-- recent_review_start -->")
+    recent, end, _ = recent.partition("<!-- recent_review_end -->")
+    if not start or not end or not recent.strip().startswith(
+        "No actionable comments were generated in the recent review."
+    ):
+        return ""
+    commits = re.search(r"between [0-9a-f]{40} and ([0-9a-f]{40})\.", recent)
+    return commits[1] if commits else ""
+
+
 def bot(user: dict[str, Any]) -> bool:
     """Match the configured GitHub identity, not a display name."""
     return all(user.get(key) == value for key, value in CONFIG["coderabbit"].items()) and user.get("type") == "Bot"
@@ -389,7 +403,12 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         return None
     prompt = agent_prompt(comment.get("body") or "")
     if not prompt:
-        return None
+        head = clean_review_head(comment.get("body") or "") if event == "issue_comment" else ""
+        if not head:
+            return None
+        return {"repo": repo, "pr": number, "comment": comment["id"], "kind": event,
+                "mode": "clean_review", "head": head,
+                "key": f"{repo}:clean_review:{number}:{head}"}
     fingerprint = hashlib.sha256(prompt.encode()).hexdigest()
     approval = CONFIG["owner_approvals"].get(f"{repo}#{number}", "")
     if approval:
@@ -421,7 +440,7 @@ async def webhook(request: Request) -> JSONResponse:
     except (ValueError, TypeError, AttributeError):
         raise HTTPException(400, "invalid event") from None
     if job is None:
-        return JSONResponse({"status": "ignored"})
+        return JSONResponse({"status": "ignored", "revision": REVISION})
     if not await CLAIMS.put.aio(job["key"], "claimed", skip_if_exists=True):
         return JSONResponse({"status": "duplicate"})
     try:
@@ -455,15 +474,16 @@ def github(path: str) -> Any:
     return github_request("GET", path)
 
 
-def acknowledge_queued(job: dict[str, Any]) -> None:
-    """Post one acknowledgment after dispatch, never replay an uncertain write."""
+def acknowledge_review(job: dict[str, Any]) -> None:
+    """Acknowledge queued fixes or completed clean reviews without replaying writes."""
     if not CLAIMS.put("ack:" + job["key"], "posting", skip_if_exists=True):
         log("ack_already_claimed", key=job["key"])
         return
 
     repo, pr, source = job["repo"], job["pr"], job["comment"]
     kind = job["kind"]
-    marker = f"<!-- omp-runner:queued:{hashlib.sha256(job['key'].encode()).hexdigest()} -->"
+    status = "clean" if job.get("mode") == "clean_review" else "queued"
+    marker = f"<!-- omp-runner:{status}:{hashlib.sha256(job['key'].encode()).hexdigest()} -->"
     if kind == "pull_request_review_comment":
         path = f"repos/{repo}/pulls/{pr}/comments/{source}/replies"
         listing = f"repos/{repo}/pulls/{pr}/comments?per_page=100&sort=created&direction=desc"
@@ -473,6 +493,10 @@ def acknowledge_queued(job: dict[str, Any]) -> None:
         path = f"repos/{repo}/issues/{pr}/comments"
         listing = f"{path}?per_page=100&sort=created&direction=desc"
         body = f"queued for investigation. [source](https://github.com/{repo}/pull/{pr}#{anchor})\n\n{marker}"
+    if status == "clean":
+        body = (f"reviewed and okay: CodeRabbit found no actionable comments for `{job['head']}`. "
+                f"no fix run was needed. [review](https://github.com/{repo}/pull/{pr}#issuecomment-{source})"
+                f"\n\n{marker}")
 
     try:
         github_request("POST", path, {"body": body})
@@ -652,12 +676,25 @@ def worker(job: dict[str, Any]) -> None:
         if generated_docs_pr(pr):
             log("generated_docs_ignored", key=job["key"])
             return
+        if job.get("mode") == "clean_review":
+            repo, number = job["repo"], job["pr"]
+            comment = github(f"repos/{repo}/issues/comments/{job['comment']}")
+            if (pr["state"] != "open" or pr["head"]["sha"] != job["head"]
+                    or pr["base"]["repo"]["full_name"] != repo
+                    or pr["head"]["repo"]["full_name"] != repo
+                    or not bot(comment["user"])
+                    or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
+                    or clean_review_head(comment.get("body") or "") != job["head"]):
+                log("clean_review_outdated", key=job["key"])
+                return
+            acknowledge_review(job)
+            return
     pr_key = f"{job['repo'].lower()}#{job['pr']}"
     call = PRWorker(pr_key=pr_key).run.spawn(job)
     log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
     if job["kind"] != "pull_request":
         try:
-            acknowledge_queued(job)
+            acknowledge_review(job)
         except Exception as error:
             log("ack_uncertain", key=job["key"], reason=type(error).__name__)
 

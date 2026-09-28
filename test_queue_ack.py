@@ -90,7 +90,7 @@ class QueueAcknowledgmentTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 fake = GitHubFake()
                 with patch.object(runner.urllib.request, "urlopen", fake):
-                    runner.acknowledge_queued(job(kind))
+                    runner.acknowledge_review(job(kind))
                 self.assertIn(f"https://github.com/{REPO}/pull/42#{anchor}", fake.comments[0]["body"])
                 self.assertEqual([path for method, path, _ in fake.calls if method == "POST"],
                                  [f"repos/{REPO}/issues/42/comments"])
@@ -104,8 +104,8 @@ class QueueAcknowledgmentTests(unittest.TestCase):
                 self.logs.clear()
                 fake = GitHubFake(lost_response=True, receipt_user=user_id, reply_source=reply_source)
                 with patch.object(runner.urllib.request, "urlopen", fake):
-                    runner.acknowledge_queued(job())
-                    runner.acknowledge_queued(job())
+                    runner.acknowledge_review(job())
+                    runner.acknowledge_review(job())
                 self.assertIn(expected, self.logs)
                 self.assertEqual([method for method, _, _ in fake.calls], ["POST", "GET", "GET"])
 

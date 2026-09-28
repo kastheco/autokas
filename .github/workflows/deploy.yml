@@ -1,0 +1,40 @@
+name: deploy runner
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: omp-runner-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: test
+        run: python -m unittest discover -v
+      - name: pause, drain, deploy and reconcile
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          MODAL_ENVIRONMENT: main
+        run: python -u deploy.py
+      - name: restore intake after failure or cancellation
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          MODAL_ENVIRONMENT: main
+          DEPLOY_CLEANUP: '1'
+        run: python -u deploy.py

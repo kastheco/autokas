@@ -33,6 +33,7 @@ failed commands are not automatic stop conditions. omp must diagnose and repair 
 - the durable `worker` entry queue dispatches to a native Modal `PRWorker` instance keyed by lowercase repository and PR number. each key has at most one single-use worker container and one active input, so different PRs can run concurrently while jobs for the same PR wait in Modal's queue. each agent has 2 CPU, 8 GiB, a one-hour timeout, a fresh temporary home and checkout. Modal shuts down its container after that job. queue order is not guaranteed.
 - generated docs PRs include `@coderabbitai ignore` in their initial description, so CodeRabbit skips automatic review. a dedicated body marker excludes their issue comments from runner intake, and the `docs-update/` branch prefix also excludes review events and merged-PR events. the worker checks fetched PR metadata before starting an agent, so older queued findings for generated docs PRs are ignored too. ordinary PR reviews remain enabled.
 - after a coding job is queued, the dispatcher posts an acknowledgment on the triggering review thread or links the triggering conversation comment or review. duplicate delivery does not post another acknowledgment. uncertain writes are reconciled once against the authenticated account, never blindly repeated. acknowledgment failure is logged without canceling already-queued work.
+- completed clean reviews receive a linked “reviewed and okay” comment from `autokas[bot]`, attributing the result to CodeRabbit and identifying the reviewed commit. the dispatcher re-fetches the completed review and current PR head before posting. incomplete, stale, spoofed and generated-docs reviews are not acknowledged as clean. one clean acknowledgment is claimed per repository, PR and head within the existing duplicate-retention window. no coding agent starts for this path.
 - after confirming its commit on the remote PR branch, the agent replies to each addressed review thread with the commit link and resolves that exact thread. rejected, blocked, unfixed and uncertain-push findings stay unresolved. conversation comments and whole-review bodies cannot be resolved, so they receive a linked outcome comment instead.
 - each job fetches `refs/pull/N/head`, checks out the PR branch and verifies its head SHA. worktrunk is unnecessary for a disposable single-job clone and was removed at kas's request.
 - external-fork PR heads are not enabled. the head must belong to the approved base repository, including when that approved repository is itself a fork. all positive PR numbers are eligible; only genuine CodeRabbit findings with the fenced agent prompt start work.
@@ -78,19 +79,20 @@ provider OAuth credentials stay in the existing Railway proxy volume, not Modal.
 
 ## deploy and update
 
-with the approved Modal profile and `main` environment active, the initial and update command is the same:
+pushes to `main` run `.github/workflows/deploy.yml`. a manual dispatch on `main` uses the same serialized workflow. it runs the tests, then `deploy.py` performs the complete cutover:
 
-```sh
-modal deploy --strategy rolling runner.py
-```
+1. discover active repository hooks targeting the exact runner URL and persist their restoration list before changing them.
+2. pause those hooks and wait for the receiver, dispatcher and aggregate PR worker pools to have no running inputs or backlog across three consecutive checks. a drain timeout prevents deployment.
+3. deploy with `modal deploy --strategy recreate runner.py`, reject an unsigned request with `401`, and verify a real signed GitHub ping returns `200` with the expected source revision.
+4. restore every saved hook, then reconstruct eligible comments, reviews and merged-PR events changed since the pause began. existing atomic claims suppress duplicate jobs.
 
-keep the app/function names stable. Modal prints the webhook URL and app logs link. [rolling deployments](https://modal.com/docs/guide/managing-deployments#deployment-strategies) let old inputs finish while new containers accept traffic. that overlap does not preserve same-PR serialization across versions. before an update or rollback, arrange an approved, lossless intake pause, finish in-flight dispatches, and drain existing workers before deploying. a zero-backlog snapshot without an intake pause is not sufficient. the runner has no built-in intake pause, and Modal's `max_containers=0` does not pause dispatch. do not disable hooks or reject deliveries without an approved reconciliation plan, since GitHub does not automatically redeliver failures.
+the workflow uses the existing `DEPLOY_GH_TOKEN`, `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` repository secrets. GitHub credentials need hook administration and access to the target repositories. worker credentials remain in Modal. workflow runs do not cancel an active deployment. do not run a separate local deployment concurrently.
 
-a source push does not deploy. automatic deployment is deferred in the project ticket. the logs' `revision` hashes the paths and bytes of `runner.py`, `config.json`, `consult.py`, the voice profile and every bundled skill asset, including uncommitted changes. each job logs its selected model, reasoning effort, requested service tier, PR and worktree head.
+the restoration list and reconciliation progress live in the existing Modal Dict under `__deployment_pause__`. failure cleanup restores intake before reconciliation. if the runner is forcibly terminated before cleanup can finish, manually dispatch the workflow again. it finishes the saved restoration and reconciliation before starting another cutover. uncertain job dispatches retain their claims rather than blindly repeating publication.
 
-after changing a Modal secret, use `modal deploy --strategy recreate runner.py` once intake is disabled and active jobs have finished. a normal rolling deploy kept a warm receiver on the previous signing key during the bootstrap trial. the recreate deployment refreshed it, and the same signed request then passed. verify the receiver before enabling deliveries.
+for rollback, revert the source on `main` and let the same workflow deploy it. after changing a Modal secret, manually dispatch the workflow to recreate containers through the same pause and drain. keep app and function names stable. secrets remain outside the release.
 
-for rollback, keep intake paused, drain active work, and deploy the last known-good source with `modal deploy --strategy rolling runner.py`. verify the receiver before resuming intake. secrets remain outside the release. do not restart the old publisher.
+the logs' `revision` hashes the paths and bytes of `runner.py`, `config.json`, `consult.py`, the voice profile and every bundled skill asset. the signed-ping response carries that revision so the workflow verifies the running code, not just an HTTP success. each coding job also logs its selected model, reasoning effort, requested service tier, PR and worktree head.
 
 
 
@@ -117,7 +119,7 @@ railway ssh --project 00000000-0000-4000-8000-000000000002 \
   -- /CLIProxyAPI/CLIProxyAPI --help
 ```
 
-add and verify a replacement account before changing the default. select its native proxy model in `omp_models`, update `model` and the native `modelRoles`, then run `modal deploy runner.py`. there is no automatic provider fallback. unsupported proxy/omp combinations are blockers, not permission to add an auth service. prove a second account handled the request using native account-attributed evidence; success through an old account is insufficient. rotate the proxy access key only with approval, update its Modal secret and redeploy.
+add and verify a replacement account before changing the default. select its native proxy model in `omp_models`, update `model` and the native `modelRoles`, then push the change to `main` for the deployment workflow. there is no automatic provider fallback. unsupported proxy/omp combinations are blockers, not permission to add an auth service. prove a second account handled the request using native account-attributed evidence. success through an old account is insufficient. rotate the proxy access key only with approval, update its Modal secret and manually dispatch the deployment workflow.
 
 ## one live verification path
 
