@@ -47,9 +47,10 @@ class CleanReviewTests(unittest.TestCase):
         self.assertIsNotNone(job)
         claims = set()
         store = Mock()
-        store.put.side_effect = lambda key, value, skip_if_exists: (
-            False if key in claims else (claims.add(key) or True)
+        store.put.side_effect = lambda key, value, skip_if_exists=False: (
+            False if skip_if_exists and key in claims else (claims.add(key) or True)
         )
+        store.get.return_value = None
         fake = CleanGitHub()
         with patch.object(runner, "CLAIMS", store), patch.object(runner, "github_token", return_value="test"), \
                 patch.object(runner.urllib.request, "urlopen", fake), patch.object(runner, "PRWorker") as worker:
