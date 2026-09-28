@@ -3,11 +3,16 @@
   "repository_owners": ["kastheco"],
   "repositories": [
     "example-org/example-app",
+    "example-org/example-repo-9",
+    "example-org/example-repo-7",
     "example-owner-1/example-repo-1",
     "example-owner-1/example-repo-4",
     "example-owner-1/example-repo-5"
   ],
   "docs_update": {
+    "model": "railway-codex/gpt-6-luna",
+    "thinking": "medium",
+    "service_tier": "default",
     "webhook_url": "https://runner.example.invalid",
     "branch_prefix": "docs-update/",
     "repositories": {
@@ -30,7 +35,9 @@
   "timeout_seconds": 3600,
   "omp_version": "18.3.2",
   "bun_version": "1.4.2",
-  "model": "railway-codex/gpt-6-astra",
+  "model": "railway-codex/gpt-6-sol",
+  "thinking": "high",
+  "service_tier": "priority",
   "jarvis_url": "https://advisor.example.invalid/api/jarvis/consult",
   "tools": ["read", "bash", "edit", "write", "grep", "glob", "lsp", "todo"],
   "omp_models": {
@@ -41,7 +48,14 @@
         "apiKey": "CLI_PROXY_API_KEY",
         "models": [
           {
-            "id": "gpt-6-astra",
+            "id": "gpt-6-sol",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "contextWindow": 272000,
+            "maxTokens": 32768
+          },
+          {
+            "id": "gpt-6-luna",
             "reasoning": true,
             "input": ["text", "image"],
             "contextWindow": 272000,
@@ -52,13 +66,7 @@
     }
   },
   "omp_settings": {
-    "retry": {"enabled": false, "modelFallback": false},
-    "modelRoles": {
-      "default": "railway-codex/gpt-6-astra",
-      "smol": "railway-codex/gpt-6-astra",
-      "slow": "railway-codex/gpt-6-astra",
-      "plan": "railway-codex/gpt-6-astra"
-    }
+    "retry": {"enabled": false, "modelFallback": false}
   },
   "git_author": {
     "name": "autokas",

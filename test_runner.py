@@ -1,6 +1,7 @@
 """Behavior regressions for CodeRabbit review and comment intake."""
 
 import copy
+from email.message import Message
 import unittest
 import tempfile
 import time
@@ -98,6 +99,43 @@ class ReviewIntakeTests(unittest.TestCase):
         event["review"]["body"] = "No actionable findings."
         self.assertIsNone(event_job("pull_request_review", event))
 
+    def test_generated_docs_findings_never_become_jobs(self) -> None:
+        for kind in ("pull_request_review", "pull_request_review_comment", "issue_comment"):
+            event = review_event()
+            pr = event["pull_request"]
+            pr["body"] = "ordinary PR"
+            pr["head"] = {"ref": "fix/ordinary"}
+            if kind != "pull_request_review":
+                event["action"] = "created"
+                event["comment"] = event.pop("review")
+            if kind == "issue_comment":
+                event["issue"] = event.pop("pull_request")
+                pr.pop("head")
+                pr["pull_request"] = {"url": PR_URL}
+                event["comment"]["issue_url"] = PR_URL.replace("/pulls/", "/issues/")
+            with self.subTest(kind=kind):
+                self.assertIsNotNone(event_job(kind, event))
+                pr["body"] = "<!-- omp-runner:docs-update -->\n@coderabbitai ignore"
+                self.assertIsNone(event_job(kind, event))
+                if kind != "issue_comment":
+                    pr["body"] = "older generated docs PR without a marker"
+                    pr["head"]["ref"] = CONFIG["docs_update"]["branch_prefix"] + "142-abc"
+                    self.assertIsNone(event_job(kind, event))
+
+    def test_generated_docs_merge_does_not_schedule_another_update(self) -> None:
+        event = {"action": "closed", "repository": {"full_name": REPO}, "pull_request": {
+            "number": 142, "merged": True, "merge_commit_sha": "a" * 40,
+            "base": {"ref": "main", "repo": {"full_name": REPO}},
+            "head": {"ref": "fix/ordinary", "repo": {"full_name": REPO}},
+        }}
+        self.assertIsNotNone(event_job("pull_request", event))
+        event["pull_request"]["body"] = "<!-- omp-runner:docs-update -->"
+        self.assertIsNone(event_job("pull_request", event))
+        event["pull_request"].pop("body")
+        event["pull_request"]["head"]["ref"] = CONFIG["docs_update"]["branch_prefix"] + "142-abc"
+        self.assertIsNone(event_job("pull_request", event))
+
+
     def test_new_exact_approval_allows_one_distinct_attempt(self) -> None:
         with patch.dict(CONFIG["owner_approvals"], {}, clear=True):
             original = event_job("pull_request_review", review_event())
@@ -188,7 +226,7 @@ class DocsMergeTests(unittest.TestCase):
             if payload.get("sha", self.current_head) != self.current_head:
                 if self.concurrent_merge:
                     self.merged_head = self.current_head
-                raise HTTPError(path, 409, "Head branch was modified", {}, None)
+                raise HTTPError(path, 409, "Head branch was modified", Message(), None)
             self.merged_head = self.current_head
             if self.lose_response:
                 raise TimeoutError("merge response lost")

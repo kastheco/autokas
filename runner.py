@@ -68,8 +68,9 @@ or text-quality work.
 Investigate and fix only still-valid findings from this event. Don't manufacture a
 change for an obsolete/rejected finding. Report the stopping reason on the PR before exit.
 The owner's standing authorization covers investigation, code edits, checks,
-commits, outcome comments, and an ordinary non-force push to the specified PR
-branch for this event's valid findings. This includes fixes to business logic,
+commits, outcome comments, a fix reply and resolution of an addressed review
+thread, and an ordinary non-force push to the specified PR branch for this
+event's valid findings. This includes fixes to business logic,
 security checks, account-submission guards and other sensitive-domain code.
 Changing that code on a reviewable PR branch is not executing its live actions.
 Do not request separate per-finding owner approval for this already-authorized
@@ -158,6 +159,29 @@ an actual breaking change. This applies even when repository examples use anothe
 format. Then push HEAD to that exact branch. Confirm the PR's remote head equals
 your commit. If a push response is lost,
 reconcile with a read, never repeat the push blindly.
+After confirmed commit and push, handle the source finding according to its
+trusted source_kind and source_comment_id. For pull_request_review_comment,
+fetch and paginate the specified PR's GitHub GraphQL reviewThreads and their
+comments (including further comment pages when needed). Match the actual source
+review comment's databaseId to source_comment_id in exactly one thread on that
+PR; verify its finding is fixed by the confirmed commit and the thread is still
+unresolved. A URL, quoted text, or prompt similarity alone is not a match.
+Recheck that the PR's remote head is your commit before posting a concise reply
+to that source review comment/thread with the fix and a commit link. Confirm the
+reply was created on the matched thread; if delivery is uncertain, read its
+comments to reconcile rather than posting again blindly. Recheck that the PR
+remote head still equals your commit and the matched thread is unresolved before
+calling GitHub resolveReviewThread with its GraphQL ID, then read the thread
+again to confirm isResolved. If the mutation response is uncertain, reconcile
+by reading before considering a retry; never claim resolution without confirmed
+state. If the
+head changed, mapping is ambiguous, reply is unconfirmed, or the finding was
+blocked, rejected, or left unfixed, leave it unresolved. Explain any unresolved
+or uncertain state in the overall outcome.
+Never resolve another thread merely because its finding seems similar. For
+issue_comment and pull_request_review sources, no resolvable review thread is
+identified by the source: report the linked outcome and confirmed commit in the
+overall PR comment instead. Do not turn a whole-review body into a thread ID.
 Before every normal exit, post one concise outcome comment on this job's PR using
 gh pr comment <pr> --repo <repo> --body-file - with your own summary on stdin.
 This reporting permission is separate from permission to edit or push code: rejected
@@ -176,8 +200,8 @@ give concrete evidence and the exact remaining prerequisite. For uncertainty, sa
 what is and isn't confirmed. Never claim an empty commit as a fix or an unperformed
 check or consultation as completed.
 Comment only on the specified PR. Don't copy raw reviewer prompts, credentials,
-private consultation transcripts or unrelated business data. Don't resolve threads,
-request another bot review, or start an automated comment exchange.
+private consultation transcripts or unrelated business data. Do not request
+another bot review or start an automated comment exchange.
 If comment delivery fails or is uncertain, read the PR comments to reconcile once;
 never blindly post again. If still unconfirmed, make that failure explicit in the
 final output. Don't claim a comment was posted without a confirmed response or read.
@@ -201,6 +225,17 @@ Never print credentials or write them into the repository. Finish with a concise
 summary of changed documentation and checks, and do not claim publication.
 """
 DOCS_PROMPT = "Update the configured documentation after this merged pull request."
+DOCS_PR_MARKER = "<!-- omp-runner:docs-update -->"
+
+
+def generated_docs_pr(pr: dict[str, Any]) -> bool:
+    """Identify generated docs PRs in both issue and pull-request payloads."""
+    head = pr.get("head")
+    body = pr.get("body")
+    return (
+        isinstance(head, dict)
+        and str(head.get("ref", "")).startswith(CONFIG["docs_update"]["branch_prefix"])
+    ) or (isinstance(body, str) and DOCS_PR_MARKER in body)
 
 
 
@@ -230,7 +265,7 @@ def docs_event_job(payload: dict[str, Any]) -> dict[str, Any] | None:
         or base_repo.get("full_name") != repo
         or base.get("ref") != entry["branch"]
         or head_repo.get("full_name") != repo
-        or str(head.get("ref", "")).startswith(CONFIG["docs_update"]["branch_prefix"])
+        or generated_docs_pr(pr)
     ):
         return None
     number = pr.get("number")
@@ -290,6 +325,8 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if not bot(comment.get("user", {})):
         return None
     pr = payload.get("issue" if event == "issue_comment" else "pull_request", {})
+    if generated_docs_pr(pr):
+        return None
     number = pr.get("number")
     if type(number) is not int or number <= 0:
         return None
@@ -373,8 +410,56 @@ def github(path: str) -> Any:
     return github_request("GET", path)
 
 
+def acknowledge_queued(job: dict[str, Any]) -> None:
+    """Post one acknowledgment after dispatch, never replay an uncertain write."""
+    if not CLAIMS.put("ack:" + job["key"], "posting", skip_if_exists=True):
+        log("ack_already_claimed", key=job["key"])
+        return
 
-@app.function(image=BASE_IMAGE.add_local_file(ROOT / "config.json", "/root/config.json"), secrets=[WEBHOOK_SECRET, WORKER_SECRET], timeout=120)
+    repo, pr, source = job["repo"], job["pr"], job["comment"]
+    kind = job["kind"]
+    marker = f"<!-- omp-runner:queued:{hashlib.sha256(job['key'].encode()).hexdigest()} -->"
+    if kind == "pull_request_review_comment":
+        path = f"repos/{repo}/pulls/{pr}/comments/{source}/replies"
+        listing = f"repos/{repo}/pulls/{pr}/comments?per_page=100&sort=created&direction=desc"
+        body = f"queued for investigation.\n\n{marker}"
+    else:
+        anchor = f"issuecomment-{source}" if kind == "issue_comment" else f"pullrequestreview-{source}"
+        path = f"repos/{repo}/issues/{pr}/comments"
+        listing = f"{path}?per_page=100&sort=created&direction=desc"
+        body = f"queued for investigation. [source](https://github.com/{repo}/pull/{pr}#{anchor})\n\n{marker}"
+
+    try:
+        github_request("POST", path, {"body": body})
+        log("ack_posted", key=job["key"])
+    except Exception as error:
+        # The POST may have succeeded before its response was lost. Read once,
+        # accepting only a marker from the authenticated account and source.
+        try:
+            account = github("user")
+            comments = github(listing)
+            confirmed = any(
+                comment.get("user", {}).get("id") == account.get("id")
+                and account.get("id") is not None
+                and comment.get("body") == body
+                and (kind != "pull_request_review_comment" or comment.get("in_reply_to_id") == source)
+                for comment in comments
+            )
+        except Exception as receipt_error:
+            log("ack_uncertain", key=job["key"], reason=type(error).__name__,
+                receipt_reason=type(receipt_error).__name__)
+            return
+        log("ack_reconciled" if confirmed else "ack_uncertain", key=job["key"],
+            reason=type(error).__name__)
+
+
+@app.function(
+    image=BASE_IMAGE.add_local_file(ROOT / "config.json", "/root/config.json")
+    .add_local_file(ROOT / "consult.py", "/root/consult.py")
+    .add_local_file(ROOT / "kas-voice-profile.md", "/root/kas-voice-profile.md")
+    .add_local_dir(ROOT / "skills", "/root/skills"),
+    secrets=[WEBHOOK_SECRET, WORKER_SECRET], timeout=120, retries=0,
+)
 def register_webhooks() -> None:
     def set_hook_events(path: str, expected: list[str]) -> None:
         try:
@@ -405,6 +490,9 @@ def register_webhooks() -> None:
     if "pull_request" not in events:
         set_hook_events(hook_path, events + ["pull_request"])
     for repo in (repo for repo in repos if repo != tower):
+        expected_events = ["pull_request"]
+        if repo in CONFIG["repositories"]:
+            expected_events = ["issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment"]
         hooks = github(f"repos/{repo}/hooks")
         if not isinstance(hooks, list):
             raise RuntimeError(f"hooks for {repo} could not be read safely")
@@ -415,13 +503,13 @@ def register_webhooks() -> None:
             hook = matches[0]
             if hook.get("active") is not True:
                 raise RuntimeError(f"configured hook for {repo} is inactive")
-            set_hook_events(f"repos/{repo}/hooks/{hook['id']}", ["pull_request"])
+            set_hook_events(f"repos/{repo}/hooks/{hook['id']}", expected_events)
         else:
             try:
                 created = github_request("POST", f"repos/{repo}/hooks", {
                     "name": "web",
                     "active": True,
-                    "events": ["pull_request"],
+                    "events": expected_events,
                     "config": {
                         "url": webhook_url,
                         "content_type": "json",
@@ -434,14 +522,14 @@ def register_webhooks() -> None:
                 confirmed = [
                     hook for hook in observed
                     if hook.get("config", {}).get("url") == webhook_url
-                    and hook.get("events") == ["pull_request"]
+                    and hook.get("events") == expected_events
                 ]
                 if len(confirmed) == 1:
                     continue
                 raise RuntimeError(f"pull_request hook creation for {repo} failed or is uncertain") from error
             if (
                 created.get("active") is not True
-                or created.get("events") != ["pull_request"]
+                or created.get("events") != expected_events
                 or created.get("config", {}).get("url") != webhook_url
             ):
                 raise RuntimeError(f"pull_request hook creation for {repo} was not confirmed")
@@ -453,6 +541,7 @@ def docs_worker(
 ) -> None:
     """Run the docs agent, then create and squash-merge a validated docs PR."""
     repo, number = job["repo"], job["pr"]
+    execution = CONFIG["docs_update"]
     entry = CONFIG["docs_update"]["repositories"].get(repo)
     if not isinstance(entry, dict):
         raise RuntimeError("source repository is not configured for docs updates")
@@ -499,7 +588,9 @@ def docs_worker(
     )
     args = [
         "omp", "--print", "--no-session", "--no-title", "--no-prewalk", "--no-extensions",
-        "--model", CONFIG["model"], "--config", str(settings), "--tools", ",".join(CONFIG["tools"]),
+        "--model", execution["model"], "--thinking", execution["thinking"],
+        "--service-tier", execution["service_tier"],
+        "--config", str(settings), "--tools", ",".join(CONFIG["tools"]),
         "--approval-mode", "yolo", "--append-system-prompt", str(policy),
         "--max-time", str(max(1, int(deadline - time.monotonic()) - 10)),
         "@" + str(prompt_file),
@@ -542,7 +633,7 @@ def docs_worker(
         try:
             followup = github_request("POST", f"{api_base}/pulls", {
                 "title": f"docs: update after #{number}",
-                "body": f"Documentation update for merged {repo}#{number}.",
+                "body": f"{DOCS_PR_MARKER}\n@coderabbitai ignore\n\nDocumentation update for merged {repo}#{number}.",
                 "head": branch, "base": base_branch,
             })
         except Exception as error:
@@ -585,110 +676,147 @@ def docs_worker(
         branch=branch, source_sha=job["source_sha"], changed=len(changed))
 
 @app.function(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
-              single_use_containers=True, timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192)
+              timeout=180, cpu=0.125, memory=256)
 def worker(job: dict[str, Any]) -> None:
-    """Prepare one fresh worktree and let omp perform the entire fix workflow."""
-    # Modal infrastructure can redeliver interrupted inputs even with retries=0.
-    # Keep the claim after failure: no uncertain publication is automatically replayed.
-    if not CLAIMS.put("started:" + job["key"], "started", skip_if_exists=True):
-        log("execution_uncertain_no_replay", key=job["key"])
-        return
-    deadline = time.monotonic() + CONFIG["timeout_seconds"] - 30
-    log("started", repo=job["repo"], pr=job["pr"], comment=job.get("comment"), model=CONFIG["model"])
-    with tempfile.TemporaryDirectory(prefix="omp-job-") as directory:
-        root = Path(directory)
-        home = root / "home"
-        agent = home / ".omp" / "agent"
-        agent.mkdir(parents=True)
-        (agent / "skills").symlink_to(ROOT / "skills", target_is_directory=True)
-        (agent / "models.yml").write_text(json.dumps(CONFIG["omp_models"]))
-        settings = agent / "config.yml"
-        settings.write_text(json.dumps(CONFIG["omp_settings"]))
-        env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL", "GH_TOKEN", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN")}
-        env["JARVIS_CONSULT_URL"] = CONFIG["jarvis_url"]
-        env.update(HOME=str(home), PI_CODING_AGENT_DIR=str(agent), CI="true", GH_PROMPT_DISABLED="1",
-                   GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME=CONFIG["git_author"]["name"],
-                   GIT_AUTHOR_EMAIL=CONFIG["git_author"]["email"], GIT_COMMITTER_NAME=CONFIG["git_author"]["name"],
-                   GIT_COMMITTER_EMAIL=CONFIG["git_author"]["email"])
-
-        def run(args: list[str], cwd: Path = root) -> str:
-            result = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True,
-                                    timeout=max(1, deadline - time.monotonic()))
-            if result.returncode:
-                detail = result.stderr.strip()
-                for secret in (env["GH_TOKEN"], env["CLI_PROXY_API_KEY"], env["JARVIS_RUNNER_TOKEN"]):
-                    detail = detail.replace(secret, "[redacted]")
-                raise RuntimeError(f"{args[0]} {args[1]} failed ({result.returncode}): {detail[-2000:]}")
-            return result.stdout.strip()
-
+    """Keep the durable intake queue while routing work to one pool per PR."""
+    if job["kind"] != "pull_request":
         try:
-            provider, model = CONFIG["model"].split("/", 1)
-            proxy_url = CONFIG["omp_models"]["providers"][provider]["baseUrl"]
-            request = urllib.request.Request(
-                proxy_url.rstrip("/") + "/models",
-                headers={"Authorization": f"Bearer {env['CLI_PROXY_API_KEY']}"},
-            )
-            with urllib.request.urlopen(request, timeout=30) as response:
-                if model not in {entry["id"] for entry in json.load(response)["data"]}:
-                    raise RuntimeError("configured model is not available from the proxy")
-            log("proxy_connected", model=CONFIG["model"])
-            if job.get("mode") == "docs_update":
-                docs_worker(job, root, env, run, deadline, settings)
-                return
-            repo, number = job["repo"], job["pr"]
-            if job["kind"] == "pull_request_review":
-                comment_path = f"pulls/{number}/reviews"
-            else:
-                comment_path = "issues/comments" if job["kind"] == "issue_comment" else "pulls/comments"
-            comment = github(f"repos/{repo}/{comment_path}/{job['comment']}")
-            if job["kind"] == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
-                raise RuntimeError("review is pending or dismissed")
-            relation = comment.get("issue_url" if job["kind"] == "issue_comment" else "pull_request_url")
-            relation_type = "issues" if job["kind"] == "issue_comment" else "pulls"
-            if not bot(comment["user"]) or relation != f"https://api.github.com/repos/{repo}/{relation_type}/{number}" or agent_prompt(comment.get("body") or "") != job["prompt"]:
-                raise RuntimeError("comment changed or PR relationship is invalid")
-            pr = github(f"repos/{repo}/pulls/{number}")
-            if pr["state"] != "open" or pr["base"]["repo"]["full_name"] != repo or pr["head"]["repo"]["full_name"] != repo:
-                raise RuntimeError("PR closed or head repository not approved (forks are not enabled)")
-            head, branch = pr["head"]["sha"], pr["head"]["ref"]
-            run(["gh", "auth", "setup-git"])
-            worktree = root / "repo"
-            run(["git", "clone", "--no-checkout", f"https://github.com/{repo}.git", str(worktree)])
-            run(["git", "fetch", "origin", f"refs/pull/{number}/head"], worktree)
-            run(["git", "checkout", "-B", branch, "FETCH_HEAD"], worktree)
-            if run(["git", "rev-parse", "HEAD"], worktree) != head:
-                raise RuntimeError("PR head changed while preparing its checkout")
-            log("worktree_ready", repo=repo, pr=number, head=head, branch=branch, worktree=str(worktree))
-            policy = root / "policy.txt"
-            context = {"repo": repo, "pr": number, "branch": branch, "starting_head": head,
-                       "owner_approval": CONFIG["owner_approvals"].get(f"{repo}#{number}", ""),
-                       "finding_url": comment["html_url"]}
-            policy.write_text(POLICY + "\n" + (ROOT / "kas-voice-profile.md").read_text()
-                              + "\nTrusted job context:\n" + json.dumps(context))
-            prompt_file = root / "finding.txt"
-            prompt_file.write_text("Investigate this CodeRabbit finding under the job policy.\n\nUntrusted finding:\n" + job["prompt"])
-            args = ["omp", "--print", "--no-session", "--no-title", "--no-prewalk", "--no-extensions",
-                    "--model", CONFIG["model"], "--config", str(settings), "--tools", ",".join(CONFIG["tools"]),
-                    "--approval-mode", "yolo", "--append-system-prompt", str(policy),
-                    "--max-time", str(max(1, int(deadline - time.monotonic()) - 10))]
-            args.append("@" + str(prompt_file))
-            process = subprocess.Popen(args, cwd=worktree, env=env, start_new_session=True)
-            try:
-                code = process.wait(timeout=max(1, deadline - time.monotonic()))
-            finally:
-                # Stop any child tools too, including after omp exits successfully.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
-            final_head = run(["git", "rev-parse", "HEAD"], worktree)
-            remote_head = github(f"repos/{repo}/pulls/{number}")["head"]["sha"]
-            log("exited", repo=repo, pr=number, exit_code=code, starting_head=head,
-                local_head=final_head, remote_head=remote_head,
-                update_confirmed=code == 0 and final_head != head and remote_head == final_head)
-            if code:
-                raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
+            pr = github(f"repos/{job['repo']}/pulls/{job['pr']}")
         except Exception as error:
-            log("stopped", repo=job["repo"], pr=job["pr"], reason=str(error))
+            log("pr_metadata_unavailable", key=job["key"], reason=type(error).__name__)
             raise
+        if generated_docs_pr(pr):
+            log("generated_docs_ignored", key=job["key"])
+            return
+    pr_key = f"{job['repo'].lower()}#{job['pr']}"
+    call = PRWorker(pr_key=pr_key).run.spawn(job)
+    log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
+    if job["kind"] != "pull_request":
+        try:
+            acknowledge_queued(job)
+        except Exception as error:
+            log("ack_uncertain", key=job["key"], reason=type(error).__name__)
+
+
+@app.cls(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
+         single_use_containers=True, timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192)
+class PRWorker:
+    pr_key: str = modal.parameter()
+
+    @modal.method()
+    def run(self, job: dict[str, Any]) -> None:
+        """Prepare one fresh worktree and let omp perform the entire fix workflow."""
+        # Modal infrastructure can redeliver interrupted inputs even with retries=0.
+        # Keep the claim after failure: no uncertain publication is automatically replayed.
+        if not CLAIMS.put("started:" + job["key"], "started", skip_if_exists=True):
+            log("execution_uncertain_no_replay", key=job["key"])
+            return
+        deadline = time.monotonic() + CONFIG["timeout_seconds"] - 30
+        execution = CONFIG["docs_update"] if job.get("mode") == "docs_update" else CONFIG
+        log("started", repo=job["repo"], pr=job["pr"], comment=job.get("comment"),
+            model=execution["model"], thinking=execution["thinking"], service_tier=execution["service_tier"])
+        with tempfile.TemporaryDirectory(prefix="omp-job-") as directory:
+            root = Path(directory)
+            home = root / "home"
+            agent = home / ".omp" / "agent"
+            agent.mkdir(parents=True)
+            (agent / "skills").symlink_to(ROOT / "skills", target_is_directory=True)
+            (agent / "models.yml").write_text(json.dumps(CONFIG["omp_models"]))
+            settings = agent / "config.yml"
+            settings.write_text(json.dumps(CONFIG["omp_settings"] | {
+                "modelRoles": dict.fromkeys(("default", "smol", "slow", "plan"), execution["model"]),
+            }))
+            env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL", "GH_TOKEN", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN")}
+            env["JARVIS_CONSULT_URL"] = CONFIG["jarvis_url"]
+            env.update(HOME=str(home), PI_CODING_AGENT_DIR=str(agent), CI="true", GH_PROMPT_DISABLED="1",
+                       GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME=CONFIG["git_author"]["name"],
+                       GIT_AUTHOR_EMAIL=CONFIG["git_author"]["email"], GIT_COMMITTER_NAME=CONFIG["git_author"]["name"],
+                       GIT_COMMITTER_EMAIL=CONFIG["git_author"]["email"])
+
+            def run(args: list[str], cwd: Path = root) -> str:
+                result = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True,
+                                        timeout=max(1, deadline - time.monotonic()))
+                if result.returncode:
+                    detail = result.stderr.strip()
+                    for secret in (env["GH_TOKEN"], env["CLI_PROXY_API_KEY"], env["JARVIS_RUNNER_TOKEN"]):
+                        detail = detail.replace(secret, "[redacted]")
+                    raise RuntimeError(f"{args[0]} {args[1]} failed ({result.returncode}): {detail[-2000:]}")
+                return result.stdout.strip()
+
+            try:
+                provider, model = execution["model"].split("/", 1)
+                proxy_url = CONFIG["omp_models"]["providers"][provider]["baseUrl"]
+                request = urllib.request.Request(
+                    proxy_url.rstrip("/") + "/models",
+                    headers={"Authorization": f"Bearer {env['CLI_PROXY_API_KEY']}"},
+                )
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    if model not in {entry["id"] for entry in json.load(response)["data"]}:
+                        raise RuntimeError("configured model is not available from the proxy")
+                log("proxy_connected", model=execution["model"])
+                if job.get("mode") == "docs_update":
+                    docs_worker(job, root, env, run, deadline, settings)
+                    return
+                repo, number = job["repo"], job["pr"]
+                if job["kind"] == "pull_request_review":
+                    comment_path = f"pulls/{number}/reviews"
+                else:
+                    comment_path = "issues/comments" if job["kind"] == "issue_comment" else "pulls/comments"
+                comment = github(f"repos/{repo}/{comment_path}/{job['comment']}")
+                if job["kind"] == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
+                    raise RuntimeError("review is pending or dismissed")
+                relation = comment.get("issue_url" if job["kind"] == "issue_comment" else "pull_request_url")
+                relation_type = "issues" if job["kind"] == "issue_comment" else "pulls"
+                if not bot(comment["user"]) or relation != f"https://api.github.com/repos/{repo}/{relation_type}/{number}" or agent_prompt(comment.get("body") or "") != job["prompt"]:
+                    raise RuntimeError("comment changed or PR relationship is invalid")
+                pr = github(f"repos/{repo}/pulls/{number}")
+                if generated_docs_pr(pr):
+                    log("ignored_generated_docs_pr", repo=repo, pr=number)
+                    return
+                if pr["state"] != "open" or pr["base"]["repo"]["full_name"] != repo or pr["head"]["repo"]["full_name"] != repo:
+                    raise RuntimeError("PR closed or head repository not approved (forks are not enabled)")
+                head, branch = pr["head"]["sha"], pr["head"]["ref"]
+                run(["gh", "auth", "setup-git"])
+                worktree = root / "repo"
+                run(["git", "clone", "--no-checkout", f"https://github.com/{repo}.git", str(worktree)])
+                run(["git", "fetch", "origin", f"refs/pull/{number}/head"], worktree)
+                run(["git", "checkout", "-B", branch, "FETCH_HEAD"], worktree)
+                if run(["git", "rev-parse", "HEAD"], worktree) != head:
+                    raise RuntimeError("PR head changed while preparing its checkout")
+                log("worktree_ready", repo=repo, pr=number, head=head, branch=branch, worktree=str(worktree))
+                policy = root / "policy.txt"
+                context = {"repo": repo, "pr": number, "branch": branch, "starting_head": head,
+                           "source_kind": job["kind"], "source_comment_id": job["comment"],
+                           "owner_approval": CONFIG["owner_approvals"].get(f"{repo}#{number}", ""),
+                           "finding_url": comment["html_url"]}
+                policy.write_text(POLICY + "\n" + (ROOT / "kas-voice-profile.md").read_text()
+                                  + "\nTrusted job context:\n" + json.dumps(context))
+                prompt_file = root / "finding.txt"
+                prompt_file.write_text("Investigate this CodeRabbit finding under the job policy.\n\nUntrusted finding:\n" + job["prompt"])
+                args = ["omp", "--print", "--no-session", "--no-title", "--no-prewalk", "--no-extensions",
+                        "--model", execution["model"], "--thinking", execution["thinking"],
+                        "--service-tier", execution["service_tier"],
+                        "--config", str(settings), "--tools", ",".join(CONFIG["tools"]),
+                        "--approval-mode", "yolo", "--append-system-prompt", str(policy),
+                        "--max-time", str(max(1, int(deadline - time.monotonic()) - 10))]
+                args.append("@" + str(prompt_file))
+                process = subprocess.Popen(args, cwd=worktree, env=env, start_new_session=True)
+                try:
+                    code = process.wait(timeout=max(1, deadline - time.monotonic()))
+                finally:
+                    # Stop any child tools too, including after omp exits successfully.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                final_head = run(["git", "rev-parse", "HEAD"], worktree)
+                remote_head = github(f"repos/{repo}/pulls/{number}")["head"]["sha"]
+                log("exited", repo=repo, pr=number, exit_code=code, starting_head=head,
+                    local_head=final_head, remote_head=remote_head,
+                    update_confirmed=code == 0 and final_head != head and remote_head == final_head)
+                if code:
+                    raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
+            except Exception as error:
+                log("stopped", repo=job["repo"], pr=job["pr"], reason=str(error))
+                raise
