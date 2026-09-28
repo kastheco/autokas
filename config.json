@@ -121,7 +121,6 @@
       "issues": "read/write"
     },
     "app_id_env": "GITHUB_APP_ID",
-    "installation_id_env": "GITHUB_APP_INSTALLATION_ID",
     "private_key_env": "GITHUB_APP_PRIVATE_KEY"
   }
 }

@@ -31,31 +31,34 @@ app = modal.App(CONFIG["app"])
 CLAIMS = modal.Dict.from_name(f'{CONFIG["app"]}-comments', create_if_missing=True)
 WEBHOOK_SECRET = modal.Secret.from_name("omp-runner-webhook", required_keys=["GITHUB_WEBHOOK_SECRET"])
 WORKER_SECRET = modal.Secret.from_name(
-    "omp-runner-worker", required_keys=["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN"]
+    "omp-runner-worker", required_keys=["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN"]
 )
 
-_github_token: tuple[str, float] | None = None
+_github_tokens: dict[str, tuple[str, float]] = {}
 
-def github_token() -> str:
-    """Mint a short-lived GitHub App installation token."""
+def github_token(repo: str) -> str:
+    """Mint a token from this repository's installation, never another owner's."""
     import jwt
-    global _github_token
+    repo = repo.lower()
     now = time.time()
-    if _github_token and _github_token[1] > now + 60:
-        return _github_token[0]
+    cached = _github_tokens.get(repo)
+    if cached and cached[1] > now + 60:
+        return cached[0]
     app_id = os.environ[CONFIG["github_app"]["app_id_env"]]
-    installation_id = os.environ[CONFIG["github_app"]["installation_id_env"]]
     private_key = os.environ[CONFIG["github_app"]["private_key_env"]].replace("\\n", "\n")
     assertion = jwt.encode({"iat": int(now) - 60, "exp": int(now) + 540, "iss": app_id}, private_key, algorithm="RS256")
+    headers = {"Authorization": f"Bearer {assertion}", "Accept": "application/vnd.github+json"}
+    request = urllib.request.Request(f"https://api.github.com/repos/{repo}/installation", headers=headers)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        installation_id = json.load(response)["id"]
     request = urllib.request.Request(
         f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-        headers={"Authorization": f"Bearer {assertion}", "Accept": "application/vnd.github+json"},
-        method="POST",
+        headers=headers, method="POST",
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         data = json.load(response)
-    _github_token = (data["token"], time.time() + 3600)
-    return _github_token[0]
+    _github_tokens[repo] = (data["token"], now + 3600)
+    return data["token"]
 BASE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi==0.135.1")
 IMAGE = (
     modal.Image.from_registry("node:22.22.0-bookworm-slim", add_python="3.12")
@@ -477,10 +480,10 @@ async def webhook(request: Request) -> JSONResponse:
 def github_request(method: str, path: str, payload: Any = None) -> Any:
     """Call GitHub without exposing the bearer in command arguments."""
     body = None if payload is None else json.dumps(payload).encode()
-    headers = {
-        "Authorization": f"Bearer {github_token()}",
-        "Accept": "application/vnd.github+json",
-    }
+    headers = {"Accept": "application/vnd.github+json"}
+    if path.startswith("repos/"):
+        repo = "/".join(path.split("/")[1:3])
+        headers["Authorization"] = f"Bearer {github_token(repo)}"
     if body is not None:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(
@@ -833,7 +836,7 @@ class PRWorker:
                 "modelRoles": dict.fromkeys(("default", "smol", "slow", "plan"), execution["model"]),
             }))
             env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL", "CLI_PROXY_API_KEY")}
-            env["GH_TOKEN"] = github_token()
+            env["GH_TOKEN"] = github_token(job["repo"])
             env["OMP_JOB_REPO"] = job["repo"]
             if job["repo"].split("/")[0].lower() == "example-org":
                 env["JARVIS_RUNNER_TOKEN"] = os.environ["JARVIS_RUNNER_TOKEN"]

@@ -65,7 +65,7 @@ create these native Modal secrets in the approved environment:
 | secret | values | scope |
 | --- | --- | --- |
 | `omp-runner-webhook` | `GITHUB_WEBHOOK_SECRET` | fresh random webhook signing key, receiver only |
-| `omp-runner-worker` | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY`, `CLI_PROXY_API_KEY`, `JARVIS_RUNNER_TOKEN` | worker only |
+| `omp-runner-worker` | `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `CLI_PROXY_API_KEY`, `JARVIS_RUNNER_TOKEN` | worker only |
 
 `autokas` uses a GitHub App installation token with Contents, Workflows, Pull requests and Issues read/write permissions. Repository access is controlled only by the repositories selected when the App is installed. The runner does not apply a second repository allowlist.
 
@@ -163,6 +163,6 @@ references: [Modal deployment](https://modal.com/docs/guide/apps), [secrets](htt
 
 ### autokas GitHub App setup
 
-create the `autokas` GitHub App under the `kastheco` organization with contents, workflows, pull requests and issues read/write permissions. install it only on approved repositories, then add `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY` to the `omp-runner-worker` Modal secret. the worker mints short-lived tokens for that configured installation, not a separate installation selected by repository owner, and does not use a personal GitHub PAT.
+create the `autokas` GitHub App under the `kastheco` organization with contents, workflows, pull requests and issues read/write permissions. install it only on approved repositories, then add `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` to the `omp-runner-worker` Modal secret. the worker resolves each repository’s installation with the app JWT before minting a short-lived installation token. cached tokens are isolated by repository and refreshed before expiry. a missing installation fails without falling back to another organization or a personal GitHub PAT. the agent receives the token selected for its job repository. public bot identity lookups need no installation credential.
 
 Run `./setup_autokas.py` from the repository root to create the `autokas` App through GitHub, discover its `kastheco` installation, optionally write the Modal secret, and deploy the cutover. The wizard asks before account creation and deployment.

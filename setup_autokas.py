@@ -108,10 +108,10 @@ def main() -> None:
     print(f"created autokas App {app_id}, installation {installation_id}")
     if input("write credentials to Modal and deploy the cutover now? [y/N] ").lower() != "y":
         print("App created. Add these values to Modal secret omp-runner-worker before deploying:")
-        print(f"GITHUB_APP_ID={app_id}\nGITHUB_APP_INSTALLATION_ID={installation_id}\nGITHUB_APP_PRIVATE_KEY=<private>" )
+        print(f"GITHUB_APP_ID={app_id}\nGITHUB_APP_PRIVATE_KEY=<private>")
         return
 
-    env = {"GITHUB_APP_ID": app_id, "GITHUB_APP_INSTALLATION_ID": installation_id, "GITHUB_APP_PRIVATE_KEY": private_key, "CLI_PROXY_API_KEY": getpass.getpass("existing CLI proxy key: "), "JARVIS_RUNNER_TOKEN": getpass.getpass("existing Jarvis runner token: ")}
+    env = {"GITHUB_APP_ID": app_id, "GITHUB_APP_PRIVATE_KEY": private_key, "CLI_PROXY_API_KEY": getpass.getpass("existing CLI proxy key: "), "JARVIS_RUNNER_TOKEN": getpass.getpass("existing Jarvis runner token: ")}
     env_file = Path(".autokas-modal-secret.env")
     try:
         env_file.write_text("\n".join(f"{k}={v}" for k, v in env.items()) + "\n")
