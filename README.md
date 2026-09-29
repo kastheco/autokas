@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/autokas-readme.jpg" alt="autokas. review fixes, docs management, fully automated in the cloud. powered by omp and modal.com." width="860">
+  <img src="docs/assets/autokas-readme.svg" alt="autokas. review fixes, docs management, fully automated in the cloud. powered by omp and modal.com." width="860">
 </p>
 
 <p align="center">
