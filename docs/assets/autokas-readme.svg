@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 320" role="img" aria-labelledby="title description">
+  <title id="title">autokas</title>
+  <desc id="description">autokas logo, a hooded figure with closed eyes and an orange zip, with the lines review comment in, pushed fix out</desc>
+
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2431"/>
+      <stop offset="1" stop-color="#232f3f"/>
+    </linearGradient>
+    <linearGradient id="wood" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e9b877"/>
+      <stop offset="1" stop-color="#d9a35f"/>
+    </linearGradient>
+    <clipPath id="tile"><rect x="56" y="36" width="248" height="248" rx="22"/></clipPath>
+  </defs>
+
+  <rect x="4" y="4" width="952" height="312" rx="28" fill="url(#panel)" stroke="#33445a" stroke-width="8"/>
+  <path d="M48 274 H912" stroke="#33445a" stroke-width="2"/>
+  <path d="M48 274 H326" stroke="#d2643a" stroke-width="2"/>
+
+  <g clip-path="url(#tile)">
+    <rect x="56" y="36" width="248" height="248" fill="url(#wood)"/>
+    <g stroke="#c48d4d" stroke-width="2" stroke-linecap="round" opacity=".55">
+      <path d="M84 36 V150"/><path d="M118 60 V176"/><path d="M248 44 V130"/><path d="M280 90 V210"/>
+    </g>
+    <path d="M180 48 C130 92 104 150 106 214 L102 284 H258 L254 214 C256 150 230 92 180 48 Z" fill="#17202c"/>
+    <path d="M56 284 C60 236 110 214 180 212 C250 214 300 236 304 284 Z" fill="#17202c"/>
+    <path d="M180 84 C150 84 132 116 134 152 C136 186 156 206 180 206 C204 206 224 186 226 152 C228 116 210 84 180 84 Z" fill="#ecc48c"/>
+    <path d="M148 146 Q160 152 172 146" fill="none" stroke="#17202c" stroke-width="3" stroke-linecap="round"/>
+    <path d="M188 146 Q200 152 212 146" fill="none" stroke="#17202c" stroke-width="3" stroke-linecap="round"/>
+    <path d="M181 160 V176 H188" fill="none" stroke="#17202c" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="173" y="216" width="14" height="68" rx="3" fill="#d2643a"/>
+    <rect x="170" y="212" width="20" height="12" rx="3" fill="#e9b877"/>
+  </g>
+  <rect x="56" y="36" width="248" height="248" rx="22" fill="none" stroke="#33445a" stroke-width="3"/>
+
+  <g font-family="Oswald, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="360" y="130" fill="#f1e6d0" font-size="76" font-weight="700" letter-spacing="-1.5">autokas</text>
+    <text x="364" y="177" fill="#9fb0c4" font-size="28" font-weight="500" letter-spacing="2">review fixes, run in the cloud</text>
+    <text x="364" y="235" fill="#e9b877" font-size="22" font-weight="500">comment in. pushed fix out. then it leaves.</text>
+  </g>
+</svg>
