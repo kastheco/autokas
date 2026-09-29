@@ -4,55 +4,11 @@
     "model": "railway-codex/gpt-6-luna",
     "thinking": "medium",
     "service_tier": "default",
-    "webhook_url": "https://runner.example.invalid",
+    "webhook_url": "https://runner.example.invalid/webhook",
     "branch_prefix": "docs-update/",
-    "repositories": {
-      "example-org/example-app": {
-        "branch": "main",
-        "folders": [
-          "docs"
-        ],
-        "postprocess": {
-          "command": ["node", ".railway/worker-release.mjs", "record"],
-          "files": [".railway/worker-releases.json"]
-        }
-      },
-      "example-org/example-repo-9": {
-        "branch": "staging",
-        "folders": [
-          "docs"
-        ]
-      },
-      "example-org/example-repo-7": {
-        "branch": "staging",
-        "folders": [
-          "docs"
-        ]
-      },
-      "example-org/example-repo-6": {
-        "branch": "main",
-        "folders": [
-          "docs"
-        ]
-      },
-      "example-org/example-repo-8": {
-        "branch": "main",
-        "folders": [
-          "docs"
-        ]
-      },
-      "example-org/example-repo-2": {
-        "branch": "main",
-        "folders": [
-          "docs"
-        ]
-      }
-    },
-    "tower_hook_id": 9000000009
+    "repositories": {}
   },
-  "owner_approvals": {
-    "example-org/example-app#144": ""
-  },
+  "owner_approvals": {},
   "coderabbit": {
     "login": "coderabbitai[bot]",
     "id": 136622811
@@ -63,7 +19,8 @@
   "model": "railway-codex/gpt-6-sol",
   "thinking": "high",
   "service_tier": "priority",
-  "jarvis_url": "https://advisor.example.invalid/api/jarvis/consult",
+  "jarvis_url": "",
+  "jarvis_owner": "",
   "tools": [
     "read",
     "bash",

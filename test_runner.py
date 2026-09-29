@@ -137,6 +137,11 @@ class ReviewIntakeTests(unittest.TestCase):
                     self.assertIsNone(event_job(kind, event))
 
     def test_generated_docs_merge_does_not_schedule_another_update(self) -> None:
+        repositories = {REPO: {"branch": "main", "folders": ["docs"]}}
+        with patch.dict(CONFIG["docs_update"]["repositories"], repositories):
+            self.check_generated_docs_merge()
+
+    def check_generated_docs_merge(self) -> None:
         event = {"action": "closed", "repository": {"full_name": REPO}, "pull_request": {
             "number": 142, "merged": True, "merge_commit_sha": "a" * 40,
             "base": {"ref": "main", "repo": {"full_name": REPO}},
@@ -365,7 +370,8 @@ class DocsMergeTests(unittest.TestCase):
         self.followup["head"]["ref"] = self.branch
         entry = {"branch": "main", "folders": ["docs"]}
         if configured:
-            entry["postprocess"] = copy.deepcopy(CONFIG["docs_update"]["repositories"]["example-org/example-app"]["postprocess"])
+            entry["postprocess"] = {"command": ["node", ".railway/worker-release.mjs", "record"],
+                                       "files": [".railway/worker-releases.json"]}
         CONFIG["docs_update"]["repositories"]["example/docs"] = entry
         self.real_env = {**os.environ, "GH_TOKEN": "disposable-token", "HOOK_MODE": mode,
                          "EXPECT_BASE": self.job["source_sha"],

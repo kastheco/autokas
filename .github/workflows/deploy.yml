@@ -21,20 +21,54 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: test
-        run: python -m unittest discover -v
+        run: |
+          cp config.example.json config.json
+          python -m unittest discover -v
+      - name: private_config
+        id: private_config
+        env:
+          AUTOKAS_CONFIG_JSON: ${{ secrets.AUTOKAS_CONFIG_JSON }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          from urllib.parse import urlparse
+          try:
+              config = json.loads(os.environ["AUTOKAS_CONFIG_JSON"])
+              url = urlparse(config["docs_update"]["webhook_url"])
+              if url.scheme != "https" or not url.hostname or url.hostname.endswith(".invalid"):
+                  raise ValueError
+              fd = os.open("config.json", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+              with os.fdopen(fd, "w") as f:
+                  json.dump(config, f, indent=2)
+              os.chmod("config.json", 0o600)
+          except Exception:
+              sys.exit("AUTOKAS_CONFIG_JSON is missing, invalid, or still the example config")
+          PY
+          echo ready=true >> "$GITHUB_OUTPUT"
       - name: pause, drain, deploy and reconcile
         env:
           GH_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           MODAL_ENVIRONMENT: main
-        run: python -u deploy.py
+        run: |
+          # Detailed output names private repositories, so it stays in a private runner file.
+          umask 077
+          status=0
+          python -u deploy.py > "$RUNNER_TEMP/deploy.log" 2>&1 || status=$?
+          echo "deploy exit status: $status"
+          exit $status
       - name: restore intake after failure or cancellation
-        if: always()
+        if: always() && steps.private_config.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           MODAL_ENVIRONMENT: main
           DEPLOY_CLEANUP: '1'
-        run: python -u deploy.py
+        run: |
+          umask 077
+          status=0
+          python -u deploy.py > "$RUNNER_TEMP/restore.log" 2>&1 || status=$?
+          echo "restore exit status: $status"
+          exit $status

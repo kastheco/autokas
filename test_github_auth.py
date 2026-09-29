@@ -13,7 +13,7 @@ class InstallationTests(unittest.TestCase):
     def test_repository_requests_never_reuse_another_installation_token(self):
         calls = []
         now = [1000]
-        installations = {'example-owner-3/example-repo-3': 21, 'example-org/example-app': 42}
+        installations = {'example-owner-3/example-repo-2': 21, 'example-org/example-app': 42}
 
         def serve(request, timeout):
             path = request.full_url.removeprefix('https://api.github.com/')
@@ -33,13 +33,13 @@ class InstallationTests(unittest.TestCase):
             return io.BytesIO(json.dumps(value).encode())
 
         with patch.dict(runner._github_tokens, {}, clear=True), patch.dict(os.environ, GITHUB_APP_ID='1', GITHUB_APP_PRIVATE_KEY='fixture'), patch('jwt.encode', return_value='app-jwt'), patch.object(runner.time, 'time', side_effect=lambda: now[0]), patch.object(runner.urllib.request, 'urlopen', side_effect=serve):
-            runner.github('repos/example-owner-3/example-repo-3/pulls/289')
+            runner.github('repos/Example-Owner-3/example-repo-2/pulls/289')
             runner.github('repos/example-org/example-app/pulls/1')
-            runner.github('repos/example-owner-3/example-repo-3/pulls/290')
+            runner.github('repos/EXAMPLE-OWNER-3/example-repo-2/pulls/290')
             self.assertEqual(calls.count('app/installations/21/access_tokens'), 1)
             self.assertEqual(calls.count('app/installations/42/access_tokens'), 1)
             now[0] += 3600
-            runner.github('repos/example-owner-3/example-repo-3/pulls/292')
+            runner.github('repos/Example-Owner-3/example-repo-2/pulls/292')
             self.assertEqual(calls.count('app/installations/21/access_tokens'), 2)
             with self.assertRaises(HTTPError):
                 runner.github('repos/not-installed/private/pulls/1')

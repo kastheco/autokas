@@ -102,7 +102,7 @@ def verify(state: dict[str, Any]) -> None:
         time.sleep(5)
     else:
         raise RuntimeError('Receiver did not reject unsigned requests with 401')
-    hook = next(h for h in state['hooks'] if h['repo'] == 'example-org/example-app')
+    hook = state['hooks'][0]
     path = f"repos/{hook['repo']}/hooks/{hook['id']}"
     before = {d['id'] for d in github(path + '/deliveries?per_page=100')}
     github(path + '/pings', 'POST')

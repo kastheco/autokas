@@ -54,8 +54,9 @@ def main() -> int:
     parser.add_argument("--request-id", required=True, type=uuid.UUID)
     args = parser.parse_args()
     repo = os.environ.get("OMP_JOB_REPO", "").split("/")
-    if len(repo) != 2 or repo[0].lower() != "example-org" or not repo[1]:
-        print("blocked: Jarvis is only available for example-org repositories; "
+    owner = os.environ.get("JARVIS_REPOSITORY_OWNER", "")
+    if len(repo) != 2 or not all(repo) or not owner or repo[0].lower() != owner.lower():
+        print("blocked: Jarvis is only available for the configured repository owner; "
               "report business-logic changes to the repository owner", file=sys.stderr)
         return 1
     raw = sys.stdin.read(12_001)

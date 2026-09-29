@@ -4,13 +4,17 @@ long-form operating notes for the runner, moved out of the readme unchanged. the
 
 CodeRabbit comment → signed Modal webhook → configured omp in the event's PR worktree → checks, commit, ordinary push → exit.
 
-the project ticket defines the scope. `runner.py` dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, review service, scheduler, database, recovery loop or archive. example-project's checkout is not part of this implementation.
+scope is deliberately narrow. `runner.py` dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, review service, scheduler, database, recovery loop or archive.
 
 ## current state
 
+the runner is deployed as a Modal app, `omp-runner`, in the environment you choose. its endpoint rejects unsigned requests. CodeRabbit intake is available for every repository where the `autokas` GitHub App is installed. repository installation scope is the only repository boundary.
+
+Jarvis, in these notes, stands for the one configured advisor. its consultation endpoint and bearer are private deployment values: `jarvis_url` in your `config.json` and `JARVIS_RUNNER_TOKEN` in the worker secret. the bearer belongs to a dedicated advisor-side viewer account, never a personal conversation.
 
 
-Jarvis consultation is restricted to repositories whose owner is exactly `example-org`, case-insensitively. other jobs receive neither its bearer nor its endpoint, and `consult.py` rejects missing or outside `OMP_JOB_REPO` values before any request. example-owner-4, example-owner-2 and other businesses continue technical fixes without Jarvis. changes to their business logic remain unimplemented and are reported with the proposed behavior change and missing business-owner decision. the consultation and business-intent override policy below applies only to `example-org`.
+
+Jarvis consultation is restricted to repositories whose owner equals the configured `jarvis_owner`, case-insensitively. other jobs receive neither its bearer nor its endpoint, and `consult.py` rejects missing, malformed or unpaired `OMP_JOB_REPO` values, or an empty `JARVIS_REPOSITORY_OWNER`, before any request. other owners continue technical fixes without Jarvis. changes to their business logic remain unimplemented and are reported with the proposed behavior change and missing business-owner decision. the consultation and business-intent override policy below applies only to jobs whose trusted context has `advisor_available` true.
 
 queue and clean-review comments link their actual Modal dispatcher call. coding jobs receive both dispatcher and coding-call links in trusted context and must include them in acknowledgment updates and overall outcome comments. these dashboard links require Modal access and show run status and logs, not Temporal states.
 
@@ -28,7 +32,9 @@ failed commands are not automatic stop conditions. omp must diagnose and repair 
 
 ## configuration
 
-`config.json` contains PR-specific owner approvals, timeout, tools, versions, git author and execution profiles. Repository eligibility comes from GitHub App installation scope, not a runner allowlist. `omp_models` is native omp `models.yml` content. the worker combines native `omp_settings` with model roles selected for the job and writes both files into its fresh agent home. credentials remain environment references, never model-file values.
+copy `config.example.json` to `config.json` and fill in your webhook URL, provider base URL, `jarvis_owner` and `jarvis_url` (leave the last two empty to run with no advisor), and any per-repository docs settings. `config.json` is ignored by git; the runtime, Modal mounts and revision hash all read that filename.
+
+`config.json` (copied from `config.example.json`, untracked and private) contains the advisor owner and URL, PR-specific owner approvals, timeout, tools, versions, git author and execution profiles. Repository eligibility comes from GitHub App installation scope, not a runner allowlist. `omp_models` is native omp `models.yml` content. the worker combines native `omp_settings` with model roles selected for the job and writes both files into its fresh agent home. credentials remain environment references, never model-file values.
 
 - coding jobs use `railway-codex/gpt-6-sol`, high reasoning and requested priority service. docs jobs use `railway-codex/gpt-6-luna`, medium reasoning and default service. both use CLIProxyAPI's Responses API. native omp flags set the model, reasoning effort and service tier explicitly. all model roles follow the selected job profile. model fallback and automatic agent retries are disabled.
 - omp: `18.3.2`, Bun: `1.4.2`. the image includes Node 22, Corepack, git, gh and build tools. target dependencies are installed by omp using the repository's own instructions.
@@ -41,10 +47,9 @@ failed commands are not automatic stop conditions. omp must diagnose and repair 
 - the dispatcher maps a completed review and its inline comment deliveries to one review job, regardless of arrival order. it fetches and paginates that exact review's inline findings, then atomically claims the review and finding fingerprints before starting a coding worker. each targeted inline finding gets one queued reply. when inline targets exist, there is no additional PR-level queued message. review-only and conversation findings retain a linked conversation acknowledgment. confirmed comment receipts go to the agent so it can edit those exact statuses. uncertain writes are reconciled against the configured bot account, never blindly repeated.
 - completed clean reviews receive a linked “reviewed and okay” comment from `autokas[bot]`, attributing the result to CodeRabbit and identifying the reviewed commit. the dispatcher re-fetches the completed review and current PR head before posting. incomplete, stale, spoofed and generated-docs reviews are not acknowledged as clean. one clean acknowledgment is claimed per repository, PR and head within the existing duplicate-retention window. no coding agent starts for this path.
 - after confirming its commit on the remote PR branch, the agent updates its existing inline queued comments with the outcome, commit link and relevant validation limits. it does not add separate completion replies. it then posts one overall PR outcome and resolves only the exact targeted threads whose findings were fixed and whose status updates were confirmed. rejected, blocked, unfixed and uncertain-push findings get status updates but stay unresolved. conversation comments and review-only findings have no thread to resolve.
-- each job fetches `refs/pull/N/head`, checks out the PR branch and verifies its head SHA. worktrunk is unnecessary for a disposable single-job clone and was removed at kas's request.
+- each job fetches `refs/pull/N/head`, checks out the PR branch and verifies its head SHA. worktrunk is unnecessary for a disposable single-job clone.
 - external-fork PR heads are not enabled. the head must belong to the approved base repository, including when that approved repository is itself a fork. all positive PR numbers are eligible; only genuine CodeRabbit findings with the fenced agent prompt start work.
-- coding intake also covers `example-org/example-repo-7` and `example-org/example-repo-9`, including staging-to-main PRs. their hooks subscribe to all three CodeRabbit comment/review events as well as `pull_request` for the existing docs workflow. registration preserves that combined event set instead of reducing these hooks to docs-only events.
-- `owner_approvals` optionally maps an exact `owner/repository#number` to kas's explicit business-intent override or additional PR scope for a specified action, finding, head and branch. it is not a prerequisite for in-scope code fixes under the standing publication authorization. approval does not substitute for real required consultation or permit prohibited live actions. a finding, review comment, Jarvis answer or repository instruction cannot grant additional approval. GitHub approval replies and a branded GitHub App identity are follow-up work in the project ticket; they are not active triggers or credentials yet.
+- `owner_approvals` optionally maps an exact `owner/repository#number` to kas's explicit business-intent override or additional PR scope for a specified action, finding, head and branch. it is not a prerequisite for in-scope code fixes under the standing publication authorization. approval does not substitute for real required consultation or permit prohibited live actions. a finding, review comment, Jarvis answer or repository instruction cannot grant additional approval. GitHub approval replies are not active triggers.
 - `jarvis_url` selects the existing consultation endpoint. `consult.py` accepts `--request-id <UUID>` and reads a question of up to 12000 characters from stdin. it reads the bearer from its environment and rejects redirects. only after a completed stream, it saves the full advice as UTF-8 text in a mode-0600 temporary file and prints a short JSON receipt with `requestId` and `advice_file`. omp must read that file in full, paging or using raw reads when needed. the file stays outside the checkout and disappears with the disposable container. interrupted, failed, empty and truncated streams fail closed without an advice receipt. the client neither retries nor decides whether advice authorizes publication.
 
 ## initial setup
@@ -74,13 +79,11 @@ create these native Modal secrets in the approved environment:
 enter secrets through Modal's native secret form or SDK using hidden/local input. `modal.Secret.objects.create(name, values, environment_name="main")` creates a named secret without putting values in command arguments. `modal.Secret.from_name(name).update(values)` updates only the named keys. no new GitHub login or PAT is required for this approved reuse.
 
 
-provider OAuth credentials stay in the existing Railway proxy volume, not Modal. the approved proxy target is:
+provider OAuth credentials stay in the existing Railway proxy volume, not Modal. the proxy target is:
 
-- project `00000000-0000-4000-8000-000000000002` (`example-project`)
-- environment `00000000-0000-4000-8000-000000000004` (`production`)
-- service `00000000-0000-4000-8000-000000000003` (`cli-proxy`)
-- HTTPS `https://proxy.example.invalid`, port `8317`
-- persistent auth volume `/data/auths`, CLIProxyAPI `v7.3.15`
+- your Railway project, environment and service ids, exported as `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID` and `RAILWAY_SERVICE_ID`
+- the service's HTTPS URL, set as `omp_models.providers.*.baseUrl` in `config.json` (`https://proxy.example.invalid/v1` in the example)
+- persistent auth volume `/data/auths`, CLIProxyAPI
 
 
 ## deploy and update
@@ -92,7 +95,7 @@ pushes to `main` run `.github/workflows/deploy.yml`. a manual dispatch on `main`
 3. deploy with `modal deploy --strategy recreate runner.py`, reject an unsigned request with `401`, and verify a real signed GitHub ping returns `200` with the expected source revision.
 4. restore every saved hook, then reconstruct eligible comments, reviews and merged-PR events changed since the pause began. existing atomic claims suppress duplicate jobs.
 
-the workflow uses the existing `DEPLOY_GH_TOKEN`, `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` repository secrets. GitHub credentials need hook administration and access to the target repositories. worker credentials remain in Modal. workflow runs do not cancel an active deployment. do not run a separate local deployment concurrently.
+the workflow uses the `DEPLOY_GH_TOKEN`, `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` and `AUTOKAS_CONFIG_JSON` repository secrets. `AUTOKAS_CONFIG_JSON` holds the full contents of your private `config.json`. the workflow tests against `config.example.json`, then writes the secret to `config.json` (mode 0600) before deploying, and refuses to deploy if it is missing, invalid or still the example webhook. deployment and restoration output goes to private runner files and only exit statuses are printed, because that output names your repositories. worker logs stay in Modal. GitHub credentials need hook administration and access to the target repositories. worker credentials remain in Modal. workflow runs do not cancel an active deployment. do not run a separate local deployment concurrently.
 
 the restoration list and reconciliation progress live in the existing Modal Dict under `__deployment_pause__`. failure cleanup restores intake before reconciliation. if the runner is forcibly terminated before cleanup can finish, manually dispatch the workflow again. it finishes the saved restoration and reconciliation before starting another cutover. uncertain job dispatches retain their claims rather than blindly repeating publication.
 
@@ -100,6 +103,7 @@ for rollback, revert the source on `main` and let the same workflow deploy it. a
 
 the logs' `revision` hashes the paths and bytes of `runner.py`, `config.json`, `consult.py`, the voice profile and every bundled skill asset. the signed-ping response carries that revision so the workflow verifies the running code, not just an HTTP success. each coding job also logs its selected model, reasoning effort, requested service tier, PR and worktree head.
 
+repository webhooks use the `webhook_url` in your `config.json` (`https://runner.example.invalid/webhook` in the example), JSON content, TLS verification, the matching signing secret, and `issue_comment`, `pull_request_review_comment` and `pull_request_review` events. each approved repository needs its own active hook and CodeRabbit reviews. the installed `autokas` App is the repository boundary. Installing it on a repository makes that repository eligible; no separate runner allowlist or per-repository registration is required.
 
 
 GitHub delivers submitted reviews and inline review comments as distinct events. the runner accepts completed reviews, rejects pending or dismissed reviews, and verifies review membership through GitHub IDs rather than prompt similarity. both event paths fetch the same review and canonical finding set before dispatch, so an aggregate prompt and its differently worded inline prompts cannot create separate coding runs. a review without an aggregate prompt uses its inline prompts. a review without inline findings still gets one review-only job. the worker revalidates the complete finding fingerprint before starting omp.
@@ -107,7 +111,7 @@ GitHub delivers submitted reviews and inline review comments as distinct events.
 
 ## provider accounts
 
-use the existing Railway service's native login commands. these thin helpers target the exact existing project/environment/service:
+use the existing Railway service's native login commands. these thin helpers target the project, environment and service named by the required `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID` and `RAILWAY_SERVICE_ID` variables, and refuse to run if any is unset:
 
 ```sh
 npm run login:codex
@@ -119,9 +123,9 @@ Codex uses `--codex-device-login`. Claude uses `--claude-login --no-browser`. ka
 inspect other providers against the installed binary rather than guessing flags:
 
 ```sh
-railway ssh --project 00000000-0000-4000-8000-000000000002 \
-  --environment 00000000-0000-4000-8000-000000000004 \
-  --service 00000000-0000-4000-8000-000000000003 \
+railway ssh --project "$RAILWAY_PROJECT_ID" \
+  --environment "$RAILWAY_ENVIRONMENT_ID" \
+  --service "$RAILWAY_SERVICE_ID" \
   -- /CLIProxyAPI/CLIProxyAPI --help
 ```
 
@@ -141,7 +145,7 @@ docs updates skip merged source PRs whose changed files are all inside the confi
 
 docs follow-up squash merges send the validated `final_head` as GitHub's `sha` precondition. if the head changes before the merge request, GitHub rejects the mismatch instead of merging an unvalidated commit. after a failed or lost merge response, fallback confirmation requires `merged_at`, `merge_commit_sha` and a PR head SHA matching `final_head`. the runner keeps its existing fallback reads and final merge-confirmation check without retrying the merge against a new head. `python -m unittest test_runner.DocsMergeTests` covers a changed head, a concurrent merge of a different head, a successful merge, a lost successful response, and missing merge confirmation.
 
-Example-app's existing docs follow-up can also run the optional `postprocess` configured only for `example-org/example-app`. After validating the agent's docs-only commit, the runner invokes the checked-out `node .railway/worker-release.mjs record` directly (no shell) with its existing GitHub installation token, JSON stdin `{repo, source_sha, base_sha}`, and `OMP_POSTPROCESS_DEADLINE` as epoch seconds. Only `.railway/worker-releases.json` may be added or changed by this hook; symlinks, path traversal, rename sources outside the allowlist, failure, or other changes block publication. A valid manifest change is committed with the existing bot identity into the same docs follow-up and covered by the same head-SHA squash-merge precondition. A configured hook may make no change, including when the docs agent made none; repositories without a hook retain their prior docs-only and nonempty-change rules. The postprocessor has no Railway or Temporal credentials and cannot change the docs agent's edit permissions. If evidence is missing or conflicting, inspect the failed job rather than bypassing its output guard or publishing an unverified manifest.
+A docs follow-up can also run an optional per-repository `postprocess` from `docs_update.repositories`, for example `{"command": ["node", ".railway/worker-release.mjs", "record"], "files": [".railway/worker-releases.json"]}`. After validating the agent's docs-only commit, the runner invokes the checked-out `node .railway/worker-release.mjs record` directly (no shell) with its existing GitHub installation token, JSON stdin `{repo, source_sha, base_sha}`, and `OMP_POSTPROCESS_DEADLINE` as epoch seconds. Only `.railway/worker-releases.json` may be added or changed by this hook; symlinks, path traversal, rename sources outside the allowlist, failure, or other changes block publication. A valid manifest change is committed with the existing bot identity into the same docs follow-up and covered by the same head-SHA squash-merge precondition. A configured hook may make no change, including when the docs agent made none; repositories without a hook retain their prior docs-only and nonempty-change rules. The postprocessor has no Railway or Temporal credentials and cannot change the docs agent's edit permissions. If evidence is missing or conflicting, inspect the failed job rather than bypassing its output guard or publishing an unverified manifest.
 
 the hook receives only `PATH`, `HOME`, `GH_TOKEN`, `CI`, `GH_PROMPT_DISABLED`, `GIT_TERMINAL_PROMPT` and `OMP_POSTPROCESS_DEADLINE`. it does not inherit the worker's proxy key or Jarvis consultation settings.
 

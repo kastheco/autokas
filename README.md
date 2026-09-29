@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="runner.py">runner</a> ·
-  <a href="config.json">config</a> ·
+  <a href="config.example.json">config</a> ·
   <a href="consult.py">advisor</a> ·
   <a href="deploy.py">deploy</a> ·
   <a href="docs/operations.md">operations</a> ·
@@ -14,7 +14,7 @@
 
 autokas fixes CodeRabbit review findings without anyone sitting at a keyboard. a signed GitHub webhook lands on Modal, a configured omp agent checks out the pull request in a disposable container, runs the repo's checks, commits, pushes to the PR branch and exits.
 
-the runner dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, review service, scheduler, database or recovery loop. scope is set in the project ticket.
+the runner dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, review service, scheduler, database or recovery loop.
 
 ## how a job runs
 
@@ -31,7 +31,7 @@ a repo can be paired with an advisor: an external service omp consults before it
 
 `consult.py` is the client. it sends a bounded question, keeps the full answer in a private temp file for omp to read, and fails closed on any interrupted or empty response. an advisor's bearer and endpoint go only to jobs for repos it's paired with.
 
-today the one advisor is Jarvis, paired with `example-org` repos. other owners get technical fixes with no advisor, and business-logic changes there are reported instead of made. the full policy is in [docs/operations.md](docs/operations.md).
+the advisor is paired to one repository owner through `jarvis_owner` in the config. other owners get technical fixes with no advisor, and business-logic changes there are reported instead of made. the full policy is in [docs/operations.md](docs/operations.md).
 
 autokas also opens follow-up docs PRs after merges, limited to each repo's configured documentation folders.
 
@@ -41,7 +41,7 @@ autokas is a GitHub App owned by `kastheco`. the repositories it's installed on 
 
 the installed set is managed in the App's GitHub installation settings.
 
-the Modal app is `omp-runner` in workspace `example-workspace`, environment `main`. the repo was renamed to `autokas` on GitHub, but app, function and package names stay as they are so live hooks and secrets keep working. models come from the Railway CLIProxyAPI service through omp's native `models.yml`.
+the Modal app is `omp-runner`. the repo was renamed to `autokas` on GitHub, but app, function and package names stay as they are so live hooks and secrets keep working. models come from the Railway CLIProxyAPI service (its URL is `omp_models` in your config) through omp's native `models.yml`.
 
 ## set up
 
@@ -54,7 +54,13 @@ modal profile list
 modal environment list
 ```
 
-kas does the Modal login and consent. then create two secrets in the approved environment, entering values through Modal's own form or SDK, never through arguments, chat or tracked files:
+do the Modal login and consent yourself. then copy the example config and edit it:
+
+```sh
+cp config.example.json config.json
+```
+
+`config.json` holds your webhook URL, provider URL and advisor pairing and stays untracked. then create two secrets in the approved environment, entering values through Modal's own form or SDK, never through arguments, chat or tracked files:
 
 | secret | values | scope |
 | -- | -- | -- |
@@ -63,7 +69,7 @@ kas does the Modal login and consent. then create two secrets in the approved en
 
 `./setup_autokas.py` creates the GitHub App, finds its `kastheco` installation and can write the worker secret and deploy. it asks before each of those steps.
 
-model logins live in the Railway proxy volume, not Modal:
+model logins live in the Railway proxy volume, not Modal. export `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID` and `RAILWAY_SERVICE_ID` first, the scripts refuse to run without them:
 
 ```sh
 npm run login:codex
@@ -72,7 +78,7 @@ npm run login:claude
 
 ## deploy
 
-pushes to `main` run `.github/workflows/deploy.yml`, which runs the tests and then `deploy.py`. it pauses the repo hooks, drains running work, redeploys with `modal deploy --strategy recreate runner.py`, checks that an unsigned request returns `401` and a signed ping returns `200` with the expected source revision, then restores the hooks and replays anything missed. rollback is a revert on `main`.
+pushes to `main` run `.github/workflows/deploy.yml`, which runs the tests against `config.example.json`, materializes your real config from the `AUTOKAS_CONFIG_JSON` Actions secret, and then runs `deploy.py`. its output is written to private runner files, so public logs show only exit statuses. it pauses the repo hooks, drains running work, redeploys with `modal deploy --strategy recreate runner.py`, checks that an unsigned request returns `401` and a signed ping returns `200` with the expected source revision, then restores the hooks and replays anything missed. rollback is a revert on `main`.
 
 ## test
 
@@ -90,7 +96,7 @@ disable a repo's webhook to stop new intake and let running work finish. uninsta
 
 ```text
 runner.py             webhook receiver, dispatcher, PR worker and docs worker
-config.json           models, tools, profiles, timeouts and git identity
+config.example.json   example models, tools, profiles, timeouts and git identity
 consult.py            bounded client for advisor consultations
 deploy.py             hook pause, drain, deploy, verify, restore and replay
 setup_autokas.py      one-time GitHub App and Modal setup wizard

@@ -66,7 +66,7 @@ def main() -> None:
     manifest = {
         "name": "autokas",
         "url": "https://github.com/kastheco",
-        "hook_attributes": {"url": "https://runner.example.invalid", "active": False},
+        "hook_attributes": {"url": json.loads(Path("config.json").read_text())["docs_update"]["webhook_url"], "active": False},
         "redirect_url": callback,
         "description": "authenticated GitHub identity for omp-runner",
         "public": False,

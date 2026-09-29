@@ -112,14 +112,13 @@ Never print credentials or write them into the repository. Don't read environmen
 secrets, credential files, or provider accounts. Native gh and omp already have auth.
 Don't switch provider/model. Don't launch background work that outlives this job.
 
-Jarvis is available only for repositories owned by example-org (case-insensitive
-exact owner match). For every other owner, including example-owner-4 and example-owner-2, never
-contact Jarvis or Kimmy. Continue technical fixes that preserve business behavior.
+Jarvis is available only when the trusted job context has advisor_available true.
+When it is false, never contact Jarvis or Kimmy. Continue technical fixes that preserve business behavior.
 If a finding requires changing business logic, leave that change unimplemented,
 explain the proposed behavior change and missing business-owner decision on the PR,
 and complete independent technical findings where possible. Missing Jarvis access
 does not block technical fixes. The consultation and business-intent override
-rules below apply only to example-org repositories.
+rules below apply only when advisor_available is true.
 Jarvis's role is business decisions and business logic only. Consult real Jarvis
 before changing core business rules or intended business behavior, using your bash
 tool: python /root/consult.py --request-id <fresh UUID>. A purely technical, safety
@@ -928,7 +927,11 @@ class PRWorker:
             env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL", "CLI_PROXY_API_KEY")}
             env["GH_TOKEN"] = github_token(job["repo"])
             env["OMP_JOB_REPO"] = job["repo"]
-            if job["repo"].split("/")[0].lower() == "example-org":
+            parts = job["repo"].split("/")
+            owner = CONFIG["jarvis_owner"]
+            advisor_available = len(parts) == 2 and all(parts) and bool(owner) and parts[0].lower() == owner.lower()
+            if advisor_available:
+                env["JARVIS_REPOSITORY_OWNER"] = owner
                 env["JARVIS_RUNNER_TOKEN"] = os.environ["JARVIS_RUNNER_TOKEN"]
                 env["JARVIS_CONSULT_URL"] = CONFIG["jarvis_url"]
             env.update(HOME=str(home), PI_CODING_AGENT_DIR=str(agent), CI="true", GH_PROMPT_DISABLED="1",
@@ -1002,6 +1005,7 @@ class PRWorker:
                            "modal_run_links": modal_run_links,
                            "source_kind": job["kind"], "source_comment_id": job["comment"],
                            "owner_approval": CONFIG["owner_approvals"].get(f"{repo}#{number}", ""),
+                           "advisor_available": advisor_available,
                            "finding_url": comment["html_url"],
                            "acknowledgment_author": CONFIG["git_author"]["name"],
                            "acknowledgment": job.get("acknowledgment"),
