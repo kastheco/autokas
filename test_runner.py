@@ -1,6 +1,9 @@
 """Behavior regressions for CodeRabbit review and comment intake."""
 
 import copy
+import json
+import os
+import subprocess
 from email.message import Message
 import unittest
 import tempfile
@@ -187,6 +190,7 @@ class DocsMergeTests(unittest.TestCase):
                      "ref": self.branch, "sha": self.final_head},
             "base": {"repo": {"full_name": "example/docs"}, "ref": "main"},
         }
+        self.real_popen = subprocess.Popen
         patches = [
             patch.dict(CONFIG["docs_update"]["repositories"], {
                 "example/docs": {"branch": "main", "folders": ["docs"]},
@@ -203,6 +207,7 @@ class DocsMergeTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         mocks[3].return_value.wait.return_value = 0
         self.process = mocks[3]
+        self.github_read = mocks[1]
         self.log = mocks[5]
 
     def read_github(self, path):
@@ -217,7 +222,7 @@ class DocsMergeTests(unittest.TestCase):
         if path == f"{self.api}/2/files?per_page=100":
             if self.move_head:
                 self.current_head = "c" * 40
-            return [{"filename": "docs/guide.md"}]
+            return getattr(self, "followup_files", [{"filename": "docs/guide.md"}])
         if path == f"{self.api}?state=open&head=example:{self.branch}&base=main":
             return []
         if path == f"{self.api}/2":
@@ -249,8 +254,8 @@ class DocsMergeTests(unittest.TestCase):
             return "0" * 40
         if args == ["git", "rev-parse", "HEAD"]:
             return self.final_head
-        if args[:3] == ["git", "diff", "--name-only"]:
-            return "docs/guide.md"
+        if args[:4] == ["git", "diff", "--name-status", "-z"]:
+            return "M\0docs/guide.md\0"
         if args[:2] in (["gh", "auth"], ["git", "clone"], ["git", "fetch"],
                         ["git", "checkout"], ["git", "ls-remote"],
                         ["git", "status"], ["git", "push"]):
@@ -322,6 +327,131 @@ class DocsMergeTests(unittest.TestCase):
             self.run_worker()
         self.log.assert_not_called()
 
+    def disposable_checkout(self, *, mode="write", agent="docs", configured=True):
+        """Run the docs flow against a local Git remote and an actual Node hook."""
+        upstream = self.root / "upstream"
+        self.process.side_effect = self.real_popen
+        upstream.mkdir()
+
+        def command(args, cwd=upstream, env=None):
+            return subprocess.run(args, cwd=cwd, env=env, capture_output=True,
+                                  text=True, check=True).stdout.strip()
+
+        command(["git", "init", "-b", "main"])
+        (upstream / "docs").mkdir()
+        (upstream / "docs/guide.md").write_text("Original guide\n")
+        (upstream / "src").mkdir()
+        (upstream / "src/service.py").write_text("service\n")
+        (upstream / ".railway").mkdir()
+        (upstream / ".railway/worker-release.mjs").write_text(
+            "import fs from 'node:fs';\n"
+            "const input = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+            "if (!process.env.GH_TOKEN || !process.env.HOME || !process.env.PATH || "
+            "input.repo !== 'example/docs' || input.base_sha !== input.source_sha "
+            "|| Number(process.env.OMP_POSTPROCESS_DEADLINE) <= Date.now() / 1000) process.exit(3);\n"
+            "if (['CLI_PROXY_API_KEY', 'JARVIS_RUNNER_TOKEN', 'JARVIS_CONSULT_URL', "
+            "'HOOK_MODE', 'EXPECT_BASE'].some(key => key in process.env)) process.exit(5);\n"
+            f"const mode = {json.dumps(mode)};\n"
+            "if (mode === 'fail') process.exit(4);\n"
+            "if (mode === 'write') fs.writeFileSync('.railway/worker-releases.json', JSON.stringify(input));\n"
+            "if (mode === 'forbidden') fs.writeFileSync('src/injected.txt', 'not allowed');\n"
+            "if (mode === 'rename') fs.renameSync('src/service.py', '.railway/worker-releases.json');\n"
+            "if (mode === 'symlink') fs.symlinkSync('../src/service.py', '.railway/worker-releases.json');\n"
+        )
+        command(["git", "add", "-A"])
+        command(["git", "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"])
+        self.job["source_sha"] = command(["git", "rev-parse", "HEAD"])
+        self.branch = f'{CONFIG["docs_update"]["branch_prefix"]}1-{self.job["source_sha"][:12]}'
+        self.followup["head"]["ref"] = self.branch
+        entry = {"branch": "main", "folders": ["docs"]}
+        if configured:
+            entry["postprocess"] = copy.deepcopy(CONFIG["docs_update"]["repositories"]["example-org/example-app"]["postprocess"])
+        CONFIG["docs_update"]["repositories"]["example/docs"] = entry
+        self.real_env = {**os.environ, "GH_TOKEN": "disposable-token", "HOOK_MODE": mode,
+                         "EXPECT_BASE": self.job["source_sha"],
+                         "CLI_PROXY_API_KEY": "test-proxy-key", "JARVIS_RUNNER_TOKEN": "test-jarvis-token",
+                         "JARVIS_CONSULT_URL": "https://example.invalid/consult",
+                         "GIT_AUTHOR_NAME": "autokas[bot]", "GIT_AUTHOR_EMAIL": "bot@example.com",
+                         "GIT_COMMITTER_NAME": "autokas[bot]", "GIT_COMMITTER_EMAIL": "bot@example.com"}
+
+        def popen(args, *positional, **kwargs):
+            if args[0] != "omp":
+                return self.real_popen(args, *positional, **kwargs)
+            checkout = self.root / "repo"
+            if agent == "docs":
+                (checkout / "docs/guide.md").write_text("Updated guide\n")
+                command(["git", "add", "-A"], checkout)
+                command(["git", "commit", "-m", "docs: update guide"], checkout, self.real_env)
+            elif agent == "rename":
+                command(["git", "mv", "src/service.py", "docs/service.py"], checkout)
+                command(["git", "commit", "-m", "docs: rename service"], checkout, self.real_env)
+            return self.process.return_value
+        self.process.side_effect = popen
+
+        def git_run(args, cwd):
+            if args[:2] == ["gh", "auth"]:
+                return ""
+            if args[:2] == ["git", "clone"]:
+                args = ["git", "clone", "--no-checkout", str(upstream), args[-1]]
+            output = command(args, cwd, self.real_env)
+            if args[:2] == ["git", "push"]:
+                self.final_head = command(["git", "rev-parse", "HEAD"], cwd, self.real_env)
+                self.current_head = self.final_head
+                self.followup["head"]["sha"] = self.final_head
+                names = command(["git", "diff", "--name-only", self.job["source_sha"], "HEAD"], cwd)
+                self.followup_files = [{"filename": name} for name in names.splitlines()]
+            return output
+        self.git_run = git_run
+
+    def run_disposable(self):
+        docs_worker(self.job, self.root, self.real_env, self.git_run,
+                    time.monotonic() + 60, self.root / "settings.json")
+
+
+    def test_disposable_docs_and_manifest_share_followup(self) -> None:
+        self.disposable_checkout()
+        self.run_disposable()
+        self.assertEqual(self.merged_head, self.final_head)
+        self.assertEqual({item["filename"] for item in self.followup_files},
+                         {"docs/guide.md", ".railway/worker-releases.json"})
+        self.assertEqual(json.loads((self.root / "repo/.railway/worker-releases.json").read_text()),
+                         {"repo": self.job["repo"], "source_sha": self.job["source_sha"],
+                          "base_sha": self.job["source_sha"]})
+
+    def test_disposable_hook_rejects_failure_and_forbidden_output(self) -> None:
+        for mode, error in (("fail", "exited with 4"), ("forbidden", "undeclared"),
+                            ("rename", "undeclared"), ("symlink", "symlink")):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                self.root = Path(directory)
+                self.disposable_checkout(mode=mode)
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self.run_disposable()
+                self.assertEqual(self.merge_attempts, 0)
+
+    def test_disposable_agent_rename_source_is_rejected_before_hook(self) -> None:
+        self.disposable_checkout(agent="rename")
+        with self.assertRaisesRegex(RuntimeError, "non-documentation"):
+            self.run_disposable()
+        self.assertEqual(self.merge_attempts, 0)
+
+    def test_disposable_noop_only_for_configured_repository(self) -> None:
+        self.disposable_checkout(mode="noop", agent="none")
+        self.run_disposable()
+        self.assertEqual(self.merge_attempts, 0)
+        self.assertEqual(self.log.call_args.args[0], "docs_update_no_change")
+
+    def test_disposable_unconfigured_noop_remains_error(self) -> None:
+        self.disposable_checkout(mode="noop", agent="none", configured=False)
+        with self.assertRaisesRegex(RuntimeError, "no committed change"):
+            self.run_disposable()
+        self.assertEqual(self.merge_attempts, 0)
+
+    def test_disposable_configured_traversal_never_runs_hook(self) -> None:
+        self.disposable_checkout()
+        CONFIG["docs_update"]["repositories"]["example/docs"]["postprocess"]["files"] = [".railway/../src/injected.txt"]
+        with self.assertRaisesRegex(RuntimeError, "invalid docs postprocess output path"):
+            self.run_disposable()
+        self.assertEqual(self.merge_attempts, 0)
 
 if __name__ == "__main__":
     unittest.main()
