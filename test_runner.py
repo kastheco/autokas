@@ -346,10 +346,12 @@ class DocsMergeTests(unittest.TestCase):
         (upstream / ".railway/worker-release.mjs").write_text(
             "import fs from 'node:fs';\n"
             "const input = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
-            "if (!process.env.GH_TOKEN || input.repo !== 'example/docs' || "
-            "input.base_sha !== process.env.EXPECT_BASE || input.source_sha !== process.env.EXPECT_BASE "
+            "if (!process.env.GH_TOKEN || !process.env.HOME || !process.env.PATH || "
+            "input.repo !== 'example/docs' || input.base_sha !== input.source_sha "
             "|| Number(process.env.OMP_POSTPROCESS_DEADLINE) <= Date.now() / 1000) process.exit(3);\n"
-            "const mode = process.env.HOOK_MODE;\n"
+            "if (['CLI_PROXY_API_KEY', 'JARVIS_RUNNER_TOKEN', 'JARVIS_CONSULT_URL', "
+            "'HOOK_MODE', 'EXPECT_BASE'].some(key => key in process.env)) process.exit(5);\n"
+            f"const mode = {json.dumps(mode)};\n"
             "if (mode === 'fail') process.exit(4);\n"
             "if (mode === 'write') fs.writeFileSync('.railway/worker-releases.json', JSON.stringify(input));\n"
             "if (mode === 'forbidden') fs.writeFileSync('src/injected.txt', 'not allowed');\n"
@@ -367,6 +369,8 @@ class DocsMergeTests(unittest.TestCase):
         CONFIG["docs_update"]["repositories"]["example/docs"] = entry
         self.real_env = {**os.environ, "GH_TOKEN": "disposable-token", "HOOK_MODE": mode,
                          "EXPECT_BASE": self.job["source_sha"],
+                         "CLI_PROXY_API_KEY": "test-proxy-key", "JARVIS_RUNNER_TOKEN": "test-jarvis-token",
+                         "JARVIS_CONSULT_URL": "https://example.invalid/consult",
                          "GIT_AUTHOR_NAME": "autokas[bot]", "GIT_AUTHOR_EMAIL": "bot@example.com",
                          "GIT_COMMITTER_NAME": "autokas[bot]", "GIT_COMMITTER_EMAIL": "bot@example.com"}
 

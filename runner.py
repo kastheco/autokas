@@ -664,7 +664,9 @@ def run_docs_postprocess(
 ) -> list[tuple[str, str]]:
     """Run the checked-out hook, then stage and verify only declared outputs."""
     outputs = postprocess_paths(worktree, postprocess)
-    hook_env = env | {"OMP_POSTPROCESS_DEADLINE": str(int(time.time() + max(0, deadline - time.monotonic())))}
+    allowed = ("PATH", "HOME", "GH_TOKEN", "CI", "GH_PROMPT_DISABLED", "GIT_TERMINAL_PROMPT")
+    hook_env = {key: env[key] for key in allowed if key in env}
+    hook_env["OMP_POSTPROCESS_DEADLINE"] = str(int(time.time() + max(0, deadline - time.monotonic())))
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise RuntimeError("docs postprocess deadline expired")

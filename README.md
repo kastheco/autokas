@@ -141,6 +141,8 @@ docs follow-up squash merges send the validated `final_head` as GitHub's `sha` p
 
 Example-app's existing docs follow-up can also run the optional `postprocess` configured only for `example-org/example-app`. After validating the agent's docs-only commit, the runner invokes the checked-out `node .railway/worker-release.mjs record` directly (no shell) with its existing GitHub installation token, JSON stdin `{repo, source_sha, base_sha}`, and `OMP_POSTPROCESS_DEADLINE` as epoch seconds. Only `.railway/worker-releases.json` may be added or changed by this hook; symlinks, path traversal, rename sources outside the allowlist, failure, or other changes block publication. A valid manifest change is committed with the existing bot identity into the same docs follow-up and covered by the same head-SHA squash-merge precondition. A configured hook may make no change, including when the docs agent made none; repositories without a hook retain their prior docs-only and nonempty-change rules. The postprocessor has no Railway or Temporal credentials and cannot change the docs agent's edit permissions. If evidence is missing or conflicting, inspect the failed job rather than bypassing its output guard or publishing an unverified manifest.
 
+the hook receives only `PATH`, `HOME`, `GH_TOKEN`, `CI`, `GH_PROMPT_DISABLED`, `GIT_TERMINAL_PROMPT` and `OMP_POSTPROCESS_DEADLINE`. it does not inherit the worker's proxy key or Jarvis consultation settings.
+
 ## logs, stopping and duplicates
 
 ```sh
