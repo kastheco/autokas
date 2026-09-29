@@ -5,7 +5,7 @@
 <p align="center">
   <a href="runner.py">runner</a> ·
   <a href="config.json">config</a> ·
-  <a href="consult.py">jarvis consult</a> ·
+  <a href="consult.py">advisor</a> ·
   <a href="deploy.py">deploy</a> ·
   <a href="docs/operations.md">operations</a> ·
   <a href="kas-voice-profile.md">voice profile</a> ·
@@ -25,7 +25,13 @@ the runner dispatches the job, not the agent's working process. omp owns investi
 5. omp fixes what's still valid, commits as `autokas[bot]` in Conventional Commits form, pushes, updates its queued status comments and posts one outcome comment.
 6. the container exits.
 
-pull requests to `example-org` repos may also consult Jarvis before a core business-rule change. other owners never get the consult bearer or endpoint. the full policy is in [docs/operations.md](docs/operations.md).
+## advisors
+
+a repo can be paired with an advisor: an external service omp consults before it changes core business rules or intended behavior. the advisor answers business-intent questions only. it isn't a technical, safety or security gatekeeper, and omp still judges those against the code.
+
+`consult.py` is the client. it sends a bounded question, keeps the full answer in a private temp file for omp to read, and fails closed on any interrupted or empty response. an advisor's bearer and endpoint go only to jobs for repos it's paired with.
+
+today the one advisor is Jarvis, paired with `example-org` repos. other owners get technical fixes with no advisor, and business-logic changes there are reported instead of made. the full policy is in [docs/operations.md](docs/operations.md).
 
 autokas also opens follow-up docs PRs after merges, limited to each repo's configured documentation folders.
 
@@ -85,7 +91,7 @@ disable a repo's webhook to stop new intake and let running work finish. uninsta
 ```text
 runner.py             webhook receiver, dispatcher, PR worker and docs worker
 config.json           models, tools, profiles, timeouts and git identity
-consult.py            bounded client for the Jarvis consultation endpoint
+consult.py            bounded client for advisor consultations
 deploy.py             hook pause, drain, deploy, verify, restore and replay
 setup_autokas.py      one-time GitHub App and Modal setup wizard
 kas-voice-profile.md  voice rules appended to every job's system policy
@@ -94,4 +100,4 @@ test_*.py             unit tests for intake, auth, dispatch, deploy and consult
 docs/                 readme banner and long-form operations notes
 ```
 
-for the consultation rules, provider accounts, live verification path and duplicate-claim limits, read [`docs/operations.md`](docs/operations.md).
+for the advisor rules, provider accounts, live verification path and duplicate-claim limits, read [`docs/operations.md`](docs/operations.md).
