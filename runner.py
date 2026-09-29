@@ -614,6 +614,80 @@ def acknowledge_review(job: dict[str, Any]) -> dict[str, Any] | None:
 
 
 
+
+def changed_paths(raw: str) -> list[tuple[str, str]]:
+    """Decode Git's NUL-delimited name/status output, including rename sources."""
+    fields = raw.rstrip("\0").split("\0") if raw else []
+    changes = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        index += 1
+        count = 2 if status.startswith(("R", "C")) else 1
+        if status[:1] not in {"A", "M", "D", "T", "R", "C", "U"} or index + count > len(fields):
+            raise RuntimeError("invalid Git change listing")
+        paths = fields[index:index + count]
+        if any(not path for path in paths):
+            raise RuntimeError("invalid Git change path")
+        changes.extend((status, path) for path in paths)
+        index += count
+    return changes
+
+
+def postprocess_paths(worktree: Path, postprocess: dict[str, Any]) -> set[str]:
+    """Constrain configured outputs to ordinary files inside the checkout."""
+    command, files = postprocess.get("command"), postprocess.get("files")
+    if (not isinstance(command, list) or not command or any(not isinstance(arg, str) or not arg for arg in command)
+        or not isinstance(files, list) or not files):
+        raise RuntimeError("invalid docs postprocess configuration")
+    result: set[str] = set()
+    for name in files:
+        if not isinstance(name, str) or not name or "\\" in name:
+            raise RuntimeError("invalid docs postprocess output path")
+        path = Path(name)
+        if path.is_absolute() or any(part in {".", "..", ".git"} for part in name.split("/")) or path.as_posix() != name or name in result:
+            raise RuntimeError("invalid docs postprocess output path")
+        target = worktree
+        for part in path.parts:
+            target /= part
+            if target.is_symlink():
+                raise RuntimeError("docs postprocess output is a symlink")
+        if target.exists() and not target.is_file():
+            raise RuntimeError("docs postprocess output is not a regular file")
+        result.add(name)
+    return result
+
+
+def run_docs_postprocess(
+    worktree: Path, postprocess: dict[str, Any], job: dict[str, Any], base_head: str,
+    agent_head: str, env: dict[str, str], run: Callable[[list[str], Path], str], deadline: float,
+) -> list[tuple[str, str]]:
+    """Run the checked-out hook, then stage and verify only declared outputs."""
+    outputs = postprocess_paths(worktree, postprocess)
+    hook_env = env | {"OMP_POSTPROCESS_DEADLINE": str(int(time.time() + max(0, deadline - time.monotonic())))}
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("docs postprocess deadline expired")
+    result = subprocess.run(
+        postprocess["command"], cwd=worktree, env=hook_env,
+        input=json.dumps({"repo": job["repo"], "source_sha": job["source_sha"], "base_sha": base_head}),
+        text=True, capture_output=True, timeout=remaining,
+    )
+    if result.returncode:
+        raise RuntimeError(f"docs postprocess exited with {result.returncode}")
+    if run(["git", "rev-parse", "HEAD"], worktree) != agent_head:
+        raise RuntimeError("docs postprocess changed the committed head")
+    postprocess_paths(worktree, postprocess)
+    run(["git", "add", "-A"], worktree)
+    changed = changed_paths(run(["git", "diff", "--cached", "--name-status", "-z", "HEAD"], worktree))
+    if any(path not in outputs or status.startswith("D") for status, path in changed):
+        raise RuntimeError("docs postprocess changed an undeclared or deleted path")
+    if run(["git", "diff", "--name-only"], worktree):
+        raise RuntimeError("docs postprocess left unstaged changes")
+    if changed:
+        run(["git", "commit", "-m", "chore: record worker release state"], worktree)
+    return changed
+
 def docs_worker(
     job: dict[str, Any], root: Path, env: dict[str, str],
     run: Callable[[list[str], Path], str], deadline: float, settings: Path,
@@ -688,11 +762,24 @@ def docs_worker(
         raise RuntimeError(f"docs omp exited with {code}")
     if run(["git", "status", "--porcelain"], worktree):
         raise RuntimeError("docs agent left uncommitted changes")
-    if final_head == base_head:
+    postprocess = entry.get("postprocess")
+    if final_head == base_head and postprocess is None:
         raise RuntimeError("docs agent produced no committed change")
-    changed = run(["git", "diff", "--name-only", f"{base_head}...{final_head}"], worktree).splitlines()
-    if not changed or any(not docs_path_allowed(path, folders) for path in changed):
+    agent_changes = changed_paths(run(["git", "diff", "--name-status", "-z", f"{base_head}...{final_head}"], worktree))
+    if any(not docs_path_allowed(path, folders) for _, path in agent_changes):
         raise RuntimeError("docs change contains non-documentation paths")
+    if final_head != base_head and not agent_changes:
+        raise RuntimeError("docs agent produced no documentation change")
+    if postprocess is not None:
+        run_docs_postprocess(worktree, postprocess, job, base_head, final_head, env, run, deadline)
+        final_head = run(["git", "rev-parse", "HEAD"], worktree)
+    if final_head == base_head:
+        log("docs_update_no_change", repo=repo, source_pr=number, source_sha=job["source_sha"])
+        return
+    changed = changed_paths(run(["git", "diff", "--name-status", "-z", f"{base_head}...{final_head}"], worktree))
+    outputs = set(postprocess["files"]) if postprocess is not None else set()
+    if not changed or any(not docs_path_allowed(path, folders) and path not in outputs for _, path in changed):
+        raise RuntimeError("docs change contains paths outside documentation and declared outputs")
     try:
         run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], worktree)
     except Exception as error:
@@ -732,12 +819,13 @@ def docs_worker(
     ):
         raise RuntimeError("docs pull request is outside the configured scope")
     files = github(f"{api_base}/pulls/{followup_number}/files?per_page=100")
+    allowed = lambda path: docs_path_allowed(path, folders) or path in outputs
     if not isinstance(files, list) or len(files) >= 100 or not files or any(
-        not docs_path_allowed(file.get("filename", ""), folders)
-        or not docs_path_allowed(file.get("previous_filename", file.get("filename", "")), folders)
+        not allowed(file.get("filename", ""))
+        or not allowed(file.get("previous_filename", file.get("filename", "")))
         for file in files
     ):
-        raise RuntimeError("docs pull request contains non-doc or unbounded changes")
+        raise RuntimeError("docs pull request contains undeclared or unbounded changes")
     try:
         github_request("PUT", f"{api_base}/pulls/{followup_number}/merge", {"merge_method": "squash", "sha": final_head})
     except Exception as error:

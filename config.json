@@ -11,7 +11,11 @@
         "branch": "main",
         "folders": [
           "docs"
-        ]
+        ],
+        "postprocess": {
+          "command": ["node", ".railway/worker-release.mjs", "record"],
+          "files": [".railway/worker-releases.json"]
+        }
       },
       "example-org/example-repo-9": {
         "branch": "staging",
