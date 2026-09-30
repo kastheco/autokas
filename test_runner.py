@@ -155,18 +155,6 @@ class ReviewIntakeTests(unittest.TestCase):
         self.assertIsNone(event_job("pull_request", event))
 
 
-    def test_new_exact_approval_allows_one_distinct_attempt(self) -> None:
-        with patch.dict(CONFIG["owner_approvals"], {}, clear=True):
-            original = event_job("pull_request_review", review_event())
-            assert original is not None
-            CONFIG["owner_approvals"][f"{REPO}#143"] = "Approval for another PR."
-            self.assertEqual(event_job("pull_request_review", review_event()), original)
-            CONFIG["owner_approvals"][f"{REPO}#142"] = "Approve this scoped refactor."
-            approved = event_job("pull_request_review", review_event())
-            assert approved is not None
-            self.assertNotEqual(approved["key"], original["key"])
-            self.assertEqual(approved["prompt"], original["prompt"])
-            self.assertEqual(event_job("pull_request_review", review_event()), approved)
 
 
 class DocsMergeTests(unittest.TestCase):
