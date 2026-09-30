@@ -127,6 +127,19 @@ class QueueAcknowledgmentTests(unittest.TestCase):
             self.assertEqual(self.claims, set())
 
 
+    def test_command_runs_only_for_write_access(self):
+        command = {**job("issue_comment"), "mode": "command", "author": "someone", "key": f"{REPO}:command:123"}
+        for permission, runs in (("admin", 1), ("write", 1), ("read", 0), ("none", 0)):
+            with self.subTest(permission=permission):
+                self.claims.clear()
+                fake = GitHubFake()
+                with patch.object(runner.urllib.request, "urlopen", fake), \
+                        patch.object(runner, "github", return_value={"permission": permission}), \
+                        patch.object(runner, "PRWorker") as cls:
+                    cls.return_value.run.spawn.return_value = Mock(object_id="call")
+                    runner.worker.local(dict(command))
+                self.assertEqual(cls.return_value.run.spawn.call_count, runs)
+                self.assertEqual(len(fake.comments), runs)
     def test_uncertain_ack_does_not_cancel_dispatched_agent(self):
         fake = GitHubFake(lost_response=True, receipt_user=999, reply_source=123)
         with patch.object(runner.urllib.request, "urlopen", fake), patch.object(runner, "PRWorker") as cls:
