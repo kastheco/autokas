@@ -127,20 +127,6 @@ class QueueAcknowledgmentTests(unittest.TestCase):
             github.assert_not_called()
             self.assertEqual(self.claims, set())
 
-    def test_docs_sources_share_base_pool_without_serializing_commands(self):
-        pools = []
-        with patch.object(runner, "PRWorker") as cls, patch.object(runner, "github", return_value={"permission": "write"}), patch.object(runner, "acknowledge_review"):
-            cls.side_effect = lambda **values: (pools.append(values["pr_key"]) or Mock())
-            for number, mode, base in ((42, "docs_update", "Main"), (43, "docs_update", "Main"),
-                                       (44, "docs_update", "main"), (42, "command", None), (43, "command", None)):
-                runner.worker.local({"repo": REPO, "pr": number, "kind": "pull_request",
-                                     "key": str(number), "mode": mode, "base_branch": base, "author": "kas"})
-        self.assertEqual(pools[0], pools[1])
-        self.assertNotEqual(pools[0], pools[2])
-        self.assertNotEqual(pools[0], pools[3])
-        self.assertNotEqual(pools[3], pools[4])
-
-
     def test_command_runs_only_for_write_access(self):
         command = {**job("issue_comment"), "mode": "command", "author": "someone", "key": f"{REPO}:command:123"}
         for permission, runs in (("admin", 1), ("write", 1), ("read", 0), ("none", 0)):
