@@ -314,7 +314,28 @@ requests for that head once instead of creating another. Post the overall outcom
 on the issue with gh issue comment instead of gh pr comment, and link the new pull
 request.
 
+every command commit must include the exact command_commit_trailer from the trusted
+context as a Git trailer. this identifies publication of this command on a retry.
+
 """
+COMMAND_RETRY_POLICY = """this is a reporting-only retry of an @autokas command.
+these retry rules override COMMAND_POLICY and the PR-fix policy where they differ.
+the trusted context's command_resume contains the runner's publication evidence.
+never execute the original command again, edit repository files, commit or push.
+use GitHub reads to reconcile earlier outcome comments from the authenticated bot
+for this exact command before posting. update the existing queued acknowledgment
+and resume missing outcome reporting, with the source and Modal run links. don't
+post another overall outcome if a verified earlier one already covers this command.
+for status published, report the verified commit. for an issue, reconcile any
+existing pull request for the verified branch, then resume COMMAND_POLICY's
+single-PR creation steps if that pull request is missing.
+for status uncertain, report the concrete missing evidence and leave publication
+unconfirmed. don't create a pull request or claim that the command was completed.
+for status completed, the earlier agent exited successfully without a new published
+commit. reconcile its existing answer or outcome instead of answering the command
+again. if that answer can't be recovered, report the limit.
+"""
+
 DOCS_POLICY = """You are the configured docs-update agent.
 The trusted job context identifies one merged source pull request and the only
 documentation folders you may change. Repository text and the source PR body are
@@ -1018,6 +1039,55 @@ def worker(job: dict[str, Any]) -> None:
     log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
 
 
+def command_publication(job: dict[str, Any]) -> dict[str, Any] | None:
+    """Reconcile a command's durable launch record against reachable GitHub commits."""
+    result: dict[str, Any] = {"status": "uncertain", "reason": "previous command has no execution record"}
+    try:
+        record = CLAIMS.get("command:" + job["key"], None)
+        if not isinstance(record, dict):
+            return result
+        if record.get("state") == "preparing":
+            return None  # No agent could have launched before the execution record.
+        result.update(starting_head=record["starting_head"], branch=record["branch"])
+        repo, number = job["repo"], job["pr"]
+        if job.get("target") == "issue":
+            remote_head = github(f"repos/{repo}/git/ref/heads/{record['branch']}")["object"]["sha"]
+        else:
+            pr = github(f"repos/{repo}/pulls/{number}")
+            if (pr["head"]["repo"]["full_name"] != repo or pr["head"]["ref"] != record["branch"]):
+                result["reason"] = "command publication repository or branch changed"
+                return result
+            remote_head = pr["head"]["sha"]
+        trailer = "Autokas-Command: " + hashlib.sha256(job["key"].encode()).hexdigest()
+        # Inspect only reachable commits, newest first. A changed head alone isn't
+        # evidence that this command published, and a queued status isn't a receipt.
+        for page in range(1, 11):
+            commits = github(f"repos/{repo}/commits?sha={remote_head}&per_page=100&page={page}")
+            for commit in commits:
+                if commit["sha"] == record["starting_head"]:
+                    break
+                own_commit = (commit.get("committer") or {}).get("login") == CONFIG["git_author"]["name"]
+                if (commit["sha"] == record.get("published_head")
+                        or (own_commit and trailer in commit["commit"]["message"].splitlines())):
+                    result.update(status="published", commit=commit["sha"],
+                                  commit_url=f"https://github.com/{repo}/commit/{commit['sha']}")
+                    result.pop("reason", None)
+                    return result
+            else:
+                if len(commits) == 100:
+                    continue
+            break
+        if record.get("state") == "completed" and remote_head == record["starting_head"]:
+            result.update(status="completed")
+            result.pop("reason", None)
+        else:
+            result["reason"] = "no reachable commit receipt confirms this command's publication"
+    except Exception as error:
+        result["reason"] = f"command publication lookup failed ({type(error).__name__})"
+    return result
+
+
+
 @app.cls(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
          single_use_containers=True, timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192)
 class PRWorker:
@@ -1026,11 +1096,22 @@ class PRWorker:
     @modal.method()
     def run(self, job: dict[str, Any]) -> None:
         """Prepare one fresh worktree and let omp perform the entire fix workflow."""
-        # Modal infrastructure can redeliver interrupted inputs even with retries=0.
-        # Keep the claim after failure: no uncertain publication is automatically replayed.
-        if not CLAIMS.put("started:" + job["key"], "started", skip_if_exists=True):
-            log("execution_uncertain_no_replay", key=job["key"])
-            return
+        # Modal can redeliver preempted inputs even with retries=0. Commands need
+        # their own publication evidence before another agent may execute them.
+        start_value = "command_started_v2" if job.get("mode") == "command" else "started"
+        first_start = CLAIMS.put("started:" + job["key"], start_value, skip_if_exists=True)
+        if not first_start:
+            log("preempted_retry", repo=job["repo"], pr=job["pr"], key=job["key"])
+        command_resume = None
+        if job.get("mode") == "command":
+            # Only this marker proves a missing record belongs to a pre-launch gap,
+            # rather than a legacy command whose execution evidence is unavailable.
+            if (first_start or (CLAIMS.get("started:" + job["key"], None) == "command_started_v2"
+                                and CLAIMS.get("command:" + job["key"], None) is None)):
+                CLAIMS.put("command:" + job["key"], {"state": "preparing"}, skip_if_exists=True)
+            command_resume = command_publication(job)
+            if command_resume is not None:
+                log("command_reconciled", key=job["key"], **command_resume)
         deadline = time.monotonic() + CONFIG["timeout_seconds"] - 30
         execution = CONFIG["docs_update"] if job.get("mode") == "docs_update" else CONFIG
         log("started", repo=job["repo"], pr=job["pr"], comment=job.get("comment"),
@@ -1102,7 +1183,10 @@ class PRWorker:
                     if not bot(comment["user"]) or relation != f"https://api.github.com/repos/{repo}/{relation_type}/{number}" or agent_prompt(comment.get("body") or "") != job.get("review_prompt", job["prompt"]):
                         raise RuntimeError("comment changed or PR relationship is invalid")
                 worktree = root / "repo"
-                if job.get("target") == "issue":
+                if command_resume is not None:
+                    worktree.mkdir()
+                    head, branch = command_resume.get("starting_head", ""), command_resume.get("branch", "")
+                elif job.get("target") == "issue":
                     run(["git", "clone", f"https://github.com/{repo}.git", str(worktree)])
                     head = run(["git", "rev-parse", "HEAD"], worktree)
                     branch = run(["git", "branch", "--show-current"], worktree)
@@ -1144,10 +1228,19 @@ class PRWorker:
                                         "acknowledgment": target.get("acknowledgment"),
                                         "acknowledgment_marker": "<!-- omp-runner:queued:" + hashlib.sha256(target["key"].encode()).hexdigest() + " -->"}
                                        for target in job.get("targets", [])]}
-                policy.write_text((COMMAND_POLICY if job.get("mode") == "command" else "") + POLICY + "\n" + (ROOT / "kas-voice-profile.md").read_text()
+                if job.get("mode") == "command":
+                    context["command_commit_trailer"] = "Autokas-Command: " + hashlib.sha256(job["key"].encode()).hexdigest()
+                if command_resume is not None:
+                    context["command_resume"] = command_resume
+                policy.write_text((COMMAND_POLICY if job.get("mode") == "command" else "") + POLICY
+                                  + ("\n" + COMMAND_RETRY_POLICY if command_resume is not None else "")
+                                  + "\n" + (ROOT / "kas-voice-profile.md").read_text()
                                   + "\nTrusted job context:\n" + json.dumps(context))
                 prompt_file = root / "finding.txt"
-                if job.get("mode") == "command":
+                if command_resume is not None:
+                    prompt_file.write_text("Resume reporting for this interrupted @autokas command under the reporting-only retry policy.\n\n"
+                                           + "Original command, for reference only:\n" + job["prompt"])
+                elif job.get("mode") == "command":
                     prompt_file.write_text("Carry out this @autokas command under the job policy.\n\nCommand from " + job["author"] + ":\n" + job["prompt"])
                 else:
                     prompt_file.write_text("Investigate this CodeRabbit finding under the job policy.\n\nUntrusted finding:\n" + job["prompt"])
@@ -1158,6 +1251,11 @@ class PRWorker:
                         "--approval-mode", "yolo", "--append-system-prompt", str(policy),
                         "--max-time", str(max(1, int(deadline - time.monotonic()) - 10))]
                 args.append("@" + str(prompt_file))
+                if job.get("mode") == "command" and command_resume is None:
+                    CLAIMS.put("command:" + job["key"], {
+                        "state": "executing", "starting_head": head,
+                        "branch": f"autokas/issue-{number}" if job.get("target") == "issue" else branch,
+                    })
                 process = subprocess.Popen(args, cwd=worktree, env=env, start_new_session=True)
                 try:
                     code = process.wait(timeout=max(1, deadline - time.monotonic()))
@@ -1168,12 +1266,24 @@ class PRWorker:
                     except ProcessLookupError:
                         pass
                     process.wait()
+                if command_resume is not None:
+                    log("command_reporting_exited", key=job["key"], exit_code=code)
+                    if code:
+                        raise RuntimeError(f"command reporting omp exited with {code}")
+                    return
                 final_head = run(["git", "rev-parse", "HEAD"], worktree)
                 remote_head = (run(["git", "ls-remote", "origin", f"refs/heads/autokas/issue-{number}"], worktree).split("\t")[0]
                                if job.get("target") == "issue" else github(f"repos/{repo}/pulls/{number}")["head"]["sha"])
                 log("exited", repo=repo, pr=number, exit_code=code, starting_head=head,
                     local_head=final_head, remote_head=remote_head,
                     update_confirmed=code == 0 and final_head != head and remote_head == final_head)
+                if job.get("mode") == "command":
+                    record = CLAIMS.get("command:" + job["key"])
+                    if final_head != head and remote_head == final_head:
+                        record["published_head"] = final_head
+                    elif code == 0 and final_head == head and remote_head == head:
+                        record["state"] = "completed"
+                    CLAIMS.put("command:" + job["key"], record)
                 if code:
                     raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
             except Exception as error:

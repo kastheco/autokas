@@ -1,8 +1,10 @@
 """Behavior regressions for CodeRabbit review and comment intake."""
 
 import copy
+import hashlib
 import json
 import os
+from io import StringIO
 import subprocess
 from email.message import Message
 import unittest
@@ -10,9 +12,9 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.error import HTTPError
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from runner import CONFIG, agent_prompt, docs_worker, event_job
+from runner import CONFIG, PRWorker, agent_prompt, command_publication, docs_worker, event_job
 
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
@@ -198,6 +200,254 @@ class ReviewIntakeTests(unittest.TestCase):
         self.assertIsNone(event_job("pull_request", event))
 
 
+
+
+class CommandPublicationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.job = {"repo": REPO, "pr": 142, "target": "pr", "key": f"{REPO}:command:555"}
+        self.record = {"state": "executing", "starting_head": "a" * 40, "branch": "feature/command"}
+        self.head = "b" * 40
+        self.trailer = "Autokas-Command: " + hashlib.sha256(self.job["key"].encode()).hexdigest()
+        self.pr = {"head": {"sha": self.head, "ref": self.record["branch"], "repo": {"full_name": REPO}}}
+        self.pages = [[self.commit(self.head, "fix: apply command\n\n" + self.trailer)]]
+        self.claims = Mock()
+        self.claims.get.side_effect = lambda key, default=None: self.record if key == "command:" + self.job["key"] else default
+        for patcher in (patch("runner.CLAIMS", self.claims), patch("runner.github", side_effect=self.read_github)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def commit(self, sha: str, message: str, login: str | None = None) -> dict:
+        return {"sha": sha, "committer": {"login": login or CONFIG["git_author"]["name"]},
+                "commit": {"message": message}}
+
+    def read_github(self, path: str):
+        if path == f"repos/{REPO}/pulls/142":
+            return self.pr
+        if path == f"repos/{REPO}/git/ref/heads/autokas/issue-142":
+            return {"object": {"sha": self.head}}
+        prefix = f"repos/{REPO}/commits?sha={self.pr['head']['sha']}&per_page=100&page="
+        if path.startswith(prefix):
+            return self.pages[int(path.removeprefix(prefix)) - 1]
+        raise AssertionError(path)
+
+    def test_published_command_is_found_beneath_a_later_unrelated_commit(self) -> None:
+        published = "c" * 40
+        self.pages = [[self.commit(self.head, "chore: unrelated change"),
+                       self.commit(published, "fix: command\n\n" + self.trailer)]]
+        result = command_publication(self.job)
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(result["commit"], published)
+
+    def test_unrelated_changed_or_unchanged_heads_do_not_authorize_replay(self) -> None:
+        for sha in (self.head, self.record["starting_head"]):
+            with self.subTest(head=sha):
+                self.pr["head"]["sha"] = sha
+                self.pages = [[self.commit(sha, "chore: unrelated change")]]
+                self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_receipts_require_this_command_and_the_bot_identity(self) -> None:
+        other = "Autokas-Command: " + hashlib.sha256((self.job["key"] + "other").encode()).hexdigest()
+        for message, login in ((other, CONFIG["git_author"]["name"]), (self.trailer, "someone-else")):
+            with self.subTest(message=message, login=login):
+                self.pages = [[self.commit(self.head, "fix: change\n\n" + message, login)]]
+                self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_recorded_publication_must_still_be_reachable(self) -> None:
+        self.record["published_head"] = self.head
+        self.pages = [[self.commit(self.head, "fix: command without a trailer")]]
+        self.assertEqual(command_publication(self.job)["status"], "published")
+        self.pages = [[self.commit("c" * 40, "chore: different history")]]
+        self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_published_issue_command_uses_its_deterministic_branch(self) -> None:
+        self.job["target"] = "issue"
+        self.record["branch"] = "autokas/issue-142"
+        self.assertEqual(command_publication(self.job)["status"], "published")
+
+    def test_changed_branch_or_repository_leaves_publication_uncertain(self) -> None:
+        for field, value in (("ref", "different-branch"), ("repo", {"full_name": "someone/fork"})):
+            with self.subTest(field=field):
+                original = self.pr["head"][field]
+                self.pr["head"][field] = value
+                self.assertEqual(command_publication(self.job)["status"], "uncertain")
+                self.pr["head"][field] = original
+
+    def test_pre_launch_preemption_can_retry_but_missing_records_cannot(self) -> None:
+        self.record = {"state": "preparing"}
+        self.assertIsNone(command_publication(self.job))
+        self.record = None
+        self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_successful_no_change_command_is_not_executed_again(self) -> None:
+        self.record["state"] = "completed"
+        self.pr["head"]["sha"] = self.record["starting_head"]
+        self.pages = [[self.commit(self.record["starting_head"], "base")]]
+        self.assertEqual(command_publication(self.job)["status"], "completed")
+
+    def test_pagination_finds_the_receipt_but_stops_at_the_starting_head(self) -> None:
+        self.pages = [[self.commit(f"{index:040x}", "chore: unrelated") for index in range(100)], self.pages[0]]
+        self.assertEqual(command_publication(self.job)["status"], "published")
+        self.pages[0][0] = self.commit(self.record["starting_head"], "base")
+        self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_lookup_failure_never_falls_back_to_execution(self) -> None:
+        with patch("runner.github", side_effect=TimeoutError("lost read response")):
+            result = command_publication(self.job)
+        self.assertEqual(result["status"], "uncertain")
+        self.assertIn("TimeoutError", result["reason"])
+
+
+class CommandInitializationTests(unittest.TestCase):
+    class Interrupted(Exception):
+        pass
+
+    def setUp(self) -> None:
+        self.job = {"mode": "command", "repo": REPO, "pr": 142, "key": f"{REPO}:command:555",
+                    "kind": "issue_comment", "comment": 555, "author": "kas", "target": "pr",
+                    "source_url": f"https://github.com/{REPO}/pull/142#issuecomment-555",
+                    "prompt": "fix the command launch regression"}
+        self.temporary_directory = tempfile.TemporaryDirectory
+        self.subprocess_run = subprocess.run
+        self.subprocess_popen = subprocess.Popen
+        temporary = self.temporary_directory()
+        self.addCleanup(temporary.cleanup)
+        self.upstream = Path(temporary.name)
+        self.git_env = {"PATH": os.defpath, "HOME": temporary.name, "GIT_CONFIG_NOSYSTEM": "1"}
+        self.branch = "feature/command"
+        self.git(["git", "init", "-b", self.branch])
+        self.git(["git", "-c", "user.name=test", "-c", "user.email=test@example.com",
+                  "commit", "--allow-empty", "-m", "base"])
+        self.head = self.git(["git", "rev-parse", "HEAD"]).stdout.strip()
+        self.git(["git", "update-ref", "refs/pull/142/head", self.head])
+        self.values = {}
+        self.interrupt_after_start = False
+        claims = Mock()
+        claims.put.side_effect = self.put
+        claims.get.side_effect = lambda key, default=None: copy.deepcopy(self.values.get(key, default))
+        for patcher in (patch("runner.CLAIMS", claims), patch("runner.log"),
+                        patch("runner.github", side_effect=AssertionError("unexpected GitHub read")),
+                        patch("runner.tempfile.TemporaryDirectory", side_effect=self.Interrupted)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def put(self, key, value, skip_if_exists=False):
+        if skip_if_exists and key in self.values:
+            return False
+        self.values[key] = copy.deepcopy(value)
+        if self.interrupt_after_start and key == "started:" + self.job["key"]:
+            self.interrupt_after_start = False
+            raise self.Interrupted
+        return True
+
+    def deliver(self) -> None:
+        with self.assertRaises(self.Interrupted):
+            PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
+
+    def git(self, args, **kwargs):
+        return self.subprocess_run(args, cwd=kwargs.get("cwd", self.upstream),
+                                   env=self.git_env, capture_output=True, text=True, check=True)
+
+    def launch(self) -> dict:
+        """Reach omp with a local checkout or an empty reporting-only directory."""
+        observed = {}
+
+        def read_github(path):
+            if path == f"repos/{REPO}/pulls/142":
+                return {"state": "open", "base": {"repo": {"full_name": REPO}},
+                        "head": {"sha": self.head, "ref": self.branch, "repo": {"full_name": REPO}}}
+            if path == f"repos/{REPO}/commits?sha={self.head}&per_page=100&page=1":
+                return [{"sha": self.head, "commit": {"message": "base"}}]
+            raise AssertionError(f"unexpected GitHub read: {path}")
+
+        def run(args, **kwargs):
+            if args == ["gh", "auth", "setup-git"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:3] == ["git", "clone", "--no-checkout"]:
+                args = [*args[:3], str(self.upstream), args[-1]]
+            elif args[:2] not in (["git", "fetch"], ["git", "checkout"], ["git", "rev-parse"]):
+                raise AssertionError(f"unexpected command: {args}")
+            return self.git(args, **kwargs)
+
+        def popen(args, *, cwd, **kwargs):
+            if args[0] == "git":
+                return self.subprocess_popen(args, cwd=cwd, **kwargs)
+            self.assertEqual(args[0], "omp")
+            observed["prompt"] = Path(args[-1].removeprefix("@")).read_text()
+            policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
+            observed["context"] = json.loads(policy.split("\nTrusted job context:\n", 1)[1])
+            observed["has_checkout"] = (cwd / ".git").is_dir()
+            observed["files"] = {path.name for path in cwd.iterdir()}
+            if observed["has_checkout"]:
+                observed["head"] = self.git(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()
+                observed["branch"] = self.git(["git", "branch", "--show-current"], cwd=cwd).stdout.strip()
+            raise self.Interrupted
+
+        model = CONFIG["model"].split("/", 1)[1]
+        with (patch("runner.tempfile.TemporaryDirectory", self.temporary_directory),
+              patch.dict("runner.os.environ", {"PATH": os.defpath, "BUN_INSTALL": "/unused",
+                                               "CLI_PROXY_API_KEY": "disposable-proxy-key"}, clear=True),
+              patch.dict(CONFIG, {"jarvis_owner": ""}),
+              patch("runner.github_token", return_value="disposable-token"),
+              patch("runner.github", side_effect=read_github),
+              patch("runner.urllib.request.urlopen", return_value=StringIO(json.dumps({"data": [{"id": model}]}))),
+              patch("runner.subprocess.run", side_effect=run),
+              patch("runner.subprocess.Popen", side_effect=popen)):
+            self.deliver()
+        return observed
+
+    def assert_execution_launch(self, observed) -> None:
+        self.assertTrue(observed["has_checkout"])
+        self.assertEqual((observed["head"], observed["branch"]), (self.head, self.branch))
+        self.assertNotIn("command_resume", observed["context"])
+        self.assertIn(self.job["prompt"], observed["prompt"])
+        self.assertIn(self.job["author"], observed["prompt"])
+        self.assertNotIn("reporting-only", observed["prompt"])
+        self.assertEqual(self.values["command:" + self.job["key"]],
+                         {"state": "executing", "starting_head": self.head, "branch": self.branch})
+
+    def assert_reporting_launch(self, observed, status) -> None:
+        self.assertFalse(observed["has_checkout"])
+        self.assertEqual(observed["files"], set())
+        self.assertEqual(observed["context"]["command_resume"]["status"], status)
+        self.assertIn("reporting-only", observed["prompt"])
+        self.assertIn(self.job["prompt"], observed["prompt"])
+
+    def test_preemption_after_start_claim_allows_command_preparation_on_redelivery(self) -> None:
+        self.interrupt_after_start = True
+        self.deliver()
+        self.assertNotIn("command:" + self.job["key"], self.values)
+        self.deliver()
+        self.assertIsNone(command_publication(self.job))
+        self.assert_execution_launch(self.launch())
+
+    def test_legacy_start_without_execution_record_stays_reporting_only(self) -> None:
+        self.values["started:" + self.job["key"]] = "started"
+        self.deliver()
+        self.assertEqual(command_publication(self.job)["status"], "uncertain")
+        self.assertNotIn("command:" + self.job["key"], self.values)
+        self.assert_reporting_launch(self.launch(), "uncertain")
+        self.assertNotIn("command:" + self.job["key"], self.values)
+
+    def test_redelivery_preserves_existing_execution_records(self) -> None:
+        self.interrupt_after_start = True
+        self.deliver()
+        for state in ("preparing", "executing", "completed"):
+            with self.subTest(state=state):
+                record = {"state": state, "starting_head": self.head, "branch": self.branch}
+                self.values["command:" + self.job["key"]] = record
+                self.deliver()
+                self.assertEqual(self.values["command:" + self.job["key"]], record)
+                result = command_publication(self.job)
+                if state == "preparing":
+                    self.assertIsNone(result)
+                else:
+                    self.assertEqual(result["status"], "uncertain")
+                observed = self.launch()
+                if state == "preparing":
+                    self.assert_execution_launch(observed)
+                else:
+                    self.assert_reporting_launch(observed, "completed" if state == "completed" else "uncertain")
+                    self.assertEqual(self.values["command:" + self.job["key"]], record)
 
 
 class DocsMergeTests(unittest.TestCase):
