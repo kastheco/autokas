@@ -516,11 +516,15 @@ class DocsMergeTests(unittest.TestCase):
         if path == f"{self.api}?state=open&head=example:{self.branch}&base=main":
             return []
         if path == f"{self.api}/2":
+            head = self.current_head
+            if getattr(self, "stale_head_reads", 0):
+                head = self.stale_head
+                self.stale_head_reads -= 1
             return {
                 **self.followup,
                 "state": "closed" if self.merged_head else "open",
                 **({"state": "closed"} if getattr(self, "closed_followup", False) else {}),
-                "head": {**self.followup["head"], "sha": self.current_head},
+                "head": {**self.followup["head"], "sha": head},
                 "merged_at": "2026-09-27T00:00:00Z" if self.merged_head else None,
                 "merge_commit_sha": "d" * 40 if self.merged_head and not self.omit_merge_commit else None,
             }
@@ -624,7 +628,8 @@ class DocsMergeTests(unittest.TestCase):
             self.run_worker()
         self.log.assert_not_called()
 
-    def disposable_checkout(self, *, mode="write", agent="docs", configured=True, move_base=None):
+    def disposable_checkout(self, *, mode="write", agent="docs", configured=True, move_base=None,
+                            stale_head_reads=0):
         """Run the docs flow against a local Git remote and an actual Node hook."""
         upstream = self.root / "upstream"
         self.merged_head = None
@@ -708,6 +713,7 @@ class DocsMergeTests(unittest.TestCase):
         self.process.side_effect = popen
 
         def git_run(args, cwd):
+            previous_head = self.current_head
             if args[:2] == ["gh", "auth"]:
                 return ""
             if args[:2] == ["git", "clone"]:
@@ -716,6 +722,9 @@ class DocsMergeTests(unittest.TestCase):
             if move_base == "hook" and args == ["git", "commit", "-m", "chore: record worker release state"] and self.base_moves == 0:
                 advance_base()
             if args[:2] == ["git", "push"]:
+                if any(arg.startswith("--force-with-lease=") for arg in args):
+                    self.stale_head = previous_head
+                    self.stale_head_reads = stale_head_reads
                 self.final_head = command(["git", "rev-parse", "HEAD"], cwd, self.real_env)
                 self.current_head = self.final_head
                 self.followup["head"]["sha"] = self.final_head
@@ -772,6 +781,55 @@ class DocsMergeTests(unittest.TestCase):
                 self.assertEqual(manifest["base_sha"], self.latest_base)
                 self.assertEqual(self.merged_head, self.final_head)
                 self.assertEqual(manifest["release"], "newer-base")
+
+    def test_reconciled_followup_waits_for_its_new_head_before_merge(self) -> None:
+        self.disposable_checkout(move_base="publication", stale_head_reads=2)
+        with patch("runner.time.sleep"):
+            self.run_disposable()
+        self.assertEqual(self.agent_runs, 2)
+        self.assertEqual(self.merged_head, self.final_head)
+        self.assertNotEqual(self.merged_head, self.stale_head)
+        self.assertEqual((self.root / "repo/docs/guide.md").read_text(), "Latest guide\nUpdated guide\n")
+
+    def test_reconciled_followup_rejects_an_unexpected_head_after_sync_lag(self) -> None:
+        self.disposable_checkout(move_base="publication", stale_head_reads=1)
+
+        def read(path):
+            response = self.read_github(path)
+            if (path == f"{self.api}/2" and hasattr(self, "stale_head")
+                    and response["head"]["sha"] != self.stale_head):
+                response["head"]["sha"] = "c" * 40
+            return response
+
+        self.github_read.side_effect = read
+        with patch("runner.time.sleep"), self.assertRaisesRegex(RuntimeError, "docs pull request changed"):
+            self.run_disposable()
+        self.assertIsNone(self.merged_head)
+        self.assertEqual(self.merge_attempts, 0)
+
+    def test_reconciled_followup_stops_when_head_does_not_sync(self) -> None:
+        self.disposable_checkout(move_base="publication", stale_head_reads=100)
+        with patch("runner.time.sleep") as sleep, self.assertRaisesRegex(RuntimeError, "docs pull request changed"):
+            self.run_disposable()
+        self.assertLessEqual(sum(call.args[0] for call in sleep.call_args_list), 15)
+        self.assertIsNone(self.merged_head)
+        self.assertEqual(self.merge_attempts, 0)
+
+    def test_reconciled_followup_wait_cannot_exceed_worker_deadline(self) -> None:
+        self.disposable_checkout(move_base="publication", stale_head_reads=100)
+        clock = [0.0]
+        deadline = 3.5
+
+        def sleep(delay):
+            clock[0] += delay
+            self.assertLess(clock[0], deadline)
+
+        with patch("runner.time.monotonic", side_effect=lambda: clock[0]), patch("runner.time.sleep", side_effect=sleep):
+            with self.assertRaisesRegex(RuntimeError, "docs pull request changed"):
+                docs_worker(self.job, self.root, self.real_env, self.git_run,
+                            deadline, self.root / "settings.json")
+        self.assertIsNone(self.merged_head)
+        self.assertEqual(self.merge_attempts, 0)
 
     def test_late_real_git_conflict_is_reconciled_before_merge(self) -> None:
         self.disposable_checkout(move_base="merge")

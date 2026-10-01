@@ -971,7 +971,7 @@ def docs_worker(
                 pushed = ""
             if pushed != final_head:
                 raise RuntimeError("docs branch push failed or is uncertain") from error
-        published_head = final_head
+        previous_head, published_head = published_head, final_head
         if followup_number is None:
             open_prs = github(f"{api_base}/pulls?state=open&head={repo.split('/')[0]}:{branch}&base={base_branch}")
             if not isinstance(open_prs, list) or len(open_prs) > 1:
@@ -1001,6 +1001,14 @@ def docs_worker(
                 or followup.get("base", {}).get("ref") != base_branch
             ):
                 raise RuntimeError("docs pull request is outside the configured scope")
+        if previous_head is not None:
+            # Wait only for our prior head, never an unrelated branch update.
+            for delay in (1, 2, 4, 8):
+                if github(f"{api_base}/pulls/{followup_number}").get("head", {}).get("sha") != previous_head:
+                    break
+                if time.monotonic() + delay >= deadline:
+                    break
+                time.sleep(delay)
         checked_followup(final_head)
         files = github(f"{api_base}/pulls/{followup_number}/files?per_page=100")
         allowed = lambda path: docs_path_allowed(path, folders) or path in outputs
