@@ -15,7 +15,7 @@
   "timeout_seconds": 3600,
   "omp_version": "18.3.2",
   "bun_version": "1.4.2",
-  "model": "railway-codex/gpt-6-sol",
+  "model": "railway-codex/gpt-6.1-sol",
   "thinking": "high",
   "service_tier": "priority",
   "jarvis_url": "",
@@ -38,7 +38,7 @@
         "apiKey": "CLI_PROXY_API_KEY",
         "models": [
           {
-            "id": "gpt-6-sol",
+            "id": "gpt-6.1-sol",
             "reasoning": true,
             "input": [
               "text",
