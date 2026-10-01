@@ -353,7 +353,7 @@ class CommandInitializationTests(unittest.TestCase):
 
         def read_github(path):
             if path == f"repos/{REPO}/pulls/142":
-                return {"state": "open", "base": {"repo": {"full_name": REPO}},
+                return {"state": "open", "body": getattr(self, "pr_body", ""), "base": {"repo": {"full_name": REPO}},
                         "head": {"sha": self.head, "ref": self.branch, "repo": {"full_name": REPO}}}
             if path == f"repos/{REPO}/commits?sha={self.head}&per_page=100&page=1":
                 return [{"sha": self.head, "commit": {"message": "base"}}]
@@ -418,6 +418,10 @@ class CommandInitializationTests(unittest.TestCase):
         self.assertNotIn("command:" + self.job["key"], self.values)
         self.deliver()
         self.assertIsNone(command_publication(self.job))
+        self.assert_execution_launch(self.launch())
+
+    def test_explicit_command_on_generated_docs_pr_reaches_its_head(self) -> None:
+        self.pr_body = "<!-- omp-runner:docs-update -->"
         self.assert_execution_launch(self.launch())
 
     def test_legacy_start_without_execution_record_stays_reporting_only(self) -> None:
@@ -514,6 +518,8 @@ class DocsMergeTests(unittest.TestCase):
         if path == f"{self.api}/2":
             return {
                 **self.followup,
+                "state": "closed" if self.merged_head else "open",
+                **({"state": "closed"} if getattr(self, "closed_followup", False) else {}),
                 "head": {**self.followup["head"], "sha": self.current_head},
                 "merged_at": "2026-09-27T00:00:00Z" if self.merged_head else None,
                 "merge_commit_sha": "d" * 40 if self.merged_head and not self.omit_merge_commit else None,
@@ -521,10 +527,15 @@ class DocsMergeTests(unittest.TestCase):
         raise AssertionError(f"unexpected GitHub read: {path}")
 
     def write_github(self, method, path, payload):
+        if method == "PATCH" and path == f"{self.api}/2":
+            self.closed_followup = True
+            return {"state": "closed"}
         if method == "POST" and path == self.api:
             return copy.deepcopy(self.followup)
         if method == "PUT" and path == f"{self.api}/2/merge":
             self.merge_attempts += 1
+            if getattr(self, "move_head_at_merge", False):
+                self.current_head = "c" * 40
             if payload.get("sha", self.current_head) != self.current_head:
                 if self.concurrent_merge:
                     self.merged_head = self.current_head
@@ -579,16 +590,16 @@ class DocsMergeTests(unittest.TestCase):
 
     def test_changed_head_is_not_merged_or_retried(self) -> None:
         self.move_head = True
-        with self.assertRaisesRegex(RuntimeError, "docs pull request merge failed or is uncertain"):
+        with self.assertRaisesRegex(RuntimeError, "docs pull request changed"):
             self.run_worker()
         self.assertIsNone(self.merged_head)
-        self.assertEqual(self.merge_attempts, 1)
+        self.assertEqual(self.merge_attempts, 0)
         self.log.assert_not_called()
 
     def test_concurrent_merge_of_changed_head_is_not_confirmed(self) -> None:
-        self.move_head = True
+        self.move_head_at_merge = True
         self.concurrent_merge = True
-        with self.assertRaisesRegex(RuntimeError, "docs pull request merge failed or is uncertain"):
+        with self.assertRaisesRegex(RuntimeError, "docs pull request changed"):
             self.run_worker()
         self.assertNotEqual(self.merged_head, self.final_head)
         self.assertEqual(self.merged_head, self.current_head)
@@ -613,9 +624,10 @@ class DocsMergeTests(unittest.TestCase):
             self.run_worker()
         self.log.assert_not_called()
 
-    def disposable_checkout(self, *, mode="write", agent="docs", configured=True):
+    def disposable_checkout(self, *, mode="write", agent="docs", configured=True, move_base=None):
         """Run the docs flow against a local Git remote and an actual Node hook."""
         upstream = self.root / "upstream"
+        self.merged_head = None
         self.process.side_effect = self.real_popen
         upstream.mkdir()
 
@@ -633,13 +645,14 @@ class DocsMergeTests(unittest.TestCase):
             "import fs from 'node:fs';\n"
             "const input = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
             "if (!process.env.GH_TOKEN || !process.env.HOME || !process.env.PATH || "
-            "input.repo !== 'example/docs' || input.base_sha !== input.source_sha "
+            "input.repo !== 'example/docs' "
             "|| Number(process.env.OMP_POSTPROCESS_DEADLINE) <= Date.now() / 1000) process.exit(3);\n"
             "if (['CLI_PROXY_API_KEY', 'JARVIS_RUNNER_TOKEN', 'JARVIS_CONSULT_URL', "
             "'HOOK_MODE', 'EXPECT_BASE'].some(key => key in process.env)) process.exit(5);\n"
             f"const mode = {json.dumps(mode)};\n"
             "if (mode === 'fail') process.exit(4);\n"
-            "if (mode === 'write') fs.writeFileSync('.railway/worker-releases.json', JSON.stringify(input));\n"
+            "const previous = fs.existsSync('.railway/worker-releases.json') ? JSON.parse(fs.readFileSync('.railway/worker-releases.json', 'utf8')) : {};\n"
+            "if (mode === 'write') fs.writeFileSync('.railway/worker-releases.json', JSON.stringify({...previous, ...input}));\n"
             "if (mode === 'forbidden') fs.writeFileSync('src/injected.txt', 'not allowed');\n"
             "if (mode === 'rename') fs.renameSync('src/service.py', '.railway/worker-releases.json');\n"
             "if (mode === 'symlink') fs.symlinkSync('../src/service.py', '.railway/worker-releases.json');\n"
@@ -660,18 +673,37 @@ class DocsMergeTests(unittest.TestCase):
                          "JARVIS_CONSULT_URL": "https://example.invalid/consult",
                          "GIT_AUTHOR_NAME": "autokas[bot]", "GIT_AUTHOR_EMAIL": "bot@example.com",
                          "GIT_COMMITTER_NAME": "autokas[bot]", "GIT_COMMITTER_EMAIL": "bot@example.com"}
+        self.agent_runs = 0
+        self.base_moves = 0
+
+        def advance_base():
+            self.base_moves += 1
+            guide = ("Original guide\nUpdated guide\n" if move_base == "covered" else
+                     "Latest guide\n" if self.base_moves == 1 else f"Latest guide {self.base_moves}\n")
+            (upstream / "docs/guide.md").write_text(guide)
+            (upstream / "src/service.py").write_text("latest service\n")
+            (upstream / ".railway/worker-releases.json").write_text(json.dumps({"release": "newer-base"}))
+            command(["git", "add", "-A"])
+            command(["git", "commit", "-m", "feat: concurrent base update"], upstream, self.real_env)
+            self.latest_base = command(["git", "rev-parse", "HEAD"])
+            return self.latest_base
+        self.advance_base = advance_base
 
         def popen(args, *positional, **kwargs):
             if args[0] != "omp":
                 return self.real_popen(args, *positional, **kwargs)
+            self.agent_runs += 1
             checkout = self.root / "repo"
-            if agent == "docs":
-                (checkout / "docs/guide.md").write_text("Updated guide\n")
+            if agent == "docs" and not (move_base == "covered" and self.agent_runs > 1):
+                guide = checkout / "docs/guide.md"
+                guide.write_text(guide.read_text() + "Updated guide\n" if move_base else "Updated guide\n")
                 command(["git", "add", "-A"], checkout)
                 command(["git", "commit", "-m", "docs: update guide"], checkout, self.real_env)
             elif agent == "rename":
                 command(["git", "mv", "src/service.py", "docs/service.py"], checkout)
                 command(["git", "commit", "-m", "docs: rename service"], checkout, self.real_env)
+            if move_base == "always" or (move_base == "agent" and self.base_moves == 0):
+                advance_base()
             return self.process.return_value
         self.process.side_effect = popen
 
@@ -681,14 +713,36 @@ class DocsMergeTests(unittest.TestCase):
             if args[:2] == ["git", "clone"]:
                 args = ["git", "clone", "--no-checkout", str(upstream), args[-1]]
             output = command(args, cwd, self.real_env)
+            if move_base == "hook" and args == ["git", "commit", "-m", "chore: record worker release state"] and self.base_moves == 0:
+                advance_base()
             if args[:2] == ["git", "push"]:
                 self.final_head = command(["git", "rev-parse", "HEAD"], cwd, self.real_env)
                 self.current_head = self.final_head
                 self.followup["head"]["sha"] = self.final_head
-                names = command(["git", "diff", "--name-only", self.job["source_sha"], "HEAD"], cwd)
+                names = command(["git", "diff", "--name-only", "origin/main", "HEAD"], cwd)
                 self.followup_files = [{"filename": name} for name in names.splitlines()]
+                if move_base in {"publication", "covered"} and self.base_moves == 0:
+                    advance_base()
             return output
         self.git_run = git_run
+        if move_base == "merge":
+            original_write = self.write_github
+
+            def merge_with_git(method, path, payload):
+                if method == "PUT":
+                    if self.base_moves == 0:
+                        advance_base()
+                    try:
+                        command(["git", "merge", "--no-ff", self.branch, "-m", "merge docs"], upstream, self.real_env)
+                    except subprocess.CalledProcessError as error:
+                        self.conflict_output = error.stdout
+                        command(["git", "merge", "--abort"])
+                        self.merge_attempts += 1
+                        raise HTTPError(path, 409, "Merge conflict", Message(), None) from error
+                return original_write(method, path, payload)
+            self.github_write_patch = patch("runner.github_request", side_effect=merge_with_git)
+            self.github_write_patch.start()
+            self.addCleanup(self.github_write_patch.stop)
 
     def run_disposable(self):
         docs_worker(self.job, self.root, self.real_env, self.git_run,
@@ -704,6 +758,46 @@ class DocsMergeTests(unittest.TestCase):
         self.assertEqual(json.loads((self.root / "repo/.railway/worker-releases.json").read_text()),
                          {"repo": self.job["repo"], "source_sha": self.job["source_sha"],
                           "base_sha": self.job["source_sha"]})
+
+    def test_stale_docs_are_regenerated_with_manifest_from_latest_base(self) -> None:
+        for stage in ("agent", "hook", "publication"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                self.root = Path(directory)
+                self.disposable_checkout(move_base=stage)
+                self.run_disposable()
+                self.assertEqual(self.agent_runs, 2)
+                self.assertEqual((self.root / "repo/docs/guide.md").read_text(), "Latest guide\nUpdated guide\n")
+                self.assertEqual((self.root / "repo/src/service.py").read_text(), "latest service\n")
+                manifest = json.loads((self.root / "repo/.railway/worker-releases.json").read_text())
+                self.assertEqual(manifest["base_sha"], self.latest_base)
+                self.assertEqual(self.merged_head, self.final_head)
+                self.assertEqual(manifest["release"], "newer-base")
+
+    def test_late_real_git_conflict_is_reconciled_before_merge(self) -> None:
+        self.disposable_checkout(move_base="merge")
+        self.run_disposable()
+        self.assertIn("CONFLICT", self.conflict_output)
+        self.assertEqual(self.merge_attempts, 2)
+        self.assertEqual(self.agent_runs, 2)
+        self.assertEqual((self.root / "upstream/docs/guide.md").read_text(), "Latest guide\nUpdated guide\n")
+        manifest = json.loads((self.root / "upstream/.railway/worker-releases.json").read_text())
+        self.assertEqual((manifest["base_sha"], manifest["release"]), (self.latest_base, "newer-base"))
+
+    def test_published_followup_is_closed_when_latest_base_already_covers_source(self) -> None:
+        self.disposable_checkout(configured=False, move_base="covered")
+        self.run_disposable()
+        self.assertTrue(self.closed_followup)
+        self.assertIsNone(self.merged_head)
+        self.assertEqual(self.merge_attempts, 0)
+        self.assertEqual((self.root / "repo/docs/guide.md").read_text(), "Original guide\nUpdated guide\n")
+
+    def test_continually_moving_base_stops_without_publishing_stale_docs(self) -> None:
+        self.disposable_checkout(move_base="always")
+        with self.assertRaisesRegex(RuntimeError, "base kept moving"):
+            self.run_disposable()
+        self.assertEqual(self.agent_runs, 3)
+        self.assertIsNone(self.merged_head)
+        self.assertEqual(self.merge_attempts, 0)
 
     def test_disposable_hook_rejects_failure_and_forbidden_output(self) -> None:
         for mode, error in (("fail", "exited with 4"), ("forbidden", "undeclared"),
@@ -727,11 +821,11 @@ class DocsMergeTests(unittest.TestCase):
         self.assertEqual(self.merge_attempts, 0)
         self.assertEqual(self.log.call_args.args[0], "docs_update_no_change")
 
-    def test_disposable_unconfigured_noop_remains_error(self) -> None:
+    def test_accurate_docs_without_postprocess_need_no_followup(self) -> None:
         self.disposable_checkout(mode="noop", agent="none", configured=False)
-        with self.assertRaisesRegex(RuntimeError, "no committed change"):
-            self.run_disposable()
+        self.run_disposable()
         self.assertEqual(self.merge_attempts, 0)
+        self.assertIsNone(self.merged_head)
 
     def test_disposable_configured_traversal_never_runs_hook(self) -> None:
         self.disposable_checkout()
