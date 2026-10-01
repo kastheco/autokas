@@ -176,6 +176,8 @@ command commits carry `Autokas-Command: <sha256 of job key>` as a Git trailer. a
 
 confirmed publications and confirmed no-change completions resume reporting only, without checking out code or executing the command again. an uncertain publication also starts a reporting-only run that explains the missing evidence. missing legacy execution records, changed branches, unavailable GitHub reads and missing commit receipts never authorize command replay. review and docs reconciliation remain separate.
 
+`python -m unittest test_runner.CommandInitializationTests -v` reaches the `PRWorker.run` launch boundary with a disposable local Git remote. it checks that pre-launch redelivery uses the original command prompt and the expected checked-out head and branch. legacy starts without execution records, uncertain executions and completed no-change commands use the reporting-only prompt in an empty worktree, without replacing their execution records.
+
 references: [Modal deployment](https://modal.com/docs/guide/apps), [secrets](https://modal.com/docs/sdk/py/latest/Secret), [Dict](https://modal.com/docs/sdk/py/latest/Dict), [GitHub fine-grained tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
 
 ### autokas GitHub App setup

@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+from io import StringIO
 import subprocess
 from email.message import Message
 import unittest
@@ -301,7 +302,23 @@ class CommandInitializationTests(unittest.TestCase):
         pass
 
     def setUp(self) -> None:
-        self.job = {"mode": "command", "repo": REPO, "pr": 142, "key": f"{REPO}:command:555"}
+        self.job = {"mode": "command", "repo": REPO, "pr": 142, "key": f"{REPO}:command:555",
+                    "kind": "issue_comment", "comment": 555, "author": "kas", "target": "pr",
+                    "source_url": f"https://github.com/{REPO}/pull/142#issuecomment-555",
+                    "prompt": "fix the command launch regression"}
+        self.temporary_directory = tempfile.TemporaryDirectory
+        self.subprocess_run = subprocess.run
+        self.subprocess_popen = subprocess.Popen
+        temporary = self.temporary_directory()
+        self.addCleanup(temporary.cleanup)
+        self.upstream = Path(temporary.name)
+        self.git_env = {"PATH": os.defpath, "HOME": temporary.name, "GIT_CONFIG_NOSYSTEM": "1"}
+        self.branch = "feature/command"
+        self.git(["git", "init", "-b", self.branch])
+        self.git(["git", "-c", "user.name=test", "-c", "user.email=test@example.com",
+                  "commit", "--allow-empty", "-m", "base"])
+        self.head = self.git(["git", "rev-parse", "HEAD"]).stdout.strip()
+        self.git(["git", "update-ref", "refs/pull/142/head", self.head])
         self.values = {}
         self.interrupt_after_start = False
         claims = Mock()
@@ -326,17 +343,89 @@ class CommandInitializationTests(unittest.TestCase):
         with self.assertRaises(self.Interrupted):
             PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
 
+    def git(self, args, **kwargs):
+        return self.subprocess_run(args, cwd=kwargs.get("cwd", self.upstream),
+                                   env=self.git_env, capture_output=True, text=True, check=True)
+
+    def launch(self) -> dict:
+        """Reach omp with a local checkout or an empty reporting-only directory."""
+        observed = {}
+
+        def read_github(path):
+            if path == f"repos/{REPO}/pulls/142":
+                return {"state": "open", "base": {"repo": {"full_name": REPO}},
+                        "head": {"sha": self.head, "ref": self.branch, "repo": {"full_name": REPO}}}
+            if path == f"repos/{REPO}/commits?sha={self.head}&per_page=100&page=1":
+                return [{"sha": self.head, "commit": {"message": "base"}}]
+            raise AssertionError(f"unexpected GitHub read: {path}")
+
+        def run(args, **kwargs):
+            if args == ["gh", "auth", "setup-git"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:3] == ["git", "clone", "--no-checkout"]:
+                args = [*args[:3], str(self.upstream), args[-1]]
+            elif args[:2] not in (["git", "fetch"], ["git", "checkout"], ["git", "rev-parse"]):
+                raise AssertionError(f"unexpected command: {args}")
+            return self.git(args, **kwargs)
+
+        def popen(args, *, cwd, **kwargs):
+            if args[0] == "git":
+                return self.subprocess_popen(args, cwd=cwd, **kwargs)
+            self.assertEqual(args[0], "omp")
+            observed["prompt"] = Path(args[-1].removeprefix("@")).read_text()
+            policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
+            observed["context"] = json.loads(policy.split("\nTrusted job context:\n", 1)[1])
+            observed["has_checkout"] = (cwd / ".git").is_dir()
+            observed["files"] = {path.name for path in cwd.iterdir()}
+            if observed["has_checkout"]:
+                observed["head"] = self.git(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()
+                observed["branch"] = self.git(["git", "branch", "--show-current"], cwd=cwd).stdout.strip()
+            raise self.Interrupted
+
+        model = CONFIG["model"].split("/", 1)[1]
+        with (patch("runner.tempfile.TemporaryDirectory", self.temporary_directory),
+              patch.dict("runner.os.environ", {"PATH": os.defpath, "BUN_INSTALL": "/unused",
+                                               "CLI_PROXY_API_KEY": "disposable-proxy-key"}, clear=True),
+              patch.dict(CONFIG, {"jarvis_owner": ""}),
+              patch("runner.github_token", return_value="disposable-token"),
+              patch("runner.github", side_effect=read_github),
+              patch("runner.urllib.request.urlopen", return_value=StringIO(json.dumps({"data": [{"id": model}]}))),
+              patch("runner.subprocess.run", side_effect=run),
+              patch("runner.subprocess.Popen", side_effect=popen)):
+            self.deliver()
+        return observed
+
+    def assert_execution_launch(self, observed) -> None:
+        self.assertTrue(observed["has_checkout"])
+        self.assertEqual((observed["head"], observed["branch"]), (self.head, self.branch))
+        self.assertNotIn("command_resume", observed["context"])
+        self.assertIn(self.job["prompt"], observed["prompt"])
+        self.assertIn(self.job["author"], observed["prompt"])
+        self.assertNotIn("reporting-only", observed["prompt"])
+        self.assertEqual(self.values["command:" + self.job["key"]],
+                         {"state": "executing", "starting_head": self.head, "branch": self.branch})
+
+    def assert_reporting_launch(self, observed, status) -> None:
+        self.assertFalse(observed["has_checkout"])
+        self.assertEqual(observed["files"], set())
+        self.assertEqual(observed["context"]["command_resume"]["status"], status)
+        self.assertIn("reporting-only", observed["prompt"])
+        self.assertIn(self.job["prompt"], observed["prompt"])
+
     def test_preemption_after_start_claim_allows_command_preparation_on_redelivery(self) -> None:
         self.interrupt_after_start = True
         self.deliver()
         self.assertNotIn("command:" + self.job["key"], self.values)
         self.deliver()
         self.assertIsNone(command_publication(self.job))
+        self.assert_execution_launch(self.launch())
 
     def test_legacy_start_without_execution_record_stays_reporting_only(self) -> None:
         self.values["started:" + self.job["key"]] = "started"
         self.deliver()
         self.assertEqual(command_publication(self.job)["status"], "uncertain")
+        self.assertNotIn("command:" + self.job["key"], self.values)
+        self.assert_reporting_launch(self.launch(), "uncertain")
         self.assertNotIn("command:" + self.job["key"], self.values)
 
     def test_redelivery_preserves_existing_execution_records(self) -> None:
@@ -344,7 +433,7 @@ class CommandInitializationTests(unittest.TestCase):
         self.deliver()
         for state in ("preparing", "executing", "completed"):
             with self.subTest(state=state):
-                record = {"state": state, "starting_head": "a" * 40, "branch": "feature/command"}
+                record = {"state": state, "starting_head": self.head, "branch": self.branch}
                 self.values["command:" + self.job["key"]] = record
                 self.deliver()
                 self.assertEqual(self.values["command:" + self.job["key"]], record)
@@ -353,6 +442,12 @@ class CommandInitializationTests(unittest.TestCase):
                     self.assertIsNone(result)
                 else:
                     self.assertEqual(result["status"], "uncertain")
+                observed = self.launch()
+                if state == "preparing":
+                    self.assert_execution_launch(observed)
+                else:
+                    self.assert_reporting_launch(observed, "completed" if state == "completed" else "uncertain")
+                    self.assertEqual(self.values["command:" + self.job["key"]], record)
 
 
 class DocsMergeTests(unittest.TestCase):
