@@ -344,6 +344,12 @@ def generated_docs_pr(pr: dict[str, Any]) -> bool:
         and str(head.get("ref", "")).startswith(CONFIG["docs_update"]["branch_prefix"])
     ) or (isinstance(body, str) and DOCS_PR_MARKER in body)
 
+def autokas_ignored(pr: dict[str, Any]) -> bool:
+    """Honor the PR author's opt-out from automatic autokas work."""
+    body = pr.get("body")
+    return isinstance(body, str) and ("autokas:ignore" in body.lower() or "@autokas ignore" in body.lower())
+
+
 COMMAND = re.compile(r"@autokas(?![\w-])", re.IGNORECASE)
 
 def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -395,7 +401,7 @@ def docs_event_job(payload: dict[str, Any]) -> dict[str, Any] | None:
         or base_repo.get("full_name") != repo
         or base.get("ref") != entry["branch"]
         or head_repo.get("full_name") != repo
-        or generated_docs_pr(pr)
+        or generated_docs_pr(pr) or autokas_ignored(pr)
     ):
         return None
     if generated_docs_pr(pr):
@@ -472,7 +478,7 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if not bot(comment.get("user", {})):
         return None
     pr = payload.get("issue" if event == "issue_comment" else "pull_request", {})
-    if generated_docs_pr(pr):
+    if generated_docs_pr(pr) or autokas_ignored(pr):
         return None
     number = pr.get("number")
     if type(number) is not int or number <= 0:
