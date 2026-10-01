@@ -1098,12 +1098,16 @@ class PRWorker:
         """Prepare one fresh worktree and let omp perform the entire fix workflow."""
         # Modal can redeliver preempted inputs even with retries=0. Commands need
         # their own publication evidence before another agent may execute them.
-        first_start = CLAIMS.put("started:" + job["key"], "started", skip_if_exists=True)
+        start_value = "command_started_v2" if job.get("mode") == "command" else "started"
+        first_start = CLAIMS.put("started:" + job["key"], start_value, skip_if_exists=True)
         if not first_start:
             log("preempted_retry", repo=job["repo"], pr=job["pr"], key=job["key"])
         command_resume = None
         if job.get("mode") == "command":
-            if first_start:
+            # Only this marker proves a missing record belongs to a pre-launch gap,
+            # rather than a legacy command whose execution evidence is unavailable.
+            if (first_start or (CLAIMS.get("started:" + job["key"], None) == "command_started_v2"
+                                and CLAIMS.get("command:" + job["key"], None) is None)):
                 CLAIMS.put("command:" + job["key"], {"state": "preparing"}, skip_if_exists=True)
             command_resume = command_publication(job)
             if command_resume is not None:

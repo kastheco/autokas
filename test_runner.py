@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
-from runner import CONFIG, agent_prompt, command_publication, docs_worker, event_job
+from runner import CONFIG, PRWorker, agent_prompt, command_publication, docs_worker, event_job
 
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
@@ -294,6 +294,65 @@ class CommandPublicationTests(unittest.TestCase):
             result = command_publication(self.job)
         self.assertEqual(result["status"], "uncertain")
         self.assertIn("TimeoutError", result["reason"])
+
+
+class CommandInitializationTests(unittest.TestCase):
+    class Interrupted(Exception):
+        pass
+
+    def setUp(self) -> None:
+        self.job = {"mode": "command", "repo": REPO, "pr": 142, "key": f"{REPO}:command:555"}
+        self.values = {}
+        self.interrupt_after_start = False
+        claims = Mock()
+        claims.put.side_effect = self.put
+        claims.get.side_effect = lambda key, default=None: copy.deepcopy(self.values.get(key, default))
+        for patcher in (patch("runner.CLAIMS", claims), patch("runner.log"),
+                        patch("runner.github", side_effect=AssertionError("unexpected GitHub read")),
+                        patch("runner.tempfile.TemporaryDirectory", side_effect=self.Interrupted)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def put(self, key, value, skip_if_exists=False):
+        if skip_if_exists and key in self.values:
+            return False
+        self.values[key] = copy.deepcopy(value)
+        if self.interrupt_after_start and key == "started:" + self.job["key"]:
+            self.interrupt_after_start = False
+            raise self.Interrupted
+        return True
+
+    def deliver(self) -> None:
+        with self.assertRaises(self.Interrupted):
+            PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
+
+    def test_preemption_after_start_claim_allows_command_preparation_on_redelivery(self) -> None:
+        self.interrupt_after_start = True
+        self.deliver()
+        self.assertNotIn("command:" + self.job["key"], self.values)
+        self.deliver()
+        self.assertIsNone(command_publication(self.job))
+
+    def test_legacy_start_without_execution_record_stays_reporting_only(self) -> None:
+        self.values["started:" + self.job["key"]] = "started"
+        self.deliver()
+        self.assertEqual(command_publication(self.job)["status"], "uncertain")
+        self.assertNotIn("command:" + self.job["key"], self.values)
+
+    def test_redelivery_preserves_existing_execution_records(self) -> None:
+        self.interrupt_after_start = True
+        self.deliver()
+        for state in ("preparing", "executing", "completed"):
+            with self.subTest(state=state):
+                record = {"state": state, "starting_head": "a" * 40, "branch": "feature/command"}
+                self.values["command:" + self.job["key"]] = record
+                self.deliver()
+                self.assertEqual(self.values["command:" + self.job["key"]], record)
+                result = command_publication(self.job)
+                if state == "preparing":
+                    self.assertIsNone(result)
+                else:
+                    self.assertEqual(result["status"], "uncertain")
 
 
 class DocsMergeTests(unittest.TestCase):
