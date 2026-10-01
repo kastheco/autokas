@@ -90,6 +90,8 @@ covers intake and identity boundaries, review state and prompt selection, instal
 
 ## stop it
 
+add `autokas:ignore` or `@autokas ignore` anywhere in a PR body to skip automatic finding fixes, clean-review acknowledgments and docs-update jobs when it merges. markers are case-insensitive. explicit `@autokas <instruction>` comments from users with write access still run.
+
 deactivate the App webhook to stop new intake everywhere and let running work finish, or uninstall the App from one repo to stop that repo's deliveries. neither cancels calls already queued. cancel an active job with Modal's native call cancellation, then reconcile the PR before doing anything else.
 
 ## repository map

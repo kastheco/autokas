@@ -136,6 +136,49 @@ class ReviewIntakeTests(unittest.TestCase):
                     pr["head"]["ref"] = CONFIG["docs_update"]["branch_prefix"] + "142-abc"
                     self.assertIsNone(event_job(kind, event))
 
+    def test_ignore_marker_blocks_automatic_work_but_not_commands(self) -> None:
+        for kind in ("pull_request_review", "pull_request_review_comment", "issue_comment"):
+            event = review_event()
+            pr = event["pull_request"]
+            pr["body"] = "ordinary PR"
+            pr["head"] = {"ref": "fix/ordinary"}
+            if kind != "pull_request_review":
+                event["action"] = "created"
+                event["comment"] = event.pop("review")
+            if kind == "issue_comment":
+                event["issue"] = event.pop("pull_request")
+                pr.pop("head")
+                pr["pull_request"] = {"url": PR_URL}
+                event["comment"]["issue_url"] = PR_URL.replace("/pulls/", "/issues/")
+            with self.subTest(kind=kind):
+                self.assertIsNotNone(event_job(kind, event))
+                pr["body"] = "wip\n@autokas ignore"
+                self.assertIsNone(event_job(kind, event))
+                pr["body"] = "<!-- autokas:ignore -->"
+                self.assertIsNone(event_job(kind, event))
+
+        payload = {
+            "action": "created", "repository": {"full_name": REPO},
+            "issue": {"number": 142, "pull_request": {"url": PR_URL}, "body": "autokas:ignore"},
+            "comment": {"id": 555, "body": "@autokas fix the typo",
+                        "user": {"login": "kas", "type": "User"},
+                        "html_url": "https://github.com/example-org/example-app/pull/142#issuecomment-555"},
+        }
+        job = event_job("issue_comment", payload)
+        self.assertIsNotNone(job)
+        assert job is not None
+        self.assertEqual(job["mode"], "command")
+
+        with patch.dict(CONFIG["docs_update"]["repositories"], {REPO: {"branch": "main", "folders": ["docs"]}}):
+            event = {"action": "closed", "repository": {"full_name": REPO}, "pull_request": {
+                "number": 142, "merged": True, "merge_commit_sha": "a" * 40,
+                "base": {"ref": "main", "repo": {"full_name": REPO}},
+                "head": {"ref": "fix/ordinary", "repo": {"full_name": REPO}},
+            }}
+            self.assertIsNotNone(event_job("pull_request", event))
+            event["pull_request"]["body"] = "autokas:ignore"
+            self.assertIsNone(event_job("pull_request", event))
+
     def test_generated_docs_merge_does_not_schedule_another_update(self) -> None:
         repositories = {REPO: {"branch": "main", "folders": ["docs"]}}
         with patch.dict(CONFIG["docs_update"]["repositories"], repositories):
