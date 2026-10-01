@@ -1026,11 +1026,10 @@ class PRWorker:
     @modal.method()
     def run(self, job: dict[str, Any]) -> None:
         """Prepare one fresh worktree and let omp perform the entire fix workflow."""
-        # Modal infrastructure can redeliver interrupted inputs even with retries=0.
-        # Keep the claim after failure: no uncertain publication is automatically replayed.
+        # With retries=0, Modal only redelivers an input after preempting its container.
+        # Rerun it: the checks below still stop if the PR or its findings changed.
         if not CLAIMS.put("started:" + job["key"], "started", skip_if_exists=True):
-            log("execution_uncertain_no_replay", key=job["key"])
-            return
+            log("preempted_retry", repo=job["repo"], pr=job["pr"], key=job["key"])
         deadline = time.monotonic() + CONFIG["timeout_seconds"] - 30
         execution = CONFIG["docs_update"] if job.get("mode") == "docs_update" else CONFIG
         log("started", repo=job["repo"], pr=job["pr"], comment=job.get("comment"),
