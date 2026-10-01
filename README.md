@@ -33,7 +33,7 @@ a repo can be paired with an advisor: an external service omp consults before it
 
 the advisor is paired to one repository owner through `jarvis_owner` in the config. other owners get technical fixes with no advisor, and business-logic changes there are reported instead of made. the full policy is in [docs/operations.md](docs/operations.md).
 
-autokas also opens follow-up docs PRs after merges, limited to each repo's configured documentation folders.
+autokas also opens follow-up docs PRs after merges. docs jobs targeting the same repo/base branch wait in the existing Modal worker pool, while reviews keep per-PR concurrency. publication refreshes the base and reconciles stale docs and declared postprocess outputs before an exact-head merge. explicit write-authorized commands can still repair generated docs PRs. see [operations](docs/operations.md) for the bounded recovery and verification limits.
 
 ## where it runs
 

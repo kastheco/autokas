@@ -119,13 +119,13 @@ class QueueAcknowledgmentTests(unittest.TestCase):
         self.assertEqual(self.claims, set())
 
     def test_docs_job_skips_coderabbit_queue_comments(self):
-        docs = {"repo": REPO, "pr": 42, "kind": "pull_request", "key": "docs-42"}
+        docs = {"repo": REPO, "pr": 42, "kind": "pull_request", "key": "docs-42",
+                "mode": "docs_update", "base_branch": "Main"}
         with patch.object(runner, "PRWorker") as cls, patch.object(runner, "github") as github:
             cls.return_value.run.spawn.return_value = Mock(object_id="call-docs")
             runner.worker.local(docs)
             github.assert_not_called()
             self.assertEqual(self.claims, set())
-
 
     def test_command_runs_only_for_write_access(self):
         command = {**job("issue_comment"), "mode": "command", "author": "someone", "key": f"{REPO}:command:123"}
