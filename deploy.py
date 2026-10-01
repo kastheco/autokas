@@ -1,4 +1,4 @@
-"""Serialize deployments in Actions and persist the intake pause across failures."""
+"""Serialize deployments in Actions and reconcile every installed repository afterwards."""
 from __future__ import annotations
 
 import json
@@ -47,30 +47,9 @@ def save(state: dict[str, Any]) -> None:
     runner.CLAIMS.put(STATE_KEY, state)
 
 
-def discover() -> dict[str, Any]:
-    hooks = []
-    for repo in pages('user/repos?affiliation=owner,collaborator,organization_member'):
-        if not repo.get('permissions', {}).get('admin'):
-            continue
-        name = repo['full_name']
-        for hook in pages(f'repos/{name}/hooks'):
-            if hook.get('active') and hook.get('config', {}).get('url') == URL:
-                hooks.append({'repo': name, 'id': hook['id']})
-    if not hooks:
-        raise RuntimeError('No active runner hooks found; refusing an unpaused deployment')
-    return {'started': (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat(),
-            'hooks': hooks, 'restored': False, 'reconciled': [], 'revision': runner.REVISION}
-
-
-def set_hook(hook: dict[str, Any], active: bool) -> None:
-    path = f"repos/{hook['repo']}/hooks/{hook['id']}"
-    current = github(path)
-    if current.get('config', {}).get('url') != URL:
-        raise RuntimeError(f'Hook target changed: {path}')
-    if current['active'] != active:
-        github(path, 'PATCH', {'active': active})
-    if github(path)['active'] != active:
-        raise RuntimeError(f'Hook state not confirmed: {path}')
+def installed_repos() -> list[str]:
+    """The App installations are the delivery list, so they are the reconcile list."""
+    return modal.Function.from_name(APP, 'installed_repos').remote()
 
 
 def drain() -> None:
@@ -89,7 +68,7 @@ def drain() -> None:
     raise TimeoutError('Workers did not drain; deployment was not started')
 
 
-def verify(state: dict[str, Any]) -> None:
+def verify() -> None:
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         try:
@@ -102,22 +81,13 @@ def verify(state: dict[str, Any]) -> None:
         time.sleep(5)
     else:
         raise RuntimeError('Receiver did not reject unsigned requests with 401')
-    hook = state['hooks'][0]
-    path = f"repos/{hook['repo']}/hooks/{hook['id']}"
-    before = {d['id'] for d in github(path + '/deliveries?per_page=100')}
-    github(path + '/pings', 'POST')
-    deadline = time.monotonic() + 180
-    while time.monotonic() < deadline:
-        for delivery in github(path + '/deliveries?per_page=100'):
-            if delivery['id'] not in before and delivery['event'] == 'ping' and delivery['status_code'] == 200:
-                receipt = github(path + f"/deliveries/{delivery['id']}")
-                body = json.loads(receipt['response']['payload'])
-                if body.get('revision') != runner.REVISION:
-                    raise RuntimeError('Signed ping returned the wrong deployed revision')
-                print(f"signed GitHub ping verified: {delivery['id']}", flush=True)
-                return
-        time.sleep(5)
-    raise RuntimeError('Signed GitHub ping did not return 200')
+    # The App key stays in Modal, so the signed replay runs there too.
+    receipt = modal.Function.from_name(APP, 'redeliver_latest').remote()
+    if receipt['status_code'] not in {200, 202}:
+        raise RuntimeError(f"Signed App delivery returned {receipt['status_code']}")
+    if json.loads(receipt['body']).get('revision') != runner.REVISION:
+        raise RuntimeError('Signed App delivery returned the wrong deployed revision')
+    print(f"signed App delivery verified: {receipt['id']}", flush=True)
 
 
 def reconcile_repo(repo: str, since: str) -> None:
@@ -155,19 +125,8 @@ def reconcile_repo(repo: str, since: str) -> None:
                                 'action': 'submitted' if key == 'review' else 'created'})
 
 
-def restore_and_reconcile(state: dict[str, Any]) -> None:
-    errors = []
-    for hook in state['hooks']:
-        try:
-            set_hook(hook, True)
-        except Exception as error:
-            errors.append(error)
-    if errors:
-        raise RuntimeError(f'{len(errors)} hooks could not be restored') from errors[0]
-    state['restored'] = True
-    save(state)
-    print(f"all {len(state['hooks'])} hooks restored", flush=True)
-    for repo in sorted({h['repo'] for h in state['hooks']}):
+def reconcile_all(state: dict[str, Any]) -> None:
+    for repo in installed_repos():
         if repo not in state['reconciled']:
             reconcile_repo(repo, state['started'])
             state['reconciled'].append(repo)
@@ -179,25 +138,24 @@ def restore_and_reconcile(state: dict[str, Any]) -> None:
 
 def main() -> None:
     previous = runner.CLAIMS.get(STATE_KEY, None)
+    unfinished = previous if previous and not previous.get('complete') else None
     if os.environ.get('DEPLOY_CLEANUP') == '1':
-        if previous and not previous.get('complete'):
-            restore_and_reconcile(previous)
+        if unfinished:
+            reconcile_all(unfinished)
         return
-    if previous and not previous.get('complete'):
-        restore_and_reconcile(previous)
-    state = discover()
-    # Persist the complete restoration list BEFORE the first external mutation.
+    # An unfinished earlier reconcile is folded into this one by keeping its start.
+    started = unfinished['started'] if unfinished else (
+        datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    state = {'started': started, 'reconciled': [], 'revision': runner.REVISION}
+    # Persist the reconcile window BEFORE the cutover can lose deliveries.
     save(state)
     try:
-        for hook in state['hooks']:
-            set_hook(hook, False)
-        print(f"paused {len(state['hooks'])} hooks", flush=True)
         drain()
         subprocess.run(['modal', 'deploy', '--strategy', 'recreate', 'runner.py'], check=True)
-        verify(state)
+        verify()
         print(f'deployed revision: {runner.REVISION}', flush=True)
     finally:
-        restore_and_reconcile(state)
+        reconcile_all(state)
 
 
 if __name__ == '__main__':

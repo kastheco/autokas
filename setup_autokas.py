@@ -71,7 +71,7 @@ def main() -> None:
         "description": "authenticated GitHub identity for omp-runner",
         "public": False,
         "default_permissions": PERMISSIONS,
-        "default_events": [],
+        "default_events": ["issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment"],
     }
     encoded = urllib.parse.quote(json.dumps(manifest, separators=(",", ":")), safe="")
     threading.Thread(target=server.serve_forever, daemon=True).start()

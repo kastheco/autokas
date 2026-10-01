@@ -45,7 +45,7 @@ jobs:
               sys.exit("AUTOKAS_CONFIG_JSON is missing, invalid, or still the example config")
           PY
           echo ready=true >> "$GITHUB_OUTPUT"
-      - name: pause, drain, deploy and reconcile
+      - name: drain, deploy and reconcile
         env:
           GH_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
@@ -58,7 +58,7 @@ jobs:
           python -u deploy.py > "$RUNNER_TEMP/deploy.log" 2>&1 || status=$?
           echo "deploy exit status: $status"
           exit $status
-      - name: restore intake after failure or cancellation
+      - name: reconcile after failure or cancellation
         if: always() && steps.private_config.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
@@ -69,6 +69,6 @@ jobs:
         run: |
           umask 077
           status=0
-          python -u deploy.py > "$RUNNER_TEMP/restore.log" 2>&1 || status=$?
-          echo "restore exit status: $status"
+          python -u deploy.py > "$RUNNER_TEMP/reconcile.log" 2>&1 || status=$?
+          echo "reconcile exit status: $status"
           exit $status

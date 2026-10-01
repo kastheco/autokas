@@ -36,29 +36,42 @@ WORKER_SECRET = modal.Secret.from_name(
 
 _github_tokens: dict[str, tuple[str, float]] = {}
 
+def app_api(path: str, bearer: str, method: str = "GET") -> Any:
+    """Call a GitHub App or installation endpoint with an explicit bearer."""
+    request = urllib.request.Request(
+        f"https://api.github.com/{path}", method=method,
+        headers={"Authorization": f"Bearer {bearer}", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        raw = response.read()
+        return json.loads(raw) if raw else {}
+
+
+def app_jwt() -> str:
+    import jwt
+    now = int(time.time())
+    app_id = os.environ[CONFIG["github_app"]["app_id_env"]]
+    private_key = os.environ[CONFIG["github_app"]["private_key_env"]].replace("\\n", "\n")
+    return jwt.encode({"iat": now - 60, "exp": now + 540, "iss": app_id}, private_key, algorithm="RS256")
+
+
+def installation_token(installation_id: int, assertion: str) -> str:
+    return app_api(f"app/installations/{installation_id}/access_tokens", assertion, "POST")["token"]
+
+
 def github_token(repo: str) -> str:
     """Mint a token from this repository's installation, never another owner's."""
-    import jwt
     repo = repo.lower()
     now = time.time()
     cached = _github_tokens.get(repo)
     if cached and cached[1] > now + 60:
         return cached[0]
-    app_id = os.environ[CONFIG["github_app"]["app_id_env"]]
-    private_key = os.environ[CONFIG["github_app"]["private_key_env"]].replace("\\n", "\n")
-    assertion = jwt.encode({"iat": int(now) - 60, "exp": int(now) + 540, "iss": app_id}, private_key, algorithm="RS256")
-    headers = {"Authorization": f"Bearer {assertion}", "Accept": "application/vnd.github+json"}
-    request = urllib.request.Request(f"https://api.github.com/repos/{repo}/installation", headers=headers)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        installation_id = json.load(response)["id"]
-    request = urllib.request.Request(
-        f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-        headers=headers, method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        data = json.load(response)
-    _github_tokens[repo] = (data["token"], now + 3600)
-    return data["token"]
+    assertion = app_jwt()
+    token = installation_token(app_api(f"repos/{repo}/installation", assertion)["id"], assertion)
+    _github_tokens[repo] = (token, now + 3600)
+    return token
+
+
 BASE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi==0.135.1")
 IMAGE = (
     modal.Image.from_registry("node:22.22.0-bookworm-slim", add_python="3.12")
@@ -515,14 +528,59 @@ async def webhook(request: Request) -> JSONResponse:
     if job is None:
         return JSONResponse({"status": "ignored", "revision": REVISION})
     if not await CLAIMS.put.aio(job["key"], "claimed", skip_if_exists=True):
-        return JSONResponse({"status": "duplicate"})
+        return JSONResponse({"status": "duplicate", "revision": REVISION})
     try:
         call = await worker.spawn.aio(job)
     except Exception:
         log("dispatch_uncertain", key=job["key"])
         raise HTTPException(503, "dispatch uncertain; inspect Modal logs, do not replay") from None
     log("dispatched", key=job["key"], call_id=call.object_id)
-    return JSONResponse({"status": "accepted", "call_id": call.object_id}, status_code=202)
+    return JSONResponse({"status": "accepted", "call_id": call.object_id, "revision": REVISION},
+                        status_code=202)
+
+
+def app_pages(path: str, bearer: str, key: str | None = None) -> list[dict[str, Any]]:
+    items = []
+    for page in range(1, 1000):
+        batch = app_api(f"{path}?per_page=100&page={page}", bearer)
+        batch = batch[key] if key else batch
+        items.extend(batch)
+        if len(batch) < 100:
+            return items
+    raise RuntimeError("GitHub pagination exceeded limit")
+
+
+@app.function(image=IMAGE, secrets=[WORKER_SECRET], timeout=300)
+def installed_repos() -> list[str]:
+    """List every repository the App webhook delivers events for."""
+    assertion = app_jwt()
+    repos = []
+    for installation in app_pages("app/installations", assertion):
+        if installation.get("suspended_at"):
+            continue
+        token = installation_token(installation["id"], assertion)
+        repos += [repo["full_name"] for repo in app_pages("installation/repositories", token, "repositories")]
+    return sorted(repos)
+
+
+@app.function(image=IMAGE, secrets=[WORKER_SECRET], timeout=300)
+def redeliver_latest() -> dict[str, Any]:
+    """Replay the newest signed App delivery and return the receiver's answer."""
+    assertion = app_jwt()
+    recent = app_api("app/hook/deliveries?per_page=100", assertion)
+    if not recent:
+        raise RuntimeError("no App webhook deliveries in GitHub's retention window to replay")
+    seen = {delivery["id"] for delivery in recent}
+    app_api(f"app/hook/deliveries/{recent[0]['id']}/attempts", assertion, "POST")
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        for delivery in app_api("app/hook/deliveries?per_page=100", assertion):
+            if delivery["id"] not in seen and delivery["guid"] == recent[0]["guid"]:
+                receipt = app_api(f"app/hook/deliveries/{delivery['id']}", assertion)
+                return {"id": delivery["id"], "status_code": delivery["status_code"],
+                        "body": receipt.get("response", {}).get("payload") or ""}
+    raise RuntimeError("redelivered App delivery was not recorded")
 
 
 def github_request(method: str, path: str, payload: Any = None) -> Any:

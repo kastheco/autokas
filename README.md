@@ -39,9 +39,9 @@ autokas also opens follow-up docs PRs after merges, limited to each repo's confi
 
 autokas is a GitHub App owned by `kastheco`. the repositories it's installed on are the only boundary, and the runner keeps no second allowlist. mint-per-repo installation tokens keep one owner's credentials away from another's.
 
-the installed set is managed in the App's GitHub installation settings.
+the installed set is managed in the App's GitHub installation settings. events arrive through one App-level webhook pointed at the receiver and subscribed to `issue_comment`, `pull_request`, `pull_request_review` and `pull_request_review_comment`, so installing the App on a repo is all it takes to start delivery. no per-repo hooks are needed.
 
-the Modal app is `omp-runner`. the repo was renamed to `autokas` on GitHub, but app, function and package names stay as they are so live hooks and secrets keep working. models come from the Railway CLIProxyAPI service (its URL is `omp_models` in your config) through omp's native `models.yml`.
+the Modal app is `omp-runner`. the repo was renamed to `autokas` on GitHub, but app, function and package names stay as they are so the App webhook and secrets keep working. models come from the Railway CLIProxyAPI service (its URL is `omp_models` in your config) through omp's native `models.yml`.
 
 ## set up
 
@@ -67,7 +67,7 @@ cp config.example.json config.json
 | `omp-runner-webhook` | `GITHUB_WEBHOOK_SECRET` | receiver only |
 | `omp-runner-worker` | `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `CLI_PROXY_API_KEY`, `JARVIS_RUNNER_TOKEN` | worker only |
 
-`./setup_autokas.py` creates the GitHub App, finds its `kastheco` installation and can write the worker secret and deploy. it asks before each of those steps.
+`./setup_autokas.py` creates the GitHub App with its webhook inactive, finds its `kastheco` installation and can write the worker secret and deploy. it asks before each of those steps. set the App webhook secret to the value in `omp-runner-webhook`, then activate the webhook in the App settings.
 
 model logins live in the Railway proxy volume, not Modal. export `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID` and `RAILWAY_SERVICE_ID` first, the scripts refuse to run without them:
 
@@ -78,7 +78,7 @@ npm run login:claude
 
 ## deploy
 
-pushes to `main` run `.github/workflows/deploy.yml`, which runs the tests against `config.example.json`, materializes your real config from the `AUTOKAS_CONFIG_JSON` Actions secret, and then runs `deploy.py`. its output is written to private runner files, so public logs show only exit statuses. it pauses the repo hooks, drains running work, redeploys with `modal deploy --strategy recreate runner.py`, checks that an unsigned request returns `401` and a signed ping returns `200` with the expected source revision, then restores the hooks and replays anything missed. rollback is a revert on `main`.
+pushes to `main` run `.github/workflows/deploy.yml`, which runs the tests against `config.example.json`, materializes your real config from the `AUTOKAS_CONFIG_JSON` Actions secret, and then runs `deploy.py`. its output is written to private runner files, so public logs show only exit statuses. it saves the reconcile window, drains running work, redeploys with `modal deploy --strategy recreate runner.py`, checks that an unsigned request returns `401` and that a redelivered App event returns `200` or `202` with the expected source revision, then replays anything missed on every installed repo. App webhooks can't be paused through the API, so deliveries that land during the cutover are recovered by that replay. rollback is a revert on `main`.
 
 ## test
 
@@ -90,7 +90,7 @@ covers intake and identity boundaries, review state and prompt selection, instal
 
 ## stop it
 
-disable a repo's webhook to stop new intake and let running work finish. uninstalling the App from a repo also stops new deliveries but doesn't cancel calls already queued. cancel an active job with Modal's native call cancellation, then reconcile the PR before doing anything else.
+deactivate the App webhook to stop new intake everywhere and let running work finish, or uninstall the App from one repo to stop that repo's deliveries. neither cancels calls already queued. cancel an active job with Modal's native call cancellation, then reconcile the PR before doing anything else.
 
 ## repository map
 
@@ -98,7 +98,7 @@ disable a repo's webhook to stop new intake and let running work finish. uninsta
 runner.py             webhook receiver, dispatcher, PR worker and docs worker
 config.example.json   example models, tools, profiles, timeouts and git identity
 consult.py            bounded client for advisor consultations
-deploy.py             hook pause, drain, deploy, verify, restore and replay
+deploy.py             drain, deploy, verify and reconcile
 setup_autokas.py      one-time GitHub App and Modal setup wizard
 kas-voice-profile.md  voice rules appended to every job's system policy
 skills/               bundled skills, with pinned sources and licenses
