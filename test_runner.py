@@ -1,6 +1,7 @@
 """Behavior regressions for CodeRabbit review and comment intake."""
 
 import copy
+import hashlib
 import json
 import os
 import subprocess
@@ -10,9 +11,9 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.error import HTTPError
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from runner import CONFIG, agent_prompt, docs_worker, event_job
+from runner import CONFIG, agent_prompt, command_publication, docs_worker, event_job
 
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
@@ -198,6 +199,101 @@ class ReviewIntakeTests(unittest.TestCase):
         self.assertIsNone(event_job("pull_request", event))
 
 
+
+
+class CommandPublicationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.job = {"repo": REPO, "pr": 142, "target": "pr", "key": f"{REPO}:command:555"}
+        self.record = {"state": "executing", "starting_head": "a" * 40, "branch": "feature/command"}
+        self.head = "b" * 40
+        self.trailer = "Autokas-Command: " + hashlib.sha256(self.job["key"].encode()).hexdigest()
+        self.pr = {"head": {"sha": self.head, "ref": self.record["branch"], "repo": {"full_name": REPO}}}
+        self.pages = [[self.commit(self.head, "fix: apply command\n\n" + self.trailer)]]
+        self.claims = Mock()
+        self.claims.get.side_effect = lambda key, default=None: self.record if key == "command:" + self.job["key"] else default
+        for patcher in (patch("runner.CLAIMS", self.claims), patch("runner.github", side_effect=self.read_github)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def commit(self, sha: str, message: str, login: str | None = None) -> dict:
+        return {"sha": sha, "committer": {"login": login or CONFIG["git_author"]["name"]},
+                "commit": {"message": message}}
+
+    def read_github(self, path: str):
+        if path == f"repos/{REPO}/pulls/142":
+            return self.pr
+        if path == f"repos/{REPO}/git/ref/heads/autokas/issue-142":
+            return {"object": {"sha": self.head}}
+        prefix = f"repos/{REPO}/commits?sha={self.pr['head']['sha']}&per_page=100&page="
+        if path.startswith(prefix):
+            return self.pages[int(path.removeprefix(prefix)) - 1]
+        raise AssertionError(path)
+
+    def test_published_command_is_found_beneath_a_later_unrelated_commit(self) -> None:
+        published = "c" * 40
+        self.pages = [[self.commit(self.head, "chore: unrelated change"),
+                       self.commit(published, "fix: command\n\n" + self.trailer)]]
+        result = command_publication(self.job)
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(result["commit"], published)
+
+    def test_unrelated_changed_or_unchanged_heads_do_not_authorize_replay(self) -> None:
+        for sha in (self.head, self.record["starting_head"]):
+            with self.subTest(head=sha):
+                self.pr["head"]["sha"] = sha
+                self.pages = [[self.commit(sha, "chore: unrelated change")]]
+                self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_receipts_require_this_command_and_the_bot_identity(self) -> None:
+        other = "Autokas-Command: " + hashlib.sha256((self.job["key"] + "other").encode()).hexdigest()
+        for message, login in ((other, CONFIG["git_author"]["name"]), (self.trailer, "someone-else")):
+            with self.subTest(message=message, login=login):
+                self.pages = [[self.commit(self.head, "fix: change\n\n" + message, login)]]
+                self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_recorded_publication_must_still_be_reachable(self) -> None:
+        self.record["published_head"] = self.head
+        self.pages = [[self.commit(self.head, "fix: command without a trailer")]]
+        self.assertEqual(command_publication(self.job)["status"], "published")
+        self.pages = [[self.commit("c" * 40, "chore: different history")]]
+        self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_published_issue_command_uses_its_deterministic_branch(self) -> None:
+        self.job["target"] = "issue"
+        self.record["branch"] = "autokas/issue-142"
+        self.assertEqual(command_publication(self.job)["status"], "published")
+
+    def test_changed_branch_or_repository_leaves_publication_uncertain(self) -> None:
+        for field, value in (("ref", "different-branch"), ("repo", {"full_name": "someone/fork"})):
+            with self.subTest(field=field):
+                original = self.pr["head"][field]
+                self.pr["head"][field] = value
+                self.assertEqual(command_publication(self.job)["status"], "uncertain")
+                self.pr["head"][field] = original
+
+    def test_pre_launch_preemption_can_retry_but_missing_records_cannot(self) -> None:
+        self.record = {"state": "preparing"}
+        self.assertIsNone(command_publication(self.job))
+        self.record = None
+        self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_successful_no_change_command_is_not_executed_again(self) -> None:
+        self.record["state"] = "completed"
+        self.pr["head"]["sha"] = self.record["starting_head"]
+        self.pages = [[self.commit(self.record["starting_head"], "base")]]
+        self.assertEqual(command_publication(self.job)["status"], "completed")
+
+    def test_pagination_finds_the_receipt_but_stops_at_the_starting_head(self) -> None:
+        self.pages = [[self.commit(f"{index:040x}", "chore: unrelated") for index in range(100)], self.pages[0]]
+        self.assertEqual(command_publication(self.job)["status"], "published")
+        self.pages[0][0] = self.commit(self.record["starting_head"], "base")
+        self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_lookup_failure_never_falls_back_to_execution(self) -> None:
+        with patch("runner.github", side_effect=TimeoutError("lost read response")):
+            result = command_publication(self.job)
+        self.assertEqual(result["status"], "uncertain")
+        self.assertIn("TimeoutError", result["reason"])
 
 
 class DocsMergeTests(unittest.TestCase):

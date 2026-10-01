@@ -170,6 +170,12 @@ deactivate the `autokas` App webhook to stop new intake everywhere, then allow e
 
 Modal Dict atomically claims each incoming repository/comment/prompt fingerprint, each canonical review before routing, and each execution before starting. identical deliveries and metadata-only edits are suppressed. aggregate and inline events share the review routing claim. changed finding prompts produce a new review fingerprint. each `@autokas` command comment has its own key, so an explicitly authorized follow-up is a new comment, not an edited one. reconcile the previous outcome before issuing another command. entries expire after seven days without activity, so this is bounded duplicate protection rather than permanent exactly-once semantics. claims remain after failed or uncertain dispatch and publication, and must not be deleted to trigger a blind retry.
 
+command retries use a separate `command:<job key>` record. a `preparing` record means omp hasn't launched and preparation can run again. immediately before launch, the runner records the starting head and publication branch, so a later interruption can't silently execute the same command twice.
+
+command commits carry `Autokas-Command: <sha256 of job key>` as a Git trailer. a retry checks up to 1,000 reachable commits on the original publication branch for that exact trailer from the configured bot, or for a commit whose publication the runner already confirmed. a changed PR head or queued acknowledgment alone isn't publication evidence. issue commands use `autokas/issue-<number>` for this check.
+
+confirmed publications and confirmed no-change completions resume reporting only, without checking out code or executing the command again. an uncertain publication also starts a reporting-only run that explains the missing evidence. missing legacy execution records, changed branches, unavailable GitHub reads and missing commit receipts never authorize command replay. review and docs reconciliation remain separate.
+
 references: [Modal deployment](https://modal.com/docs/guide/apps), [secrets](https://modal.com/docs/sdk/py/latest/Secret), [Dict](https://modal.com/docs/sdk/py/latest/Dict), [GitHub fine-grained tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
 
 ### autokas GitHub App setup
