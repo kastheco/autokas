@@ -25,6 +25,20 @@ the runner dispatches the job, not the agent's working process. omp owns investi
 5. omp fixes what's still valid, commits as `autokas[bot]` in Conventional Commits form, pushes, updates its queued status comments and posts one outcome comment.
 6. the container exits.
 
+## @autokas commands
+
+you don't have to wait for CodeRabbit. start a GitHub comment with `@autokas` and an instruction, and autokas runs it as its own job.
+
+- **on a PR**, in the conversation or on a review thread, it works on that PR's head branch and pushes there.
+- **on an issue**, it branches from the default branch as `autokas/issue-<number>`, does the work and opens one PR containing `Closes #<number>`.
+- only users with `write` or `admin` access on the repo can trigger it. other people's comments are ignored.
+- each comment runs once. editing a comment doesn't rerun it, so post a new comment for a follow-up.
+- commands still run on PRs marked `autokas:ignore` and on generated docs PRs.
+
+```text
+@autokas the date filter drops the last day of the range, fix it and add a test
+```
+
 ## advisors
 
 a repo can be paired with an advisor: an external service omp consults before it changes core business rules or intended behavior. the advisor answers business-intent questions only. it isn't a technical, safety or security gatekeeper, and omp still judges those against the code.
