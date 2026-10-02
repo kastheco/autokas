@@ -13,7 +13,7 @@
     "id": 136622811
   },
   "timeout_seconds": 3600,
-  "omp_version": "18.3.2",
+  "omp_version": "18.4.10",
   "bun_version": "1.4.2",
   "model": "railway-codex/gpt-6.1-sol",
   "thinking": "high",
