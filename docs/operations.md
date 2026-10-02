@@ -89,6 +89,8 @@ provider OAuth credentials stay in the existing Railway proxy volume, not Modal.
 
 ## deploy and update
 
+repository Actions must be enabled and all four deployment secrets below must be configured. disabling Actions or removing those secrets prevents automatic deployment, even when a PR merges successfully. local deployment is a recovery path, not the normal release path.
+
 pushes to `main` run `.github/workflows/deploy.yml`. a manual dispatch on `main` uses the same serialized workflow. it runs the tests, then `deploy.py` performs the complete cutover:
 
 1. persist the reconcile window (its start, the source revision and reconciled repositories) before anything else.
