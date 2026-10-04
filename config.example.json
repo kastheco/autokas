@@ -12,6 +12,10 @@
     "login": "coderabbitai[bot]",
     "id": 136622811
   },
+  "bugbot": {
+    "login": "cursor[bot]",
+    "id": 206951365
+  },
   "timeout_seconds": 3600,
   "omp_version": "18.4.10",
   "bun_version": "1.4.2",
