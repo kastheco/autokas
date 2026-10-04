@@ -1,0 +1,9 @@
+version: 1
+
+triggers:
+  # Review every opened pull request, then again whenever it is updated.
+  frequency: everyPush
+
+review:
+  # Updates re-review only the changes since the previous Bugbot review.
+  incremental: true
