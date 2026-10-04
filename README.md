@@ -25,6 +25,8 @@ the runner dispatches the job, not the agent's working process. omp owns investi
 5. omp fixes what's still valid, commits as `autokas[bot]` in Conventional Commits form, pushes, updates its queued status comments and posts one outcome comment.
 6. the container exits.
 
+Bugbot review summaries and issue comments don't start finding jobs, even when they contain marked finding text. a Bugbot review batch uses only its collected inline findings as the agent prompt. CodeRabbit keeps its review-prompt-first behavior, falling back to joined inline prompts when the review has none.
+
 ## @autokas commands
 
 you don't have to wait for CodeRabbit. start a GitHub comment with `@autokas` and an instruction, and autokas runs it as its own job.

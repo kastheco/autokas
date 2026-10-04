@@ -94,6 +94,7 @@ class ReviewDispatchTests(unittest.TestCase):
                 jobs = self.run_events(fake, deliveries)
                 self.assertEqual(len(jobs), 1)
                 self.assertEqual({t["comment"] for t in jobs[0]["targets"]}, {123, 124})
+                self.assertEqual(jobs[0]["prompt"], runner.agent_prompt(REVIEW["body"]))
                 self.assertEqual({c["in_reply_to_id"] for c in fake.comments}, {123, 124})
                 self.assertEqual(len(fake.comments), 2)
                 self.assertEqual({t["acknowledgment"]["id"] for t in jobs[0]["targets"]}, {901, 902})

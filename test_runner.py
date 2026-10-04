@@ -90,6 +90,21 @@ class BugbotIntakeTests(unittest.TestCase):
         event["review"]["body"] = "<!-- BUGBOT_REVIEW -->\nCursor Bugbot has reviewed your changes and found 1 potential issue."
         self.assertIsNone(event_job("pull_request_review", event))
 
+    def test_marked_findings_in_review_summaries_and_issue_comments_do_not_start_work(self) -> None:
+        summary = review_event()
+        summary["sender"] = dict(BUGBOT)
+        summary["review"]["user"] = dict(BUGBOT)
+        summary["review"]["body"] = "<!-- BUGBOT_REVIEW -->\n" + BUGBOT_BODY
+        issue = bugbot_comment_event()
+        issue["issue"] = {"number": 142, "pull_request": {"url": PR_URL}}
+        issue["comment"]["issue_url"] = f"https://api.github.com/repos/{REPO}/issues/142"
+        for kind, event, actions in (("pull_request_review", summary, ("submitted", "edited")),
+                                     ("issue_comment", issue, ("created", "edited"))):
+            for action in actions:
+                event["action"] = action
+                with self.subTest(kind=kind, action=action):
+                    self.assertIsNone(event_job(kind, event))
+
     def test_bugbot_identity_is_exact_and_not_interchangeable(self) -> None:
         for sender, author in ((BUGBOT, BOT), (BOT, BUGBOT), ({**BUGBOT, "id": 1}, BUGBOT)):
             event = bugbot_comment_event()
@@ -129,6 +144,28 @@ class BugbotIntakeTests(unittest.TestCase):
         assert canonical is not None
         self.assertEqual(canonical["reviewer"], "bugbot")
         self.assertEqual([target["comment"] for target in canonical["targets"]], [9000000002])
+
+    def test_parent_marked_finding_cannot_replace_collected_inline_prompts(self) -> None:
+        event = bugbot_comment_event()
+        first = {**event["comment"], "pull_request_review_id": 77,
+                 "html_url": "https://github.com/x#discussion_r1"}
+        second = {**first, "id": first["id"] + 1,
+                  "body": BUGBOT_BODY.replace("Feedback split ignores boundaries", "Second inline finding"),
+                  "html_url": "https://github.com/x#discussion_r2"}
+        review = {"user": dict(BUGBOT), "state": "commented", "pull_request_url": PR_URL,
+                  "body": BUGBOT_BODY.replace("Feedback split ignores boundaries", "Parent-only finding"),
+                  "html_url": "https://github.com/x#pullrequestreview-77"}
+        responses = {f"repos/{REPO}/pulls/comments/{first['id']}": first,
+                     f"repos/{REPO}/pulls/142/reviews/77": review,
+                     f"repos/{REPO}/pulls/142/reviews/77/comments?per_page=100&page=1": [second, first]}
+        job = event_job("pull_request_review_comment", event)
+        assert job is not None
+        with patch("runner.github", side_effect=lambda path: responses[path]):
+            canonical = review_job(job, event["pull_request"])
+        self.assertIsNotNone(canonical)
+        assert canonical is not None
+        self.assertEqual(canonical["prompt"], "\n\n".join(bugbot_prompt(c["body"]) for c in (first, second)))
+        self.assertNotIn("Parent-only finding", canonical["prompt"])
 
 
 class ReviewIntakeTests(unittest.TestCase):

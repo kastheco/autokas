@@ -528,6 +528,8 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     reviewer = reviewer_of(payload.get("sender", {}))
     if reviewer is None:
         return None
+    if reviewer == "bugbot" and event != "pull_request_review_comment":
+        return None
     comment = payload.get("review" if event == "pull_request_review" else "comment", {})
     if event == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
         return None
@@ -711,7 +713,8 @@ def review_job(job: dict[str, Any], pr: dict[str, Any]) -> dict[str, Any] | None
         target["comment"] == job["comment"] for target in targets
     ):
         return None
-    prompt = review_prompt or "\n\n".join(target["prompt"] for target in targets)
+    target_prompt = "\n\n".join(target["prompt"] for target in targets)
+    prompt = target_prompt if reviewer == "bugbot" else review_prompt or target_prompt
     if not prompt:
         return None
     fingerprint = hashlib.sha256(json.dumps([
