@@ -264,6 +264,21 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertEqual((state["head"], state["round"]), (HEAD, 2))
         self.assertEqual(state["findings"][0]["header"], "Wrong lookup")
 
+    def test_oversized_review_fits_one_comment_and_keeps_every_finding(self):
+        long = [{**issue, "issue_content": "é" * 40000} for issue in ISSUES]
+        for name, review, issues in (("long review", "## PR Reviewer Guide\n" + "🔍" * 30000, None),
+                                     ("long findings", "## PR Reviewer Guide", long)):
+            with self.subTest(name):
+                self.run_review(self.auto_job(), review=review, issues=issues)
+                body = self.posts[0][2]["body"]
+                self.assertLessEqual(len(body.encode()), runner.GITHUB_COMMENT_LIMIT)
+                state = runner.pr_agent_review_state(body)
+                self.assertEqual([finding["header"] for finding in state["findings"]], ["Wrong lookup", "Naming"])
+                self.assertEqual(len(self.dispatched), 1)
+                if issues is None:
+                    self.assertTrue(body.split("\n\n<sub>")[0].endswith(runner.REVIEW_TRIMMED))
+                    self.assertEqual(state["findings"][0]["content"], ISSUES[0]["issue_content"].strip())
+
     def test_each_fix_round_reviews_the_pushed_head_until_the_cap(self):
         rounds = runner.CONFIG["pr_review"]["max_fix_rounds"]
         body = runner.pr_agent_marker(HEAD, 1, runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}}))

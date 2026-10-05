@@ -568,6 +568,31 @@ def pr_agent_marker(head: str, round_: int, findings: list[dict[str, Any]]) -> s
     return "<!-- autokas:pr-agent " + data.replace("<", "\\u003c").replace(">", "\\u003e") + " -->"
 
 
+GITHUB_COMMENT_LIMIT = 65536
+REVIEW_TRIMMED = "\n\n_review trimmed to fit GitHub's comment limit._"
+
+
+def utf8_cut(text: str, size: int) -> str:
+    return text.encode()[:max(size, 0)].decode(errors="ignore")
+
+
+def pr_agent_comment(review: str, head: str, round_: int, findings: list[dict[str, Any]]) -> str:
+    """Fit the review, its head line and the marker into one comment. the marker keeps every finding; the rendered
+    review is trimmed first, and finding text only when the marker alone would take more than half the limit.
+    sizes are UTF-8 bytes, which never undercounts GitHub's character limit."""
+    marker = pr_agent_marker(head, round_, findings)
+    cap = max((len(finding["content"].encode()) for finding in findings), default=0)
+    while len(marker.encode()) > GITHUB_COMMENT_LIMIT // 2 and cap:
+        cap //= 2
+        marker = pr_agent_marker(head, round_, [{**finding, "content": utf8_cut(finding["content"], cap)}
+                                                for finding in findings])
+    footer = f"\n\n<sub>reviewed head {head}</sub>\n\n{marker}"
+    room = GITHUB_COMMENT_LIMIT - len(footer.encode())
+    if len(review.encode()) > room:
+        review = utf8_cut(review, room - len(REVIEW_TRIMMED.encode())) + REVIEW_TRIMMED
+    return review + footer
+
+
 def pr_agent_review_state(body: str) -> dict[str, Any] | None:
     matches = PR_AGENT_MARKER.findall(body)
     if not matches:
@@ -1339,7 +1364,7 @@ def pr_review(job: dict[str, Any]) -> None:
         return
     round_ = job.get("round", 1)
     comment = github_request("POST", f"repos/{repo}/issues/{number}/comments", {
-        "body": f"{review}\n\n<sub>reviewed head {head}</sub>\n\n{pr_agent_marker(head, round_, findings)}"})
+        "body": pr_agent_comment(review, head, round_, findings)})
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
     # the same job the webhook builds from this comment, so whichever arrives second is a duplicate claim.

@@ -158,7 +158,9 @@ for PR-Agent reviews, after a deploy:
 
 the runner reads the final PR-Agent state marker, so marker-like text in the rendered review can't override the appended state. both direct and webhook fix jobs retain that marker's reviewed head. if the PR head moves while a fix is queued, the coding worker logs `review_outdated` and stops before cloning or launching omp. the next review round still uses the confirmed post-fix head.
 
-`python -m unittest test_pr_review` covers trigger selection, skip rules, the command split, bot-loop safety, routing, access checks, head pinning before and after the review, the checkout's token and `pyproject.toml` handling, the PR-Agent environment, redaction, severity thresholds, untagged findings, the comment marker against hostile finding text, the account check on review comments, the fix job matching its webhook delivery, and the round cap without external calls.
+the review comment stays within GitHub's 65,536-character limit, counted in UTF-8 bytes so it never undercounts. the marker keeps every finding, so an oversized review trims its rendered markdown and says so. finding text in the marker is shortened only when the marker alone would take more than half the limit.
+
+`python -m unittest test_pr_review` covers trigger selection, skip rules, the command split, bot-loop safety, routing, access checks, head pinning before and after the review, the checkout's token and `pyproject.toml` handling, the PR-Agent environment, redaction, severity thresholds, untagged findings, the comment marker against hostile finding text, the comment size limit, the account check on review comments, the fix job matching its webhook delivery, and the round cap without external calls.
 
 docs updates skip merged source PRs whose changed files are all inside the configured documentation folders. an empty file list also skips the agent. code-only and mixed source changes continue to the docs agent, which may edit only those configured folders. `python -m unittest test_runner.DocsMergeTests` covers this routing, including folder-name lookalikes such as `docs-extra/` and `src/docs/` that aren't inside a configured `docs` folder.
 
