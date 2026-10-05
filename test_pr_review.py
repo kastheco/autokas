@@ -225,13 +225,6 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertEqual((fix["reviewer"], fix["kind"], fix["comment"]), ("pr_agent", "issue_comment", 777))
         self.assertIn("[P1] Wrong lookup (parser.py, lines 7-9)\ndrops the last day", fix["prompt"])
         self.assertNotIn("Naming", fix["prompt"])
-        # the webhook delivery of the same comment builds the same job, so one of them is a duplicate claim.
-        comment = {"id": 777, "body": self.posts[0][2]["body"], "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
-                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42"}
-        delivered = runner.event_job("issue_comment", {
-            "action": "created", "repository": {"full_name": REPO}, "sender": comment["user"], "comment": comment,
-            "issue": {"number": 42, "body": PR["body"], "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/42"}}})
-        self.assertEqual(delivered, fix)
 
     def test_no_fix_below_threshold_when_off_or_after_the_last_round(self):
         rounds = runner.CONFIG["pr_review"]["max_fix_rounds"]
@@ -318,16 +311,21 @@ class PRReviewRunTests(unittest.TestCase):
                 {"review": {"key_issues_to_review": ISSUES}}))
             self.assertEqual(bool(runner.pr_agent_prompt(body)), job["round"] <= rounds)
 
-    def test_only_autokas_comments_carry_pr_agent_findings(self):
+    def test_only_the_posted_review_starts_a_fix_never_a_delivered_comment(self):
+        # coding jobs comment as autokas[bot] too, so a delivered comment carrying the marker must not start work.
         self.run_review(self.auto_job())
         body = self.posts[0][2]["body"]
+        autokas = {**runner.CONFIG["pr_agent"], "type": "Bot"}
         for user in ({"login": "kas", "id": 1, "type": "User"}, {**runner.CONFIG["coderabbit"], "type": "Bot"},
-                     {"login": "autokas[bot]", "id": 1, "type": "Bot"}):
+                     {"login": "autokas[bot]", "id": 1, "type": "Bot"}, autokas):
             comment = {"id": 778, "body": body, "user": user, "issue_url": f"https://api.github.com/repos/{REPO}/issues/42"}
-            with self.subTest(user=user["login"], id=user["id"]):
-                self.assertIsNone(runner.event_job("issue_comment", {
-                    "action": "created", "repository": {"full_name": REPO}, "sender": user, "comment": comment,
-                    "issue": {"number": 42, "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/42"}}}))
+            for action, posted in (("created", False), ("edited", False), ("created", True)):
+                with self.subTest(user=user["login"], id=user["id"], action=action, posted=posted):
+                    job = runner.event_job("issue_comment", {
+                        "action": action, "repository": {"full_name": REPO}, "sender": user, "comment": comment,
+                        "issue": {"number": 42, "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/42"}}},
+                        posted_review=posted)
+                    self.assertEqual(job is not None, user is autokas and posted)
 
     def test_head_moved_during_review_posts_nothing(self):
         for job in (self.auto_job(), self.command_job()):

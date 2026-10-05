@@ -660,8 +660,10 @@ def reviewer_of(user: dict[str, Any]) -> str | None:
                  if all(user.get(key) == value for key, value in CONFIG[name].items())), None)
 
 
-def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Dispatch docs merges separately while preserving review-bot intake."""
+def event_job(event: str, payload: dict[str, Any], posted_review: bool = False) -> dict[str, Any] | None:
+    """Dispatch docs merges separately while preserving review-bot intake. `posted_review` is set only by `pr_review`
+    for the comment it just posted: coding jobs also comment as autokas[bot], so a delivered or reconciled
+    autokas[bot] comment never starts a PR-Agent fix."""
     if event == "pull_request":
         return docs_event_job(payload) or review_event_job(payload)
     command = command_job(event, payload)
@@ -678,7 +680,7 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if reviewer == "bugbot" and event != "pull_request_review_comment":
         return None
-    if reviewer == "pr_agent" and event != "issue_comment":
+    if reviewer == "pr_agent" and (event != "issue_comment" or not posted_review):
         return None
     comment = payload.get("review" if event == "pull_request_review" else "comment", {})
     if event == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
@@ -1373,11 +1375,11 @@ def pr_review(job: dict[str, Any]) -> None:
         "body": pr_agent_comment(review, head, round_, findings)})
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
-    # the same job the webhook builds from this comment, so whichever arrives second is a duplicate claim.
+    # the only PR-Agent fix intake: webhook and reconcile deliveries of autokas[bot] comments never start one.
     fix = event_job("issue_comment", {
         "action": "created", "repository": {"full_name": repo}, "sender": comment["user"], "comment": comment,
         "issue": {**current, "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/{number}"}},
-    })
+    }, posted_review=True)
     if fix is None:
         log("pr_review_no_fix", key=job["key"], round=round_)
         return
