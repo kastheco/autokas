@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
-from runner import CONFIG, PRWorker, agent_prompt, command_publication, docs_worker, event_job
+from runner import CONFIG, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job
 
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
@@ -40,6 +40,132 @@ def review_event() -> dict:
             "body": section("Prompt for AI Agents", "Move the validation into the shared core function."),
         },
     }
+
+
+BUGBOT = {"login": "cursor[bot]", "id": 206951365, "type": "Bot"}
+BUGBOT_BODY = (
+    "### Feedback split ignores boundaries\n\n**Medium Severity**\n\n"
+    "<!-- DESCRIPTION START -->\nDetection requires a bounded `@sentry` mention, but extraction still splits "
+    "on every substring.\n<!-- DESCRIPTION END -->\n\n"
+    "<!-- BUGBOT_BUG_ID: 9afa9cea-d9bd-4ee0-b100-7c46c28a7006 -->\n\n"
+    "<!-- LOCATIONS START\nsrc/seer/webhooks.py#L39-L42\nsrc/seer/webhooks.py#L29-L33\nLOCATIONS END -->\n"
+    "<details>\n<summary>Additional Locations (1)</summary>\n\n- [`src/seer/webhooks.py#L29-L33`](https://github.com/o/r/blob/x/a.py#L29-L33)\n\n</details>\n\n"
+    '<div><a href="https://cursor.com/open?link=TOKEN" target="_blank"><img alt="Fix in Cursor"></a></div>\n\n'
+    "<sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit abc.</sup>"
+)
+
+
+def bugbot_comment_event() -> dict:
+    return {
+        "action": "created",
+        "repository": {"full_name": REPO},
+        "sender": dict(BUGBOT),
+        "pull_request": {"number": 142, "base": {"repo": {"full_name": REPO}}},
+        "comment": {
+            "id": 9000000002,
+            "user": dict(BUGBOT),
+            "pull_request_url": PR_URL,
+            "body": BUGBOT_BODY,
+        },
+    }
+
+
+class BugbotIntakeTests(unittest.TestCase):
+    def test_inline_finding_becomes_a_job_without_cursor_links(self) -> None:
+        job = event_job("pull_request_review_comment", bugbot_comment_event())
+        self.assertIsNotNone(job)
+        assert job is not None
+        self.assertEqual((job["reviewer"], job["comment"], job["kind"]),
+                         ("bugbot", 9000000002, "pull_request_review_comment"))
+        self.assertTrue(job["prompt"].startswith("Feedback split ignores boundaries\nSeverity: Medium\n"
+                                                  "Locations: src/seer/webhooks.py#L39-L42, src/seer/webhooks.py#L29-L33"))
+        self.assertIn("extraction still splits", job["prompt"])
+        self.assertNotIn("cursor.com", job["prompt"])
+        self.assertNotIn("Additional Locations", job["prompt"])
+
+    def test_review_summary_does_not_start_work(self) -> None:
+        event = review_event()
+        event["sender"] = dict(BUGBOT)
+        event["review"]["user"] = dict(BUGBOT)
+        event["review"]["body"] = "<!-- BUGBOT_REVIEW -->\nCursor Bugbot has reviewed your changes and found 1 potential issue."
+        self.assertIsNone(event_job("pull_request_review", event))
+
+    def test_marked_findings_in_review_summaries_and_issue_comments_do_not_start_work(self) -> None:
+        summary = review_event()
+        summary["sender"] = dict(BUGBOT)
+        summary["review"]["user"] = dict(BUGBOT)
+        summary["review"]["body"] = "<!-- BUGBOT_REVIEW -->\n" + BUGBOT_BODY
+        issue = bugbot_comment_event()
+        issue["issue"] = {"number": 142, "pull_request": {"url": PR_URL}}
+        issue["comment"]["issue_url"] = f"https://api.github.com/repos/{REPO}/issues/142"
+        for kind, event, actions in (("pull_request_review", summary, ("submitted", "edited")),
+                                     ("issue_comment", issue, ("created", "edited"))):
+            for action in actions:
+                event["action"] = action
+                with self.subTest(kind=kind, action=action):
+                    self.assertIsNone(event_job(kind, event))
+
+    def test_bugbot_identity_is_exact_and_not_interchangeable(self) -> None:
+        for sender, author in ((BUGBOT, BOT), (BOT, BUGBOT), ({**BUGBOT, "id": 1}, BUGBOT)):
+            event = bugbot_comment_event()
+            event["sender"], event["comment"]["user"] = dict(sender), dict(author)
+            with self.subTest(sender=sender["login"], author=author["login"], sender_id=sender["id"]):
+                self.assertIsNone(event_job("pull_request_review_comment", event))
+
+    def test_each_reviewer_only_uses_its_own_finding_format(self) -> None:
+        event = bugbot_comment_event()
+        event["comment"]["body"] = section("Prompt for AI Agents", "Fix it.")
+        self.assertIsNone(event_job("pull_request_review_comment", event))
+        event = review_event()
+        event["review"]["body"] = BUGBOT_BODY
+        self.assertIsNone(event_job("pull_request_review", event))
+
+    def test_ignore_marker_and_missing_description_block_bugbot_work(self) -> None:
+        event = bugbot_comment_event()
+        event["pull_request"]["body"] = "wip @autokas ignore"
+        self.assertIsNone(event_job("pull_request_review_comment", event))
+        stripped = BUGBOT_BODY.replace("<!-- DESCRIPTION START -->", "").replace("<!-- DESCRIPTION END -->", "")
+        self.assertEqual(bugbot_prompt(stripped), "")
+
+    def test_review_batch_carries_the_reviewer_to_the_worker(self) -> None:
+        inline = {"id": 9000000002, "user": dict(BUGBOT), "pull_request_review_id": 77, "body": BUGBOT_BODY,
+                  "pull_request_url": PR_URL, "html_url": "https://github.com/x#discussion_r1"}
+        review = {"user": dict(BUGBOT), "state": "commented", "pull_request_url": PR_URL,
+                  "body": "<!-- BUGBOT_REVIEW -->", "html_url": "https://github.com/x#pullrequestreview-77"}
+        pr = {"number": 142, "base": {"repo": {"full_name": REPO}}}
+        responses = {f"repos/{REPO}/pulls/comments/9000000002": inline,
+                     f"repos/{REPO}/pulls/142/reviews/77": review,
+                     f"repos/{REPO}/pulls/142/reviews/77/comments?per_page=100&page=1": [inline]}
+        job = event_job("pull_request_review_comment", bugbot_comment_event())
+        assert job is not None
+        with patch("runner.github", side_effect=lambda path: responses[path]):
+            canonical = review_job(job, pr)
+        self.assertIsNotNone(canonical)
+        assert canonical is not None
+        self.assertEqual(canonical["reviewer"], "bugbot")
+        self.assertEqual([target["comment"] for target in canonical["targets"]], [9000000002])
+
+    def test_parent_marked_finding_cannot_replace_collected_inline_prompts(self) -> None:
+        event = bugbot_comment_event()
+        first = {**event["comment"], "pull_request_review_id": 77,
+                 "html_url": "https://github.com/x#discussion_r1"}
+        second = {**first, "id": first["id"] + 1,
+                  "body": BUGBOT_BODY.replace("Feedback split ignores boundaries", "Second inline finding"),
+                  "html_url": "https://github.com/x#discussion_r2"}
+        review = {"user": dict(BUGBOT), "state": "commented", "pull_request_url": PR_URL,
+                  "body": BUGBOT_BODY.replace("Feedback split ignores boundaries", "Parent-only finding"),
+                  "html_url": "https://github.com/x#pullrequestreview-77"}
+        responses = {f"repos/{REPO}/pulls/comments/{first['id']}": first,
+                     f"repos/{REPO}/pulls/142/reviews/77": review,
+                     f"repos/{REPO}/pulls/142/reviews/77/comments?per_page=100&page=1": [second, first]}
+        job = event_job("pull_request_review_comment", event)
+        assert job is not None
+        with patch("runner.github", side_effect=lambda path: responses[path]):
+            canonical = review_job(job, event["pull_request"])
+        self.assertIsNotNone(canonical)
+        assert canonical is not None
+        self.assertEqual(canonical["prompt"], "\n\n".join(bugbot_prompt(c["body"]) for c in (first, second)))
+        self.assertNotIn("Parent-only finding", canonical["prompt"])
 
 
 class ReviewIntakeTests(unittest.TestCase):

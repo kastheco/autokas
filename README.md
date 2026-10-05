@@ -12,18 +12,20 @@
   <a href="skills">skills</a>
 </p>
 
-autokas fixes CodeRabbit review findings without anyone sitting at a keyboard. a signed GitHub webhook lands on Modal, a configured omp agent checks out the pull request in a disposable container, runs the repo's checks, commits, pushes to the PR branch and exits.
+autokas fixes CodeRabbit and Cursor Bugbot review findings without anyone sitting at a keyboard. a signed GitHub webhook lands on Modal, a configured omp agent checks out the pull request in a disposable container, runs the repo's checks, commits, pushes to the PR branch and exits.
 
 the runner dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, review service, scheduler, database or recovery loop.
 
 ## how a job runs
 
 1. GitHub sends `issue_comment`, `pull_request_review_comment` or `pull_request_review` to the Modal webhook. unsigned requests get `401`.
-2. the receiver accepts only completed CodeRabbit reviews or comments that carry the fenced agent prompt, on a PR whose head belongs to the approved base repository.
+2. the receiver accepts only completed CodeRabbit reviews or comments that carry the fenced agent prompt, and Cursor Bugbot inline comments that carry its marked finding, on a PR whose head belongs to the approved base repository. each bot is matched by its configured login and id from `config.example.json`, and a bot's comments are only parsed with that bot's own format.
 3. a Modal Dict claims the review and finding fingerprints, so duplicate deliveries don't start a second job.
 4. one `PRWorker` per repo and PR clones the repo, checks out the PR head, verifies its SHA and starts omp with the job's model profile.
 5. omp fixes what's still valid, commits as `autokas[bot]` in Conventional Commits form, pushes, updates its queued status comments and posts one outcome comment.
 6. the container exits.
+
+Bugbot review summaries and issue comments don't start finding jobs, even when they contain marked finding text. a Bugbot review batch uses only its collected inline findings as the agent prompt. CodeRabbit keeps its review-prompt-first behavior, falling back to joined inline prompts when the review has none.
 
 ## @autokas commands
 
