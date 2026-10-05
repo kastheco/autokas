@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
-from runner import CONFIG, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job
+from runner import CONFIG, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, request_bugbot_rereview, review_job, upstack
 
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
@@ -473,16 +473,20 @@ class CommandInitializationTests(unittest.TestCase):
         return self.subprocess_run(args, cwd=kwargs.get("cwd", self.upstream),
                                    env=self.git_env, capture_output=True, text=True, check=True)
 
-    def launch(self) -> dict:
-        """Reach omp with a local checkout or an empty reporting-only directory."""
+    def launch(self, agent=None) -> dict:
+        """Reach omp with a local checkout or an empty reporting-only directory.
+
+        With an agent callback, omp "exits 0" after the callback edits the checkout."""
         observed = {}
 
         def read_github(path):
             if path == f"repos/{REPO}/pulls/142":
                 return {"state": "open", "body": getattr(self, "pr_body", ""), "base": {"repo": {"full_name": REPO}},
-                        "head": {"sha": self.head, "ref": self.branch, "repo": {"full_name": REPO}}}
+                        "head": {"sha": getattr(self, "remote_head", self.head), "ref": self.branch, "repo": {"full_name": REPO}}}
             if path == f"repos/{REPO}/commits?sha={self.head}&per_page=100&page=1":
                 return [{"sha": self.head, "commit": {"message": "base"}}]
+            if path.startswith(f"repos/{REPO}/pulls?state=open&per_page=100&base="):
+                return getattr(self, "stack", {}).get(path.rsplit("base=", 1)[1], [])
             raise AssertionError(f"unexpected GitHub read: {path}")
 
         def run(args, **kwargs):
@@ -506,6 +510,9 @@ class CommandInitializationTests(unittest.TestCase):
             if observed["has_checkout"]:
                 observed["head"] = self.git(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()
                 observed["branch"] = self.git(["git", "branch", "--show-current"], cwd=cwd).stdout.strip()
+            if agent:
+                agent(cwd)
+                return Mock(pid=-1, **{"wait.return_value": 0})
             raise self.Interrupted
 
         model = CONFIG["model"].split("/", 1)[1]
@@ -517,8 +524,14 @@ class CommandInitializationTests(unittest.TestCase):
               patch("runner.github", side_effect=read_github),
               patch("runner.urllib.request.urlopen", return_value=StringIO(json.dumps({"data": [{"id": model}]}))),
               patch("runner.subprocess.run", side_effect=run),
-              patch("runner.subprocess.Popen", side_effect=popen)):
-            self.deliver()
+              patch("runner.subprocess.Popen", side_effect=popen),
+              patch("runner.os.killpg"),
+              patch("runner.request_bugbot_rereview",
+                    side_effect=lambda repo, number, head: observed.setdefault("rereview", []).append(number))):
+            if agent:
+                PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
+            else:
+                self.deliver()
         return observed
 
     def assert_execution_launch(self, observed) -> None:
@@ -550,6 +563,24 @@ class CommandInitializationTests(unittest.TestCase):
         self.pr_body = "<!-- omp-runner:docs-update -->"
         self.assert_execution_launch(self.launch())
 
+    def test_launch_gives_the_agent_the_branches_stacked_above_its_pr(self) -> None:
+        child = {"number": 143, "head": {"ref": "feature/child", "repo": {"full_name": REPO}}}
+        self.stack = {"feature%2Fcommand": [child]}
+        self.assertEqual(self.launch()["context"]["upstack"],
+                         [{"pr": 143, "branch": "feature/child", "parent": "feature/command"}])
+
+    def test_fix_counts_as_published_when_the_restack_leaves_head_upstack(self) -> None:
+        def fix_then_restack(cwd):
+            commit = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "--allow-empty", "-m", "fix"]
+            self.git(commit, cwd=cwd)
+            self.remote_head = self.git(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()
+            self.git(["git", "checkout", "-b", "feature/child"], cwd=cwd)
+            self.git(commit[:-1] + ["chore(stack): merge feature/command into feature/child"], cwd=cwd)
+
+        observed = self.launch(agent=fix_then_restack)
+        self.assertEqual(observed["rereview"], [142])
+        self.assertEqual(self.values["command:" + self.job["key"]]["published_head"], self.remote_head)
+
     def test_legacy_start_without_execution_record_stays_reporting_only(self) -> None:
         self.values["started:" + self.job["key"]] = "started"
         self.deliver()
@@ -578,6 +609,36 @@ class CommandInitializationTests(unittest.TestCase):
                 else:
                     self.assert_reporting_launch(observed, "completed" if state == "completed" else "uncertain")
                     self.assertEqual(self.values["command:" + self.job["key"]], record)
+
+
+class StackAndRereviewTests(unittest.TestCase):
+    @staticmethod
+    def pr(number: int, branch: str, repo: str | None = REPO) -> dict:
+        return {"number": number, "head": {"ref": branch, "repo": repo and {"full_name": repo}}}
+
+    def test_upstack_walks_children_in_order_and_skips_forks_and_cycles(self) -> None:
+        children = {
+            "a": [self.pr(2, "b"), self.pr(9, "fork", "outsider/example-app"), self.pr(8, "gone", None)],
+            "b": [self.pr(3, "c"), self.pr(4, "d")],
+            "c": [self.pr(5, "a")],
+        }
+        prefix = f"repos/{REPO}/pulls?state=open&per_page=100&base="
+        with patch("runner.github", side_effect=lambda path: children.get(path.removeprefix(prefix), [])):
+            stack = upstack(REPO, "a")
+        self.assertEqual([(entry["pr"], entry["branch"], entry["parent"]) for entry in stack],
+                         [(2, "b", "a"), (3, "c", "b"), (4, "d", "b")])
+
+    def test_rereview_is_requested_only_where_bugbot_already_checks(self) -> None:
+        for runs, expected in (([{"name": "Cursor Bugbot"}], [{"body": "cursor review"}]), ([], [])):
+            posted = []
+            with (self.subTest(bugbot=bool(runs)),
+                  patch("runner.github", return_value={"check_runs": runs}) as read,
+                  patch("runner.github_request", side_effect=lambda method, path, body: posted.append(body)),
+                  patch("runner.log")):
+                request_bugbot_rereview(REPO, 142, "a" * 40)
+            self.assertEqual(posted, expected)
+            self.assertIn("check_name=Cursor%20Bugbot", read.call_args.args[0])
+
 
 
 class DocsMergeTests(unittest.TestCase):
