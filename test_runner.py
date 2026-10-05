@@ -481,12 +481,18 @@ class CommandInitializationTests(unittest.TestCase):
 
         def read_github(path):
             if path == f"repos/{REPO}/pulls/142":
-                return {"state": "open", "body": getattr(self, "pr_body", ""), "base": {"repo": {"full_name": REPO}},
+                return {"state": "open", "body": getattr(self, "pr_body", ""), "base": {"ref": "main", "repo": {"full_name": REPO}},
                         "head": {"sha": getattr(self, "remote_head", self.head), "ref": self.branch, "repo": {"full_name": REPO}}}
             if path == f"repos/{REPO}/commits?sha={self.head}&per_page=100&page=1":
                 return [{"sha": self.head, "commit": {"message": "base"}}]
             if path.startswith(f"repos/{REPO}/pulls?state=open&per_page=100&page=1&base="):
                 return getattr(self, "stack", {}).get(path.rsplit("base=", 1)[1], [])
+            if path == f"repos/{REPO}":
+                return {"default_branch": "main"}
+            if path.startswith(f"repos/{REPO}/branches/"):
+                return {"protected": False}
+            if path.startswith(f"repos/{REPO}/compare/"):
+                return {"merge_base_commit": {"sha": "f" * 40}, "ahead_by": 1}
             raise AssertionError(f"unexpected GitHub read: {path}")
 
         def run(args, **kwargs):
@@ -562,7 +568,7 @@ class CommandInitializationTests(unittest.TestCase):
         self.assert_execution_launch(self.launch())
 
     def test_launch_gives_the_agent_the_branches_stacked_above_its_pr(self) -> None:
-        child = {"number": 143, "head": {"ref": "feature/child", "repo": {"full_name": REPO}}}
+        child = {"number": 143, "head": {"ref": "feature/child", "sha": "c" * 40, "repo": {"full_name": REPO}}}
         self.stack = {"feature%2Fcommand": [child]}
         self.assertEqual(self.launch()["context"]["upstack"],
                          [{"pr": 143, "branch": "feature/child", "parent": "feature/command"}])
@@ -611,23 +617,38 @@ class CommandInitializationTests(unittest.TestCase):
 class StackTests(unittest.TestCase):
     @staticmethod
     def pr(number: int, branch: str, repo: str | None = REPO) -> dict:
-        return {"number": number, "head": {"ref": branch, "repo": repo and {"full_name": repo}}}
+        return {"number": number, "head": {"ref": branch, "sha": branch.upper(), "repo": repo and {"full_name": repo}}}
 
-    def test_upstack_walks_every_page_of_children_in_order_and_skips_forks_and_cycles(self) -> None:
-        forks = [self.pr(100 + n, f"fork-{n}", "outsider/example-app") for n in range(97)]
+    def test_upstack_walks_every_page_of_real_children_and_never_targets_other_branches(self) -> None:
+        forks = [self.pr(100 + n, f"fork-{n}", "outsider/example-app") for n in range(94)]
         children = {
-            ("a", 1): [self.pr(2, "b"), self.pr(9, "fork", "outsider/example-app"), self.pr(8, "gone", None), *forks],
+            ("a", 1): [self.pr(2, "b"), self.pr(9, "fork", "outsider/example-app"), self.pr(8, "gone", None),
+                       self.pr(10, "main"), self.pr(11, "release"), self.pr(12, "unrelated"), *forks],
             ("a", 2): [self.pr(7, "x")],
             ("b", 1): [self.pr(3, "c"), self.pr(4, "d")],
             ("c", 1): [self.pr(5, "a")],
         }
+        # a child built on its parent shares a merge base that isn't on the parent's base yet.
+        merge_bases = {("A", "B"): "a1", ("A", "X"): "a1", ("B", "C"): "b1", ("B", "D"): "b1", ("A", "UNRELATED"): "m0"}
+        ahead = {("main", "a1"), ("a", "b1")}
 
         def read(path):
-            query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&"))
-            return children.get((query["base"], int(query["page"])), [])
+            route, _, query = path.removeprefix(f"repos/{REPO}").partition("?")
+            if route == "":
+                return {"default_branch": "main"}
+            if route.startswith("/branches/"):
+                return {"protected": route == "/branches/release"}
+            if route.startswith("/compare/"):
+                left, right = route.removeprefix("/compare/").split("...")
+                if (left, right) in merge_bases:
+                    return {"merge_base_commit": {"sha": merge_bases[left, right]}}
+                # a diverged base still counts: only commits the base lacks matter.
+                return {"ahead_by": 2 if (left, right) in ahead else 0, "status": "diverged"}
+            params = dict(part.split("=", 1) for part in query.split("&"))
+            return children.get((params["base"], int(params["page"])), [])
 
-        with patch("runner.github", side_effect=read):
-            stack = upstack(REPO, "a")
+        with patch("runner.github", side_effect=read), patch("runner.log"):
+            stack = upstack(REPO, "a", "A", "main")
         self.assertEqual([(entry["pr"], entry["branch"], entry["parent"]) for entry in stack],
                          [(2, "b", "a"), (7, "x", "a"), (3, "c", "b"), (4, "d", "b")])
 

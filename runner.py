@@ -837,12 +837,23 @@ def github(path: str) -> Any:
     return github_request("GET", path)
 
 
-def upstack(repo: str, branch: str) -> list[dict[str, Any]]:
-    """List the same-repo open PRs stacked above a branch, parents before children."""
+def stacked_on(repo: str, parent_head: str, parent_base: str, child_head: str) -> bool:
+    """True when the child was built on the parent's own commits: their merge base isn't already on the parent's base."""
+    merge_base = github(f"repos/{repo}/compare/{parent_head}...{child_head}")["merge_base_commit"]["sha"]
+    return github(f"repos/{repo}/compare/{urllib.parse.quote(parent_base, safe='')}...{merge_base}")["ahead_by"] > 0
+
+
+def upstack(repo: str, branch: str, head: str, base: str) -> list[dict[str, Any]]:
+    """List the same-repo open PRs stacked above a branch, parents before children.
+
+    the agent pushes merges to these branches with the App's write token, so a PR's base alone doesn't qualify it:
+    anyone who can open a PR can point one at any existing branch. a child must have been built on its parent's own
+    commits, and the default branch and protected branches are never targets."""
+    default = ""
     found: list[dict[str, Any]] = []
-    seen, queue = {branch}, [branch]
+    seen, queue = {branch}, [(branch, head, base)]
     while queue:
-        parent = queue.pop(0)
+        parent, parent_head, parent_base = queue.pop(0)
         for page in range(1, 1000):
             batch = github(f"repos/{repo}/pulls?state=open&per_page=100&page={page}"
                            f"&base={urllib.parse.quote(parent, safe='')}")
@@ -850,8 +861,14 @@ def upstack(repo: str, branch: str) -> list[dict[str, Any]]:
                 child = pr["head"]["ref"]
                 if pr["head"]["repo"] is None or pr["head"]["repo"]["full_name"] != repo or child in seen:
                     continue
+                default = default or github(f"repos/{repo}")["default_branch"]
+                if (child == default
+                        or github(f"repos/{repo}/branches/{urllib.parse.quote(child, safe='')}")["protected"]
+                        or not stacked_on(repo, parent_head, parent_base, pr["head"]["sha"])):
+                    log("upstack_skipped", repo=repo, pr=pr["number"], branch=child, parent=parent)
+                    continue
                 seen.add(child)
-                queue.append(child)
+                queue.append((child, pr["head"]["sha"], parent))
                 found.append({"pr": pr["number"], "branch": child, "parent": parent})
             if len(batch) < 100:
                 break
@@ -1671,7 +1688,7 @@ class PRWorker:
                     if run(["git", "rev-parse", "HEAD"], worktree) != head:
                         raise RuntimeError("PR head changed while preparing its checkout")
                 log("worktree_ready", repo=repo, pr=number, head=head, branch=branch, worktree=str(worktree))
-                stacked = (upstack(repo, branch)
+                stacked = (upstack(repo, branch, head, pr["base"]["ref"])
                            if command_resume is None and job.get("target", "pr") == "pr" else [])
                 policy = root / "policy.txt"
                 modal_run_links = dict(job.get("modal_run_links", {}))
