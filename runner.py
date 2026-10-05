@@ -1432,7 +1432,7 @@ def dispatch(job: dict[str, Any]) -> None:
 
 
 def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict[str, Any]:
-    """The next review round, pinned to the head a PR-Agent fix pushed. `max_fix_rounds` ends the loop."""
+    """The next review round, pinned to the current head containing a PR-Agent fix. `max_fix_rounds` ends the loop."""
     state = pr_agent_review_state(review_body) or {}
     return {"mode": "pr_review", "kind": "fix", "repo": repo, "pr": number, "head": head,
             "round": int(state.get("round", 1)) + 1, "key": f"{repo}:pr_review:{number}:{head}"}
@@ -1738,21 +1738,32 @@ class PRWorker:
                     return
                 # A restack leaves HEAD on an upstack branch, so read the PR branch itself.
                 final_head = run(["git", "rev-parse", "HEAD" if job.get("target") == "issue" else f"refs/heads/{branch}"], worktree)
-                remote_head = (run(["git", "ls-remote", "origin", f"refs/heads/autokas/issue-{number}"], worktree).split("\t")[0]
-                               if job.get("target") == "issue" else github(f"repos/{repo}/pulls/{number}")["head"]["sha"])
-                update_confirmed = code == 0 and final_head != head and remote_head == final_head
+                if job.get("target") == "issue":
+                    remote_head = run(["git", "ls-remote", "origin", f"refs/heads/autokas/issue-{number}"], worktree).split("\t")[0]
+                    publication_confirmed = final_head != head and remote_head == final_head
+                else:
+                    pr = github(f"repos/{repo}/pulls/{number}")
+                    remote_head = pr["head"]["sha"]
+                    publication_confirmed = (final_head != head and pr["head"]["repo"] is not None
+                                             and pr["head"]["repo"]["full_name"] == repo
+                                             and pr["head"]["ref"] == branch)
+                    if publication_confirmed and remote_head != final_head:
+                        # A parent restack can advance this branch after the fix push.
+                        # Only a descendant confirms publication, never an unrelated head.
+                        publication_confirmed = github(f"repos/{repo}/compare/{final_head}...{remote_head}")["status"] == "ahead"
+                update_confirmed = code == 0 and publication_confirmed
                 log("exited", repo=repo, pr=number, exit_code=code, starting_head=head,
                     local_head=final_head, remote_head=remote_head,
                     update_confirmed=update_confirmed, upstack=len(stacked))
                 if job.get("mode") == "command":
                     record = CLAIMS.get("command:" + job["key"])
-                    if final_head != head and remote_head == final_head:
+                    if publication_confirmed:
                         record["published_head"] = final_head
                     elif code == 0 and final_head == head and remote_head == head:
                         record["state"] = "completed"
                     CLAIMS.put("command:" + job["key"], record)
-                if job.get("reviewer") == "pr_agent" and final_head != head and remote_head == final_head:
-                    dispatch(next_review_job(repo, number, comment.get("body") or "", final_head))
+                if job.get("reviewer") == "pr_agent" and publication_confirmed:
+                    dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head))
                 if code:
                     raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
             except Exception as error:
