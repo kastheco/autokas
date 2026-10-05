@@ -42,7 +42,7 @@ you don't have to wait for CodeRabbit. start a GitHub comment with `@autokas` an
 - only users with `write` or `admin` access on the repo can trigger it. other people's comments are ignored.
 - each comment runs once. editing a comment doesn't rerun it, so post a new comment for a follow-up.
 - commands still run on PRs marked `autokas:ignore` and on generated docs PRs.
-- `@autokas review` on a PR, and nothing after it, posts a fresh PR-Agent review of the current head instead of starting a coding job. it works on drafts too. anything longer, like `@autokas review the parser and fix it`, is an ordinary command.
+- a PR command that starts with the word `review` posts a fresh PR-Agent review of the current head instead of starting a coding job. anything after `review` goes to PR-Agent as extra instructions, so `@autokas review focus on the auth changes` steers it. it works on drafts too. a review never edits code, so `@autokas review the parser and fix it` only reviews. ask for the fix as its own command, like `@autokas fix the parser`. on an issue, `review` is an ordinary command.
 
 ```text
 @autokas the date filter drops the last day of the range, fix it and add a test

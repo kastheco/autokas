@@ -71,21 +71,24 @@ class PRReviewIntakeTests(unittest.TestCase):
             self.assertIsNone(runner.event_job("pull_request", pr_event("opened")))
             self.assertIsNone(runner.event_job(*comment_event("@autokas review")))
 
-    def test_review_command_is_its_own_job_and_other_commands_stay_coding_jobs(self):
+    def test_review_prefix_routes_to_pr_agent_with_the_rest_as_instructions(self):
         with enabled():
             for event in ("issue_comment", "pull_request_review_comment"):
-                with self.subTest(event=event):
-                    job = runner.event_job(*comment_event("@autokas  Review ", event=event))
-                    self.assertEqual(job["mode"], "pr_review")
-                    self.assertEqual(job["key"], f"{REPO}:pr_review:command:555")
-                    self.assertEqual(job["author"], "kas")
-            job = runner.event_job(*comment_event("@autokas review the parser and fix it"))
-            self.assertEqual(job["mode"], "command")
-            self.assertEqual(job["prompt"], "review the parser and fix it")
+                for body, instructions in (("@autokas  Review ", ""), ("@autokas review: focus on auth", "focus on auth"),
+                                           ("@autokas review the parser, please", "the parser, please")):
+                    with self.subTest(event=event, body=body):
+                        job = runner.event_job(*comment_event(body, event=event))
+                        self.assertEqual(job["mode"], "pr_review")
+                        self.assertEqual(job["instructions"], instructions)
+                        self.assertEqual(job["key"], f"{REPO}:pr_review:command:555")
+                        self.assertEqual(job["author"], "kas")
+            for body in ("@autokas reviewer notes: fix the parser", "@autokas fix it and review", "@autokas re-review"):
+                with self.subTest(body=body):
+                    self.assertEqual(runner.event_job(*comment_event(body))["mode"], "command")
 
-    def test_review_command_ignores_issues_and_bots(self):
+    def test_review_command_on_an_issue_stays_a_coding_command_and_bots_never_trigger(self):
         with enabled():
-            self.assertIsNone(runner.event_job(*comment_event("@autokas review", on_issue=True)))
+            self.assertEqual(runner.event_job(*comment_event("@autokas review", on_issue=True))["mode"], "command")
             # autokas[bot] posts the review itself; nothing it writes may start another job.
             self.assertIsNone(runner.event_job(*comment_event("@autokas review", user_type="Bot")))
             self.assertIsNone(runner.event_job(*comment_event("## PR Reviewer Guide 🔍\n@autokas review",
@@ -194,6 +197,12 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertEqual(self.posts, [("POST", f"repos/{REPO}/issues/42/comments",
                                        {"body": f"## PR Reviewer Guide\n\n<sub>reviewed head {HEAD}</sub>"})])
         self.assertEqual(self.events(), ["pr_review_started", "pr_review_done"])
+        self.assertNotIn("PR_REVIEWER__EXTRA_INSTRUCTIONS", env)
+
+    def test_command_text_reaches_pr_agent_as_literal_extra_instructions(self):
+        run = self.run_review({**self.command_job(), "instructions": "@json {\"a\": 1}"})
+        self.assertEqual(run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"],
+                         "the commenter asked: @json {\"a\": 1}")
 
     def test_head_moved_during_review_posts_nothing(self):
         for job in (self.auto_job(), self.command_job()):
