@@ -131,6 +131,8 @@ python -m unittest discover -v
 
 covers intake and identity boundaries, review state and prompt selection, installation token isolation, clean-review acknowledgments, deploy reconciliation and docs follow-up merge safety, all without external calls.
 
+`test_pr_review` also covers the empty-diff check lifecycle: the review completes its check as `skipped` without running PR-Agent, posting a review or queuing a fix.
+
 ## stop it
 
 add `autokas:ignore` or `@autokas ignore` anywhere in a PR body to skip automatic finding fixes, clean-review acknowledgments and docs-update jobs when it merges. markers are case-insensitive. [`@autokas` commands](#autokas-commands) from users with write access still run.

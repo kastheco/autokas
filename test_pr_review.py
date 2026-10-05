@@ -117,7 +117,7 @@ class PRReviewRunTests(unittest.TestCase):
         self.addCleanup(environ.stop)
 
     def run_review(self, job, pr=None, permission="write", code=0, stderr="", review="## PR Reviewer Guide",
-                   head_after=HEAD, issues=None, checks_denied=False):
+                   head_after=HEAD, issues=None, checks_denied=False, diff="diff --git a/parser.py b/parser.py\n"):
         """Run pr_review with GitHub and the checkout faked; PR-Agent writes `review` and `issues` to its outputs."""
         pulls = iter([copy.deepcopy(pr or PR), {**copy.deepcopy(pr or PR), "head": {**PR["head"], "sha": head_after}}])
 
@@ -147,7 +147,7 @@ class PRReviewRunTests(unittest.TestCase):
                     "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
 
         self.run = Mock(side_effect=pr_agent)
-        self.checkout = Mock(return_value="diff --git a/parser.py b/parser.py\n")
+        self.checkout = Mock(return_value=diff)
         self.posts, self.checks, self.dispatched = [], [], []
         with patch.object(runner, "github", side_effect=github), patch.object(runner.subprocess, "run", self.run), \
                 patch.object(runner, "checkout_pr_diff", self.checkout), \
@@ -359,6 +359,17 @@ class PRReviewRunTests(unittest.TestCase):
                 self.assertEqual((finish[0], finish[1]), ("PATCH", f"repos/{REPO}/check-runs/88"))
                 self.assertEqual((finish[2]["conclusion"], finish[2]["output"]["title"]), (conclusion, title))
                 self.assertEqual("details_url" in finish[2], bool(self.posts))
+
+    def test_empty_diff_finishes_check_as_skipped(self):
+        run = self.run_review(self.auto_job(), diff="")
+        start, finish = self.checks
+        self.assertEqual((start[0], start[2]["head_sha"], start[2]["status"]), ("POST", HEAD, "in_progress"))
+        self.assertEqual((finish[0], finish[1]), ("PATCH", f"repos/{REPO}/check-runs/88"))
+        self.assertEqual((finish[2]["status"], finish[2]["conclusion"], finish[2]["output"]["title"]),
+                         ("completed", "skipped", "no diff to review"))
+        run.assert_not_called()
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.dispatched, [])
 
     def test_check_api_failure_never_stops_the_review(self):
         # the installation may not have accepted the checks permission yet.
