@@ -279,6 +279,34 @@ class PRReviewRunTests(unittest.TestCase):
                     self.assertTrue(body.split("\n\n<sub>")[0].endswith(runner.REVIEW_TRIMMED))
                     self.assertEqual(state["findings"][0]["content"], ISSUES[0]["issue_content"].strip())
 
+    def test_metadata_heavy_review_fits_and_preserves_finding_locations(self):
+        issues = [{**issue, "issue_header": "[P1] " + "🔍<>" * 20000,
+                   "relevant_file": "src/" + "é" * 1000 + ".py", "issue_content": ""}
+                  for issue in ISSUES]
+        self.run_review(self.auto_job(), review="🔍" * 30000, issues=issues)
+        body = self.posts[0][2]["body"]
+        self.assertLessEqual(len(body.encode()), runner.GITHUB_COMMENT_LIMIT)
+        state = runner.pr_agent_review_state(body)
+        self.assertEqual((state["head"], state["round"]), (HEAD, 1))
+        self.assertEqual([(finding["severity"], finding["file"], finding["lines"])
+                          for finding in state["findings"]],
+                         [("P1", issue["relevant_file"], f"{issue['start_line']}-{issue['end_line']}")
+                          for issue in issues])
+        for finding in state["findings"]:
+            self.assertTrue(("🔍<>" * 20000).startswith(finding["header"]))
+            self.assertLess(len(finding["header"]), len("🔍<>" * 20000))
+        self.assertEqual(len(self.dispatched), 1)
+
+    def test_unshrinkable_metadata_never_posts_or_dispatches_a_partial_review(self):
+        cases = ("long file", [{**ISSUES[0], "relevant_file": "a" * runner.GITHUB_COMMENT_LIMIT}]), (
+            "many findings", [ISSUES[0]] * 1000)
+        for name, issues in cases:
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, "review metadata exceeds GitHub's comment limit"):
+                    self.run_review(self.auto_job(), issues=issues)
+                self.assertEqual(self.posts, [])
+                self.assertEqual(self.dispatched, [])
+
     def test_each_fix_round_reviews_the_pushed_head_until_the_cap(self):
         rounds = runner.CONFIG["pr_review"]["max_fix_rounds"]
         body = runner.pr_agent_marker(HEAD, 1, runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}}))

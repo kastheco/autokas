@@ -577,17 +577,23 @@ def utf8_cut(text: str, size: int) -> str:
 
 
 def pr_agent_comment(review: str, head: str, round_: int, findings: list[dict[str, Any]]) -> str:
-    """Fit the review, its head line and the marker into one comment. the marker keeps every finding; the rendered
-    review is trimmed first, and finding text only when the marker alone would take more than half the limit.
-    sizes are UTF-8 bytes, which never undercounts GitHub's character limit."""
+    """Fit the review and its state into one comment, measured in UTF-8 bytes.
+    Trim content, then headers, while preserving every finding's severity and location.
+    Reject metadata that can't fit without dropping findings or corrupting locations."""
+    head_line = f"\n\n<sub>reviewed head {head}</sub>\n\n"
+    marker_limit = min(GITHUB_COMMENT_LIMIT // 2,
+                       GITHUB_COMMENT_LIMIT - len(head_line.encode()) - len(REVIEW_TRIMMED.encode()))
     marker = pr_agent_marker(head, round_, findings)
-    cap = max((len(finding["content"].encode()) for finding in findings), default=0)
-    while len(marker.encode()) > GITHUB_COMMENT_LIMIT // 2 and cap:
-        cap //= 2
-        marker = pr_agent_marker(head, round_, [{**finding, "content": utf8_cut(finding["content"], cap)}
-                                                for finding in findings])
-    footer = f"\n\n<sub>reviewed head {head}</sub>\n\n{marker}"
+    for field in ("content", "header"):
+        cap = max((len(finding[field].encode()) for finding in findings), default=0)
+        while len(marker.encode()) > marker_limit and cap:
+            cap //= 2
+            findings = [{**finding, field: utf8_cut(finding[field], cap)} for finding in findings]
+            marker = pr_agent_marker(head, round_, findings)
+    footer = head_line + marker
     room = GITHUB_COMMENT_LIMIT - len(footer.encode())
+    if room < len(REVIEW_TRIMMED.encode()):
+        raise ValueError("PR-Agent review metadata exceeds GitHub's comment limit")
     if len(review.encode()) > room:
         review = utf8_cut(review, room - len(REVIEW_TRIMMED.encode())) + REVIEW_TRIMMED
     return review + footer
