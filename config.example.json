@@ -17,7 +17,7 @@
     "id": 206951365
   },
   "pr_review": {
-    "enabled": false,
+    "enabled": true,
     "pr_agent_version": "0.47.0",
     "model": "railway-codex/gpt-6-astra",
     "thinking": "medium",

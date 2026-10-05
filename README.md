@@ -29,7 +29,7 @@ Bugbot review summaries and issue comments don't start finding jobs, even when t
 
 ### PR-Agent reviews
 
-when `pr_review.enabled` is true in the config, autokas posts one PR-Agent `/review` comment as `autokas[bot]` on a same-repo PR when it's opened as ready, or when it moves from draft to ready. later pushes don't trigger another review. drafts, closed PRs, fork heads, generated docs PRs and PRs marked `autokas:ignore` are skipped.
+autokas posts one PR-Agent `/review` comment as `autokas[bot]` on a same-repo PR when it's opened as ready, or when it moves from draft to ready. later pushes don't trigger another review. drafts, closed PRs, fork heads, generated docs PRs and PRs marked `autokas:ignore` are skipped. setting `pr_review.enabled` to `false` turns off both the automatic reviews and `@autokas review`.
 
 the review runs in its own small Modal function with the pinned `pr_review.pr_agent_version`, not in the omp coding container. it calls `pr_review.model` through the same CLIProxyAPI service with no fallback model, and uses the repo's App installation token. it posts one comment and never pushes, commits, labels or resolves threads. repository `.pr_agent.toml` files are ignored.
 
