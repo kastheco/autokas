@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
-from runner import CONFIG, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, request_bugbot_rereview, review_job, upstack
+from runner import CONFIG, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job, upstack
 
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
@@ -485,7 +485,7 @@ class CommandInitializationTests(unittest.TestCase):
                         "head": {"sha": getattr(self, "remote_head", self.head), "ref": self.branch, "repo": {"full_name": REPO}}}
             if path == f"repos/{REPO}/commits?sha={self.head}&per_page=100&page=1":
                 return [{"sha": self.head, "commit": {"message": "base"}}]
-            if path.startswith(f"repos/{REPO}/pulls?state=open&per_page=100&base="):
+            if path.startswith(f"repos/{REPO}/pulls?state=open&per_page=100&page=1&base="):
                 return getattr(self, "stack", {}).get(path.rsplit("base=", 1)[1], [])
             raise AssertionError(f"unexpected GitHub read: {path}")
 
@@ -525,9 +525,7 @@ class CommandInitializationTests(unittest.TestCase):
               patch("runner.urllib.request.urlopen", return_value=StringIO(json.dumps({"data": [{"id": model}]}))),
               patch("runner.subprocess.run", side_effect=run),
               patch("runner.subprocess.Popen", side_effect=popen),
-              patch("runner.os.killpg"),
-              patch("runner.request_bugbot_rereview",
-                    side_effect=lambda repo, number, head: observed.setdefault("rereview", []).append(number))):
+              patch("runner.os.killpg")):
             if agent:
                 PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
             else:
@@ -577,8 +575,7 @@ class CommandInitializationTests(unittest.TestCase):
             self.git(["git", "checkout", "-b", "feature/child"], cwd=cwd)
             self.git(commit[:-1] + ["chore(stack): merge feature/command into feature/child"], cwd=cwd)
 
-        observed = self.launch(agent=fix_then_restack)
-        self.assertEqual(observed["rereview"], [142])
+        self.launch(agent=fix_then_restack)
         self.assertEqual(self.values["command:" + self.job["key"]]["published_head"], self.remote_head)
 
     def test_legacy_start_without_execution_record_stays_reporting_only(self) -> None:
@@ -611,32 +608,28 @@ class CommandInitializationTests(unittest.TestCase):
                     self.assertEqual(self.values["command:" + self.job["key"]], record)
 
 
-class StackAndRereviewTests(unittest.TestCase):
+class StackTests(unittest.TestCase):
     @staticmethod
     def pr(number: int, branch: str, repo: str | None = REPO) -> dict:
         return {"number": number, "head": {"ref": branch, "repo": repo and {"full_name": repo}}}
 
-    def test_upstack_walks_children_in_order_and_skips_forks_and_cycles(self) -> None:
+    def test_upstack_walks_every_page_of_children_in_order_and_skips_forks_and_cycles(self) -> None:
+        forks = [self.pr(100 + n, f"fork-{n}", "outsider/example-app") for n in range(97)]
         children = {
-            "a": [self.pr(2, "b"), self.pr(9, "fork", "outsider/example-app"), self.pr(8, "gone", None)],
-            "b": [self.pr(3, "c"), self.pr(4, "d")],
-            "c": [self.pr(5, "a")],
+            ("a", 1): [self.pr(2, "b"), self.pr(9, "fork", "outsider/example-app"), self.pr(8, "gone", None), *forks],
+            ("a", 2): [self.pr(7, "x")],
+            ("b", 1): [self.pr(3, "c"), self.pr(4, "d")],
+            ("c", 1): [self.pr(5, "a")],
         }
-        prefix = f"repos/{REPO}/pulls?state=open&per_page=100&base="
-        with patch("runner.github", side_effect=lambda path: children.get(path.removeprefix(prefix), [])):
+
+        def read(path):
+            query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&"))
+            return children.get((query["base"], int(query["page"])), [])
+
+        with patch("runner.github", side_effect=read):
             stack = upstack(REPO, "a")
         self.assertEqual([(entry["pr"], entry["branch"], entry["parent"]) for entry in stack],
-                         [(2, "b", "a"), (3, "c", "b"), (4, "d", "b")])
-
-    def test_rereview_is_requested_only_where_bugbot_already_checks(self) -> None:
-        for runs in ([{"name": "Cursor Bugbot"}], []):
-            with (self.subTest(bugbot=bool(runs)),
-                  patch("runner.github", return_value={"check_runs": runs}),
-                  patch("runner.github_request") as post,
-                  patch("runner.log")):
-                request_bugbot_rereview(REPO, 142, "a" * 40)
-            self.assertEqual(post.call_count, int(bool(runs)))
-
+                         [(2, "b", "a"), (7, "x", "a"), (3, "c", "b"), (4, "d", "b")])
 
 
 class DocsMergeTests(unittest.TestCase):

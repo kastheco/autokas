@@ -294,8 +294,7 @@ what is and isn't confirmed. Never claim an empty commit as a fix or an unperfor
 check or consultation as completed.
 Comment only on the specified PR. Don't copy raw reviewer prompts, credentials,
 private consultation transcripts or unrelated business data. Do not request
-another bot review or start an automated comment exchange; the runner requests
-any re-review itself.
+another bot review or start an automated comment exchange.
 If comment delivery fails or is uncertain, read the PR comments to reconcile once;
 never blindly post again. If still unconfirmed, make that failure explicit in the
 final output. Don't claim a comment was posted without a confirmed response or read.
@@ -844,23 +843,19 @@ def upstack(repo: str, branch: str) -> list[dict[str, Any]]:
     seen, queue = {branch}, [branch]
     while queue:
         parent = queue.pop(0)
-        for pr in github(f"repos/{repo}/pulls?state=open&per_page=100&base={urllib.parse.quote(parent, safe='')}"):
-            child = pr["head"]["ref"]
-            if pr["head"]["repo"] is None or pr["head"]["repo"]["full_name"] != repo or child in seen:
-                continue
-            seen.add(child)
-            queue.append(child)
-            found.append({"pr": pr["number"], "branch": child, "parent": parent})
+        for page in range(1, 1000):
+            batch = github(f"repos/{repo}/pulls?state=open&per_page=100&page={page}"
+                           f"&base={urllib.parse.quote(parent, safe='')}")
+            for pr in batch:
+                child = pr["head"]["ref"]
+                if pr["head"]["repo"] is None or pr["head"]["repo"]["full_name"] != repo or child in seen:
+                    continue
+                seen.add(child)
+                queue.append(child)
+                found.append({"pr": pr["number"], "branch": child, "parent": parent})
+            if len(batch) < 100:
+                break
     return found
-
-
-def request_bugbot_rereview(repo: str, number: int, head: str) -> None:
-    """Ask Cursor Bugbot to review a pushed fix; it skips pushes made by bot accounts."""
-    runs = github(f"repos/{repo}/commits/{head}/check-runs?check_name={urllib.parse.quote('Cursor Bugbot')}")
-    if not runs.get("check_runs"):
-        return
-    github_request("POST", f"repos/{repo}/issues/{number}/comments", {"body": "cursor review"})
-    log("bugbot_rereview_requested", repo=repo, pr=number)
 
 
 def review_job(job: dict[str, Any], pr: dict[str, Any]) -> dict[str, Any] | None:
@@ -1749,11 +1744,6 @@ class PRWorker:
                 log("exited", repo=repo, pr=number, exit_code=code, starting_head=head,
                     local_head=final_head, remote_head=remote_head,
                     update_confirmed=update_confirmed, upstack=len(stacked))
-                if update_confirmed and job.get("target", "pr") == "pr":
-                    try:
-                        request_bugbot_rereview(repo, number, head)
-                    except Exception as error:
-                        log("bugbot_rereview_uncertain", repo=repo, pr=number, reason=type(error).__name__)
                 if job.get("mode") == "command":
                     record = CLAIMS.get("command:" + job["key"])
                     if final_head != head and remote_head == final_head:
