@@ -388,6 +388,7 @@ def autokas_ignored(pr: dict[str, Any]) -> bool:
 
 
 COMMAND = re.compile(r"@autokas(?![\w-])", re.IGNORECASE)
+REVIEW_COMMAND = re.compile(r"review(?![\w-])[\s:,.;!-]*", re.IGNORECASE)
 
 def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     """Accept a new human comment that starts with @autokas; the dispatcher checks access."""
@@ -402,12 +403,15 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     repo = payload["repository"]["full_name"]
     target = payload["issue"] if event == "issue_comment" else payload["pull_request"]
     target_kind = "issue" if event == "issue_comment" and "pull_request" not in target else "pr"
-    if instruction.lower() == "review":
-        # `@autokas review` asks for a PR-Agent review, never an omp coding job.
-        if target_kind != "pr" or not CONFIG["pr_review"]["enabled"]:
+    review = REVIEW_COMMAND.match(instruction) if target_kind == "pr" else None
+    if review:
+        # `@autokas review …` on a PR asks for a PR-Agent review, never an omp coding job.
+        # any text after `review` goes to PR-Agent as extra review instructions.
+        if not CONFIG["pr_review"]["enabled"]:
             return None
         return {"mode": "pr_review", "kind": event, "repo": repo, "pr": target["number"],
                 "comment": comment["id"], "author": comment["user"]["login"],
+                "instructions": instruction[review.end():].strip(),
                 "key": f"{repo}:pr_review:command:{comment['id']}"}
     job = {"mode": "command", "kind": event, "repo": repo, "pr": target["number"],
            "comment": comment["id"], "author": comment["user"]["login"],
@@ -1138,12 +1142,12 @@ def check_proxy_model(model_ref: str, key: str) -> None:
     log("proxy_connected", model=model_ref)
 
 
-def pr_agent_env(home: str) -> dict[str, str]:
+def pr_agent_env(home: str, instructions: str = "") -> dict[str, str]:
     """Build PR-Agent's whole environment: the proxy model and nothing else, not even a GitHub token."""
     settings = CONFIG["pr_review"]
     provider, model = settings["model"].split("/", 1)
     base_url = CONFIG["omp_models"]["providers"][provider]["baseUrl"]
-    return {
+    env = {
         "PATH": os.environ["PATH"], "HOME": home,
         "OPENAI__KEY": os.environ["CLI_PROXY_API_KEY"],
         "OPENAI__API_BASE": base_url,
@@ -1168,6 +1172,11 @@ def pr_agent_env(home: str) -> dict[str, str]:
         # write the whole review to the output file in one piece.
         "PR_REVIEWER__PERSISTENT_COMMENT": "false",
     }
+    if instructions:
+        # PR-Agent's settings parse env values as TOML or dynaconf tokens like `@json`; a leading
+        # plain-text prefix keeps the commenter's words a literal string.
+        env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] = f"the commenter asked: {instructions}"
+    return env
 
 
 def checkout_pr_diff(repo: str, merge_base: str, head: str, checkout: Path) -> str:
@@ -1228,7 +1237,7 @@ def pr_review(job: dict[str, Any]) -> None:
             log("pr_review_empty", key=job["key"], head=head)
             return
         diff_file.write_text(diff)
-        env = pr_agent_env(home)
+        env = pr_agent_env(home, job.get("instructions", ""))
         log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
             model=model, thinking=CONFIG["pr_review"]["thinking"])
         started = time.monotonic()

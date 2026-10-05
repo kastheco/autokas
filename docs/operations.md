@@ -152,7 +152,7 @@ for PR-Agent reviews, after a deploy:
 1. open a small same-repo PR as ready, or move a draft to ready, in a repository with the App installed.
 2. observe `dispatched`, `routed`, `proxy_connected` with `pr_review.model`, `pr_review_started` and `pr_review_done` with the reviewed head in Modal logs, and exactly one `autokas[bot]` "PR Reviewer Guide" comment on the PR ending in `reviewed head <sha>`. a failure logs `pr_review_failed` with redacted output.
 3. push another commit and confirm no new review appears.
-4. comment `@autokas review` and confirm a fresh review for the current head. a user without `write` access gets `command_unauthorized` and no comment.
+4. comment `@autokas review` and confirm a fresh review for the current head. comment `@autokas review focus on error handling` and confirm the review follows that request. a user without `write` access gets `command_unauthorized` and no comment.
 
 `python -m unittest test_pr_review` covers trigger selection, skip rules, the command split, bot-loop safety, routing, access checks, head pinning before and after the review, the checkout's token and `pyproject.toml` handling, the PR-Agent environment and redaction without external calls.
 
