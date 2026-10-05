@@ -1810,7 +1810,7 @@ class PRWorker:
                     CLAIMS.put("command:" + job["key"], record)
                 pushed = final_head != head and remote_head == final_head
                 if labeled:
-                    reported = outcome_file.read_text().strip().lower() if outcome_file.is_file() else ""
+                    reported = outcome_file.read_text(encoding="utf-8", errors="replace").strip().lower() if outcome_file.is_file() else ""
                     set_fix_label(repo, number, fix_state(code, pushed, reported), job["key"])
                     labeled = False
                 if job.get("reviewer") == "pr_agent" and pushed:

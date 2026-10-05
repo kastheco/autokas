@@ -408,7 +408,9 @@ class PRReviewRunTests(unittest.TestCase):
         cases = (("pushed", 0, True, None, "fixed"), ("already handled", 0, False, "already handled", "fixed"),
                  ("rejected", 0, False, "rejected", "rejected"), ("pushed but blocked", 0, True, "blocked", "blocked"),
                  ("claims a push that didn't land", 0, False, "published", "blocked"),
-                 ("omp failed", 1, True, None, "blocked"))
+                 ("omp failed", 1, True, None, "blocked"),
+                 ("malformed outcome after push", 0, True, b"\xff\n", "fixed"),
+                 ("malformed outcome without push", 0, False, b"\xff\n", "blocked"))
         for name, code, push, reported, label in cases:
             with self.subTest(name):
                 pulls = iter([PR, {**PR, "head": {**PR["head"], "sha": pushed if push else HEAD}}])
@@ -424,7 +426,11 @@ class PRReviewRunTests(unittest.TestCase):
                     policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
                     context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
                     if reported:
-                        Path(context["outcome_file"]).write_text(reported + "\n")
+                        outcome_file = Path(context["outcome_file"])
+                        if isinstance(reported, bytes):
+                            outcome_file.write_bytes(reported)
+                        else:
+                            outcome_file.write_text(reported + "\n")
                     return Mock(pid=1, wait=Mock(return_value=code))
 
                 labels = []
@@ -436,7 +442,7 @@ class PRReviewRunTests(unittest.TestCase):
                       patch.object(runner.subprocess, "run", side_effect=run),
                       patch.object(runner.subprocess, "Popen", side_effect=omp),
                       patch.object(runner.os, "killpg"),
-                      patch.object(runner, "dispatch"),
+                      patch.object(runner, "dispatch") as dispatch,
                       patch.object(runner, "set_fix_label", side_effect=lambda repo, pr, state, key: labels.append(state))):
                     if code:
                         with self.assertRaises(RuntimeError):
@@ -444,6 +450,11 @@ class PRReviewRunTests(unittest.TestCase):
                     else:
                         runner.PRWorker(pr_key=f"{REPO}#42").run.local(copy.deepcopy(fix))
                 self.assertEqual(labels, ["fixing", label])
+                if push:
+                    [follow_up] = [call.args[0] for call in dispatch.call_args_list]
+                    self.assertEqual((follow_up["mode"], follow_up["head"]), ("pr_review", pushed))
+                else:
+                    dispatch.assert_not_called()
 
     def test_fix_label_replaces_only_other_fix_labels(self):
         calls = []
