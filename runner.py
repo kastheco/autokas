@@ -707,7 +707,7 @@ def request_bugbot_rereview(repo: str, number: int, head: str) -> None:
     runs = github(f"repos/{repo}/commits/{head}/check-runs?check_name={urllib.parse.quote('Cursor Bugbot')}")
     if not runs.get("check_runs"):
         return
-    github_request("POST", f"repos/{repo}/issues/{number}/comments", {"body": "@cursor review"})
+    github_request("POST", f"repos/{repo}/issues/{number}/comments", {"body": "cursor review"})
     log("bugbot_rereview_requested", repo=repo, pr=number)
 
 
