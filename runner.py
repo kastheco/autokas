@@ -233,8 +233,11 @@ missing, paginate the PR's review comments and find that same own-account marker
 and source. Never edit another author's comment or a different finding's status.
 Read back an uncertain PATCH rather than blindly repeating it. If the status
 cannot be found or confirmed, report that limit in the overall PR outcome.
-For a job without inline targets, update its existing conversation acknowledgment
-in the same way, checking its issue relationship instead of in_reply_to_id.
+For a job without inline targets, its acknowledgment is a PR conversation comment.
+Check its issue relationship instead of in_reply_to_id, then replace its body with
+the full overall outcome described below, keeping its marker. That edited comment is
+the single overall PR outcome, so don't post another one. Only if that
+acknowledgment cannot be found or confirmed, post the outcome as a new comment.
 Do not create another queued comment. The dispatcher already owns queue reporting.
 Only report a fix after commit, push and remote-head confirmation. Then update
 the inline statuses, post the single overall PR outcome described below, and
@@ -258,8 +261,9 @@ update already-handled statuses and continue with the remaining findings. Report
 only their outcome, without another obsolete report for handled findings.
 Do not silence findings that are merely obsolete, fixed without a verified earlier
 runner outcome, blocked, or uncertain.
-Except for that verified already-handled exit, before every normal exit post one
-concise outcome comment on this job's PR using
+Except for that verified already-handled exit and the edited conversation
+acknowledgment above, before every normal exit post one concise outcome comment
+on this job's PR using
 gh pr comment <pr> --repo <repo> --body-file - with your own summary on stdin.
 Include trusted modal_run_links as Markdown links in the overall outcome and every
 acknowledgment update. Preserve the dispatcher link and add the coding run link.
