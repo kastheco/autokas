@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
@@ -296,7 +298,10 @@ If resolution fails or remains uncertain, update the existing overall PR outcome
 with that limit instead of adding another PR comment or claiming success.
 Finish with the same clear outcome in your final output: published, rejected, blocked,
 uncertain or already handled, plus the confirmed existing or new comment URL when
-available. Then exit.
+available. When the trusted job context has outcome_file, also write exactly that
+outcome, nothing else, to that path. For mixed outcomes write the one that most needs
+the owner: blocked or uncertain over rejected over already handled over published.
+Then exit.
 """
 COMMAND_POLICY = """This job is an @autokas command, not a review-bot finding. Where the
 PR-fix policy below differs, these command rules win.
@@ -822,6 +827,84 @@ def github(path: str) -> Any:
     return github_request("GET", path)
 
 
+REVIEW_CHECK = "autokas review"
+
+
+def start_review_check(repo: str, head: str, key: str) -> int | None:
+    """Open the review's check run on the exact head it reviews. a check-API failure never stops the review."""
+    try:
+        check = github_request("POST", f"repos/{repo}/check-runs", {
+            "name": REVIEW_CHECK, "head_sha": head, "status": "in_progress", "external_id": key[:200]})
+    except Exception as error:
+        log("check_uncertain", key=key, reason=type(error).__name__)
+        return None
+    return check["id"]
+
+
+def finish_review_check(repo: str, check: int | None, key: str, conclusion: str, title: str,
+                        details_url: str | None = None) -> None:
+    if check is None:
+        return
+    payload: dict[str, Any] = {"status": "completed", "conclusion": conclusion,
+                               "output": {"title": title, "summary": title}}
+    if details_url:
+        payload["details_url"] = details_url
+    try:
+        github_request("PATCH", f"repos/{repo}/check-runs/{check}", payload)
+    except Exception as error:
+        log("check_uncertain", key=key, reason=type(error).__name__)
+
+
+def review_conclusion(findings: list[dict[str, Any]]) -> tuple[str, str]:
+    """Fail the check on the findings that start a fix: those at or above `fix_severity`."""
+    severities = [finding["severity"] for finding in findings]
+    counts = ", ".join(f"{severities.count(level)} {level}" for level in SEVERITIES if level in severities)
+    threshold = CONFIG["pr_review"].get("fix_severity")
+    if threshold in SEVERITIES and any(level in SEVERITIES[:SEVERITIES.index(threshold) + 1] for level in severities):
+        return "failure", f"{counts}, fix threshold {threshold}"
+    return "success", counts or "no findings"
+
+
+# one label per PR for the latest finding job's outcome. setting one removes the others.
+FIX_LABELS = {
+    "fixing": ("fbca04", "autokas is working on review findings"),
+    "fixed": ("0e8a16", "autokas pushed a fix for the latest findings"),
+    "rejected": ("c5def5", "autokas checked the latest findings and changed nothing"),
+    "blocked": ("d93f0b", "autokas couldn't finish the latest findings, read its outcome"),
+}
+
+
+def set_fix_label(repo: str, number: int, state: str, key: str) -> None:
+    """Replace this PR's autokas fix label. a label-API failure never stops or fails the job."""
+    name = f"autokas:{state}"
+    color, description = FIX_LABELS[state]
+    try:
+        try:
+            github_request("POST", f"repos/{repo}/labels", {"name": name, "color": color, "description": description})
+        except urllib.error.HTTPError as error:
+            if error.code != 422:  # already exists
+                raise
+        labels = github_request("POST", f"repos/{repo}/issues/{number}/labels", {"labels": [name]})
+        for label in labels:
+            other = label.get("name", "")
+            if other != name and other.startswith("autokas:") and other[len("autokas:"):] in FIX_LABELS:
+                github_request("DELETE", f"repos/{repo}/issues/{number}/labels/{urllib.parse.quote(other, safe='')}")
+    except Exception as error:
+        log("label_uncertain", key=key, label=name, reason=type(error).__name__)
+        return
+    log("label_set", key=key, label=name)
+
+
+def fix_state(code: int, pushed: bool, reported: str) -> str:
+    """Map omp's exit, the confirmed push and its reported outcome to one label. anything unclear is blocked."""
+    if code == 0 and reported not in {"blocked", "uncertain"}:
+        if pushed or reported == "already handled":
+            return "fixed"
+        if reported == "rejected":
+            return "rejected"
+    return "blocked"
+
+
 def review_job(job: dict[str, Any], pr: dict[str, Any]) -> dict[str, Any] | None:
     """Map either review delivery to one batch of the review's exact findings."""
     repo, number = job["repo"], job["pr"]
@@ -1335,44 +1418,52 @@ def pr_review(job: dict[str, Any]) -> None:
     if pr["head"]["sha"] != head:
         log("review_outdated", key=job["key"])
         return
-    model = CONFIG["pr_review"]["model"]
-    check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
-    merge_base = github(f"repos/{repo}/compare/{pr['base']['sha']}...{head}?per_page=1")["merge_base_commit"]["sha"]
-    with tempfile.TemporaryDirectory(prefix="pr-agent-") as home:
-        checkout, diff_file = Path(home, "repo"), Path(home, "pr.diff")
-        output, structured = Path(home, "review.md"), Path(home, "review.json")
-        diff = checkout_pr_diff(repo, merge_base, head, checkout)
-        if not diff.strip():
-            log("pr_review_empty", key=job["key"], head=head)
+    check = start_review_check(repo, head, job["key"])
+    try:
+        model = CONFIG["pr_review"]["model"]
+        check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
+        merge_base = github(f"repos/{repo}/compare/{pr['base']['sha']}...{head}?per_page=1")["merge_base_commit"]["sha"]
+        with tempfile.TemporaryDirectory(prefix="pr-agent-") as home:
+            checkout, diff_file = Path(home, "repo"), Path(home, "pr.diff")
+            output, structured = Path(home, "review.md"), Path(home, "review.json")
+            diff = checkout_pr_diff(repo, merge_base, head, checkout)
+            if not diff.strip():
+                log("pr_review_empty", key=job["key"], head=head)
+                finish_review_check(repo, check, job["key"], "skipped", "no diff to review")
+                return
+            diff_file.write_text(diff)
+            env = pr_agent_env(home, job.get("instructions", ""))
+            log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
+                model=model, thinking=CONFIG["pr_review"]["thinking"], round=job.get("round", 1))
+            started = time.monotonic()
+            try:
+                # plain-diff mode inside the checkout: full file context for the exact head, no GitHub access.
+                result = subprocess.run(
+                    [sys.executable, "-m", "pr_agent.cli", "--diff-file", str(diff_file), "--output", str(output),
+                     "--json-output", str(structured), "review"],
+                    cwd=checkout, env=env, capture_output=True, text=True, timeout=240,
+                )
+            except subprocess.TimeoutExpired:
+                log("pr_review_failed", key=job["key"], model=model, reason="timeout")
+                raise RuntimeError("PR-Agent review timed out") from None
+            review = output.read_text().strip() if output.is_file() else ""
+            if result.returncode or not review or not structured.is_file():
+                detail = redact((result.stdout + result.stderr).strip(), (env["OPENAI__KEY"],))
+                log("pr_review_failed", key=job["key"], model=model, code=result.returncode, detail=detail[-2000:])
+                raise RuntimeError(f"PR-Agent exited with {result.returncode} and {len(review)} review characters")
+            findings = pr_agent_findings(json.loads(structured.read_text()))
+        current = github(f"repos/{repo}/pulls/{number}")
+        if current["state"] != "open" or current["head"]["sha"] != head:
+            log("review_outdated", key=job["key"], head=head)
+            finish_review_check(repo, check, job["key"], "cancelled", "the PR head moved during the review")
             return
-        diff_file.write_text(diff)
-        env = pr_agent_env(home, job.get("instructions", ""))
-        log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
-            model=model, thinking=CONFIG["pr_review"]["thinking"], round=job.get("round", 1))
-        started = time.monotonic()
-        try:
-            # plain-diff mode inside the checkout: full file context for the exact head, no GitHub access.
-            result = subprocess.run(
-                [sys.executable, "-m", "pr_agent.cli", "--diff-file", str(diff_file), "--output", str(output),
-                 "--json-output", str(structured), "review"],
-                cwd=checkout, env=env, capture_output=True, text=True, timeout=240,
-            )
-        except subprocess.TimeoutExpired:
-            log("pr_review_failed", key=job["key"], model=model, reason="timeout")
-            raise RuntimeError("PR-Agent review timed out") from None
-        review = output.read_text().strip() if output.is_file() else ""
-        if result.returncode or not review or not structured.is_file():
-            detail = redact((result.stdout + result.stderr).strip(), (env["OPENAI__KEY"],))
-            log("pr_review_failed", key=job["key"], model=model, code=result.returncode, detail=detail[-2000:])
-            raise RuntimeError(f"PR-Agent exited with {result.returncode} and {len(review)} review characters")
-        findings = pr_agent_findings(json.loads(structured.read_text()))
-    current = github(f"repos/{repo}/pulls/{number}")
-    if current["state"] != "open" or current["head"]["sha"] != head:
-        log("review_outdated", key=job["key"], head=head)
-        return
-    round_ = job.get("round", 1)
-    comment = github_request("POST", f"repos/{repo}/issues/{number}/comments", {
-        "body": pr_agent_comment(review, head, round_, findings)})
+        round_ = job.get("round", 1)
+        comment = github_request("POST", f"repos/{repo}/issues/{number}/comments", {
+            "body": pr_agent_comment(review, head, round_, findings)})
+    except Exception:
+        finish_review_check(repo, check, job["key"], "neutral", "the review didn't finish")
+        raise
+    finish_review_check(repo, check, job["key"], *review_conclusion(findings), details_url=comment.get("html_url"))
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
     # the only PR-Agent fix intake: webhook and reconcile deliveries of autokas[bot] comments never start one.
@@ -1582,6 +1673,7 @@ class PRWorker:
                     raise RuntimeError(f"{args[0]} {args[1]} failed ({result.returncode}): {detail[-2000:]}")
                 return result.stdout.strip()
 
+            labeled = False
             try:
                 check_proxy_model(execution["model"], env["CLI_PROXY_API_KEY"])
                 run(["gh", "auth", "setup-git"])
@@ -1654,8 +1746,11 @@ class PRWorker:
                                         "acknowledgment": target.get("acknowledgment"),
                                         "acknowledgment_marker": "<!-- omp-runner:queued:" + hashlib.sha256(target["key"].encode()).hexdigest() + " -->"}
                                        for target in job.get("targets", [])]}
+                outcome_file = root / "outcome.txt"
                 if job.get("mode") == "command":
                     context["command_commit_trailer"] = "Autokas-Command: " + hashlib.sha256(job["key"].encode()).hexdigest()
+                else:
+                    context["outcome_file"] = str(outcome_file)
                 if command_resume is not None:
                     context["command_resume"] = command_resume
                 policy.write_text((COMMAND_POLICY if job.get("mode") == "command" else "") + POLICY
@@ -1682,6 +1777,9 @@ class PRWorker:
                         "state": "executing", "starting_head": head,
                         "branch": f"autokas/issue-{number}" if job.get("target") == "issue" else branch,
                     })
+                if job.get("mode") != "command":
+                    set_fix_label(repo, number, "fixing", job["key"])
+                    labeled = True
                 process = subprocess.Popen(args, cwd=worktree, env=env, start_new_session=True)
                 try:
                     code = process.wait(timeout=max(1, deadline - time.monotonic()))
@@ -1710,10 +1808,17 @@ class PRWorker:
                     elif code == 0 and final_head == head and remote_head == head:
                         record["state"] = "completed"
                     CLAIMS.put("command:" + job["key"], record)
-                if job.get("reviewer") == "pr_agent" and final_head != head and remote_head == final_head:
+                pushed = final_head != head and remote_head == final_head
+                if labeled:
+                    reported = outcome_file.read_text().strip().lower() if outcome_file.is_file() else ""
+                    set_fix_label(repo, number, fix_state(code, pushed, reported), job["key"])
+                    labeled = False
+                if job.get("reviewer") == "pr_agent" and pushed:
                     dispatch(next_review_job(repo, number, comment.get("body") or "", final_head))
                 if code:
                     raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
             except Exception as error:
+                if labeled:
+                    set_fix_label(job["repo"], job["pr"], "blocked", job["key"])
                 log("stopped", repo=job["repo"], pr=job["pr"], reason=str(error))
                 raise

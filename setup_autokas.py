@@ -22,6 +22,7 @@ PERMISSIONS = {
     "workflows": "write",
     "pull_requests": "write",
     "issues": "write",
+    "checks": "write",
 }
 
 

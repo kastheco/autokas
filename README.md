@@ -35,6 +35,24 @@ the review runs in its own small Modal function with the pinned `pr_review.pr_ag
 
 each finding in a review is tagged `[P0]` to `[P3]`: P0 is a security hole, data loss or an outage, P1 a bug in normal use, P2 a bug under specific inputs or conditions, and P3 maintainability, style or a speculative concern. an untagged finding counts as P2. when a review has findings at or above `pr_review.fix_severity` (default `P2`), autokas queues one fix job for them through the same path as CodeRabbit and Bugbot findings, with a queued status linking the review. if that fix pushes a commit, autokas reviews the new head, and the next round's findings get the next fix. a review with nothing at or above the threshold, a fix that pushes nothing, a push from someone else during a round, or reaching `pr_review.max_fix_rounds` (default 3 fix runs) ends the loop. the last review is still posted. set `fix_severity` to `null` to keep reviews and turn off the fixes. PRs marked `autokas:ignore` and generated docs PRs get no automatic fixes, even when `@autokas review` reviewed them.
 
+### status on the PR
+
+each PR-Agent review also runs as an `autokas review` check on the head it reviewed, so it shows next to CI and goes stale on the next push like any other check. it fails when the review has findings at or above `pr_review.fix_severity`, the same ones that start a fix, and passes otherwise. its title counts the findings by severity and its details link to the review comment. a review that stops early ends as `skipped` (empty diff), `cancelled` (the head moved) or `neutral` (PR-Agent failed).
+
+fix jobs for CodeRabbit, Bugbot and PR-Agent findings set one label for the latest job's outcome, replacing any earlier one: `autokas:fixing` while omp runs, then `autokas:fixed` (a fix was pushed, or an earlier job already handled the findings), `autokas:rejected` (the findings didn't warrant a change) or `autokas:blocked` (omp failed, got blocked, or couldn't confirm its push). the label follows the latest job, not the head, so read it next to the check. `@autokas` commands and docs jobs don't set labels.
+
+that's enough for gh-dash sections, for example:
+
+```yaml
+prSections:
+  - title: autokas blocked
+    filters: is:open author:@me label:autokas:blocked
+  - title: autokas fixing
+    filters: is:open author:@me label:autokas:fixing
+  - title: ready
+    filters: is:open author:@me -label:autokas:fixing -label:autokas:blocked status:success
+```
+
 ## @autokas commands
 
 you don't have to wait for CodeRabbit. start a GitHub comment with `@autokas` and an instruction, and autokas runs it as its own job.
