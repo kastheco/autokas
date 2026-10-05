@@ -33,6 +33,8 @@ autokas posts one PR-Agent `/review` comment as `autokas[bot]` on a same-repo PR
 
 the review runs in its own small Modal function with the pinned `pr_review.pr_agent_version`, not in the omp coding container. autokas checks out the exact queued head and hands PR-Agent only the diff from the merge base, with that checkout for file context, so PR-Agent never gets a GitHub token. it calls `pr_review.model` through the same CLIProxyAPI service with no fallback model. autokas posts the result as one comment, and only if the PR is still on the reviewed head. a push during the review means nothing is posted. it never pushes, commits, labels or resolves threads. PR-Agent doesn't see the PR title, description or commit messages, and repository `.pr_agent.toml` files are ignored.
 
+each finding in a review is tagged `[P0]` to `[P3]`: P0 is a security hole, data loss or an outage, P1 a bug in normal use, P2 a bug under specific inputs or conditions, and P3 maintainability, style or a speculative concern. an untagged finding counts as P2. when a review has findings at or above `pr_review.fix_severity` (default `P2`), autokas queues one fix job for them through the same path as CodeRabbit and Bugbot findings, with a queued status linking the review. if that fix pushes a commit, autokas reviews the new head, and the next round's findings get the next fix. a review with nothing at or above the threshold, a fix that pushes nothing, a push from someone else during a round, or reaching `pr_review.max_fix_rounds` (default 3 fix runs) ends the loop. the last review is still posted. set `fix_severity` to `null` to keep reviews and turn off the fixes. PRs marked `autokas:ignore` and generated docs PRs get no automatic fixes, even when `@autokas review` reviewed them.
+
 ## @autokas commands
 
 you don't have to wait for CodeRabbit. start a GitHub comment with `@autokas` and an instruction, and autokas runs it as its own job.
@@ -42,7 +44,7 @@ you don't have to wait for CodeRabbit. start a GitHub comment with `@autokas` an
 - only users with `write` or `admin` access on the repo can trigger it. other people's comments are ignored.
 - each comment runs once. editing a comment doesn't rerun it, so post a new comment for a follow-up.
 - commands still run on PRs marked `autokas:ignore` and on generated docs PRs.
-- a PR command that starts with the word `review` posts a fresh PR-Agent review of the current head instead of starting a coding job. anything after `review` goes to PR-Agent as extra instructions, so `@autokas review focus on the auth changes` steers it. it works on drafts too. a review never edits code, so `@autokas review the parser and fix it` only reviews. ask for the fix as its own command, like `@autokas fix the parser`. on an issue, `review` is an ordinary command.
+- a PR command that starts with the word `review` posts a fresh PR-Agent review of the current head instead of starting a coding job, and its findings start the fix loop above. anything after `review` goes to PR-Agent as extra instructions, so `@autokas review focus on the auth changes` steers it. it works on drafts too. on an issue, `review` is an ordinary command.
 
 ```text
 @autokas the date filter drops the last day of the range, fix it and add a test
