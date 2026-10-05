@@ -16,6 +16,12 @@
     "login": "cursor[bot]",
     "id": 206951365
   },
+  "pr_review": {
+    "enabled": false,
+    "pr_agent_version": "0.47.0",
+    "model": "railway-codex/gpt-6-luna",
+    "thinking": "medium"
+  },
   "timeout_seconds": 3600,
   "omp_version": "18.4.10",
   "bun_version": "1.4.2",

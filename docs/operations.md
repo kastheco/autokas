@@ -4,7 +4,7 @@ long-form operating notes for the runner, moved out of the readme unchanged. the
 
 CodeRabbit or Cursor Bugbot comment → signed Modal webhook → configured omp in the event's PR worktree → checks, commit, ordinary push → exit.
 
-scope is deliberately narrow. `runner.py` dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, review service, scheduler, database, recovery loop or archive.
+scope is deliberately narrow. `runner.py` dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, scheduler, database, recovery loop or archive. the only review autokas writes itself is one PR-Agent `/review` comment per ready PR, or per `@autokas review` command, sent through the same proxy. there is no other review logic.
 
 ## current state
 
@@ -40,6 +40,7 @@ copy `config.example.json` to `config.json` and fill in your webhook URL, provid
 the deploy workflow builds production `config.json` from the tracked `config.example.json` and takes only the private keys from the `AUTOKAS_CONFIG_JSON` secret: `docs_update`, `jarvis_owner`, `jarvis_url`, `omp_models` and `owner_approvals`. versions, tools, top-level model selections, `omp_settings` and every other public setting change through a normal PR to `config.example.json`, never through the secret. `omp_models` is supplied by `AUTOKAS_CONFIG_JSON` and can override the tracked value. other keys in the secret are ignored.
 
 - coding jobs use `railway-codex/gpt-6.1-sol`, high reasoning and requested priority service. docs jobs use `railway-codex/gpt-6-luna`, medium reasoning and default service. both use CLIProxyAPI's Responses API. native omp flags set the model, reasoning effort and service tier explicitly. all model roles follow the selected job profile. model fallback and automatic agent retries are disabled.
+- PR-Agent reviews use `pr_review` in `config.example.json`: `enabled` (default `false`), the pinned `pr_agent_version`, `model` (`railway-codex/gpt-6-luna`) and `thinking` (`medium`). the `pr_review` Modal function runs in its own small Python image (0.25 CPU, 512 MiB, five-minute timeout, no retries) and never starts a coding container. it builds PR-Agent's whole environment from scratch: the App installation token, `CLI_PROXY_API_KEY`, the provider's `baseUrl` and the model through the proxy's chat completions endpoint. it sets no fallback model, no temperature (the proxy rejects it while reasoning is on), `propagate_tool_errors` so failures exit non-zero, no repository or global `.pr_agent.toml`, a new comment per run and no review labels. Jarvis settings are never passed in.
 - omp: `18.4.10`, Bun: `1.4.2`. the image includes Node 22, Corepack, git, gh and build tools. target dependencies are installed by omp using the repository's own instructions.
 - runner commits use `autokas[bot] <334744567+autokas[bot]@users.noreply.github.com>` as both author and committer. the numeric ID and login match the GitHub bot account, so GitHub can attribute commits independently of the push credential. every commit must follow Conventional Commits 1.0.0, such as `fix(auth): preserve the session on refresh`, even if repository examples use another format. GitHub API calls, comments, review replies, thread resolution and pushes use the `autokas` GitHub App installation token. the App is owned by `kastheco`; its private key, App ID and installation ID stay in the Modal `omp-runner-worker` secret. the required repository permissions are contents read/write, workflows read/write, pull requests read/write and issues read/write.
 - tools: read, bash, edit, write, grep, glob, lsp and todo. extension discovery is disabled. normal repository instructions remain available.
@@ -145,6 +146,15 @@ add and verify a replacement account before changing the default. select its nat
 5. exercise the core business-intent rule through this same path. missing real required consultation is a dependency blocker. a business-intent conflict requires the owner's explicit override. technical disagreement must lead to an improved implementation, not another owner-approval request.
 
 repeat the same path after an update or provider switch, and with a later fresh job to prove credentials survive without another login. no workstation tunnel or old runner may be required. `python -m unittest test_runner` covers review intake, identity and relationship boundaries, review state, prompt selection, and docs follow-up merge safety without external calls.
+
+for PR-Agent reviews, after `pr_review.enabled` is deployed:
+
+1. open a small same-repo PR as ready, or move a draft to ready, in a repository with the App installed.
+2. observe `dispatched`, `routed`, `proxy_connected` with `pr_review.model`, `pr_review_started` and `pr_review_done` in Modal logs, and exactly one `autokas[bot]` "PR Reviewer Guide" comment on the PR. a failure logs `pr_review_failed` with redacted output.
+3. push another commit and confirm no new review appears.
+4. comment `@autokas review` and confirm a fresh review for the current head. a user without `write` access gets `command_unauthorized` and no comment.
+
+`python -m unittest test_pr_review` covers trigger selection, skip rules, the command split, bot-loop safety, routing, access checks, head checks, the subprocess environment and redaction without external calls.
 
 docs updates skip merged source PRs whose changed files are all inside the configured documentation folders. an empty file list also skips the agent. code-only and mixed source changes continue to the docs agent, which may edit only those configured folders. `python -m unittest test_runner.DocsMergeTests` covers this routing, including folder-name lookalikes such as `docs-extra/` and `src/docs/` that aren't inside a configured `docs` folder.
 

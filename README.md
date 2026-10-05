@@ -14,7 +14,7 @@
 
 autokas fixes CodeRabbit and Cursor Bugbot review findings without anyone sitting at a keyboard. a signed GitHub webhook lands on Modal, a configured omp agent checks out the pull request in a disposable container, runs the repo's checks, commits, pushes to the PR branch and exits.
 
-the runner dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, review service, scheduler, database or recovery loop.
+the runner dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, scheduler, database or recovery loop. the one review autokas writes itself comes from PR-Agent, described below.
 
 ## how a job runs
 
@@ -27,6 +27,12 @@ the runner dispatches the job, not the agent's working process. omp owns investi
 
 Bugbot review summaries and issue comments don't start finding jobs, even when they contain marked finding text. a Bugbot review batch uses only its collected inline findings as the agent prompt. CodeRabbit keeps its review-prompt-first behavior, falling back to joined inline prompts when the review has none.
 
+### PR-Agent reviews
+
+when `pr_review.enabled` is true in the config, autokas posts one PR-Agent `/review` comment as `autokas[bot]` on a same-repo PR when it's opened as ready, or when it moves from draft to ready. later pushes don't trigger another review. drafts, closed PRs, fork heads, generated docs PRs and PRs marked `autokas:ignore` are skipped.
+
+the review runs in its own small Modal function with the pinned `pr_review.pr_agent_version`, not in the omp coding container. it calls `pr_review.model` through the same CLIProxyAPI service with no fallback model, and uses the repo's App installation token. it posts one comment and never pushes, commits, labels or resolves threads. repository `.pr_agent.toml` files are ignored.
+
 ## @autokas commands
 
 you don't have to wait for CodeRabbit. start a GitHub comment with `@autokas` and an instruction, and autokas runs it as its own job.
@@ -36,6 +42,7 @@ you don't have to wait for CodeRabbit. start a GitHub comment with `@autokas` an
 - only users with `write` or `admin` access on the repo can trigger it. other people's comments are ignored.
 - each comment runs once. editing a comment doesn't rerun it, so post a new comment for a follow-up.
 - commands still run on PRs marked `autokas:ignore` and on generated docs PRs.
+- `@autokas review` on a PR, and nothing after it, posts a fresh PR-Agent review of the current head instead of starting a coding job. it works on drafts too. anything longer, like `@autokas review the parser and fix it`, is an ordinary command.
 
 ```text
 @autokas the date filter drops the last day of the range, fix it and add a test

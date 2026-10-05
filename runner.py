@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -72,8 +73,18 @@ def github_token(repo: str) -> str:
     return token
 
 
+def with_runner_files(image: modal.Image) -> modal.Image:
+    """Mount every file runner.py reads or hashes at import."""
+    return (
+        image.add_local_file(ROOT / "config.json", "/root/config.json")
+        .add_local_file(ROOT / "consult.py", "/root/consult.py")
+        .add_local_file(ROOT / "kas-voice-profile.md", "/root/kas-voice-profile.md")
+        .add_local_dir(ROOT / "skills", "/root/skills")
+    )
+
+
 BASE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi==0.135.1")
-IMAGE = (
+IMAGE = with_runner_files(
     modal.Image.from_registry("node:22.22.0-bookworm-slim", add_python="3.12")
     .pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1")
     .apt_install("git", "gh", "curl", "unzip", "ca-certificates", "build-essential")
@@ -84,10 +95,10 @@ IMAGE = (
         "npm install --global corepack && corepack enable",
     )
     .env({"PATH": "/opt/bun/bin:/usr/local/bin:/usr/bin:/bin", "BUN_INSTALL": "/opt/bun"})
-    .add_local_file(ROOT / "config.json", "/root/config.json")
-    .add_local_file(ROOT / "consult.py", "/root/consult.py")
-    .add_local_file(ROOT / "kas-voice-profile.md", "/root/kas-voice-profile.md")
-    .add_local_dir(ROOT / "skills", "/root/skills")
+)
+# PR-Agent brings its own fastapi and PyJWT; keep it out of the omp coding image.
+PR_AGENT_IMAGE = with_runner_files(
+    modal.Image.debian_slim(python_version="3.12").pip_install(f"pr-agent=={CONFIG['pr_review']['pr_agent_version']}")
 )
 
 PROMPT_SECTION = re.compile(
@@ -388,15 +399,49 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         return None
     repo = payload["repository"]["full_name"]
     target = payload["issue"] if event == "issue_comment" else payload["pull_request"]
+    target_kind = "issue" if event == "issue_comment" and "pull_request" not in target else "pr"
+    if instruction.lower() == "review":
+        # `@autokas review` asks for a PR-Agent review, never an omp coding job.
+        if target_kind != "pr" or not CONFIG["pr_review"]["enabled"]:
+            return None
+        return {"mode": "pr_review", "kind": event, "repo": repo, "pr": target["number"],
+                "comment": comment["id"], "author": comment["user"]["login"],
+                "key": f"{repo}:pr_review:command:{comment['id']}"}
     job = {"mode": "command", "kind": event, "repo": repo, "pr": target["number"],
            "comment": comment["id"], "author": comment["user"]["login"],
            "source_url": comment["html_url"], "prompt": instruction,
-           "target": "issue" if event == "issue_comment" and "pull_request" not in target else "pr",
+           "target": target_kind,
            "key": f"{repo}:command:{comment['id']}"}
     if event == "pull_request_review_comment":
         # GitHub rejects replies to replies, so the queued reply goes to the thread root.
         job["reply_to"] = comment.get("in_reply_to_id") or comment["id"]
     return job
+
+
+def review_event_job(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Accept one PR-Agent review when a same-repo PR becomes ready, never on later pushes."""
+    if not CONFIG["pr_review"]["enabled"]:
+        return None
+    action = payload.get("action")
+    repo = payload.get("repository", {}).get("full_name")
+    pr = payload.get("pull_request", {})
+    if action not in {"opened", "ready_for_review"} or not isinstance(repo, str) or not isinstance(pr, dict):
+        return None
+    base, head = pr.get("base", {}), pr.get("head", {})
+    if not isinstance(base, dict) or not isinstance(head, dict):
+        return None
+    number, head_sha = pr.get("number"), head.get("sha")
+    if (
+        pr.get("state") != "open" or pr.get("draft") is not False
+        or base.get("repo", {}).get("full_name") != repo
+        or head.get("repo", {}).get("full_name") != repo
+        or type(number) is not int or number <= 0
+        or not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha)
+        or generated_docs_pr(pr) or autokas_ignored(pr)
+    ):
+        return None
+    return {"mode": "pr_review", "kind": "pull_request", "repo": repo, "pr": number, "head": head_sha,
+            "key": f"{repo}:pr_review:{number}:{head_sha}"}
 
 
 def docs_event_job(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -515,7 +560,7 @@ def reviewer_of(user: dict[str, Any]) -> str | None:
 def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     """Dispatch docs merges separately while preserving review-bot intake."""
     if event == "pull_request":
-        return docs_event_job(payload)
+        return docs_event_job(payload) or review_event_job(payload)
     command = command_job(event, payload)
     if command is not None:
         return command
@@ -569,13 +614,7 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 
-@app.function(
-    image=BASE_IMAGE.add_local_file(ROOT / "config.json", "/root/config.json")
-    .add_local_file(ROOT / "consult.py", "/root/consult.py")
-    .add_local_file(ROOT / "kas-voice-profile.md", "/root/kas-voice-profile.md")
-    .add_local_dir(ROOT / "skills", "/root/skills"),
-    secrets=[WEBHOOK_SECRET], timeout=30,
-)
+@app.function(image=with_runner_files(BASE_IMAGE), secrets=[WEBHOOK_SECRET], timeout=30)
 @modal.fastapi_endpoint(method="POST")
 async def webhook(request: Request) -> JSONResponse:
     """Authenticate the original bytes, claim once, and dispatch one worker."""
@@ -1077,10 +1116,112 @@ def docs_worker(
         return
     raise RuntimeError("docs base kept moving after two reconciliations")
 
+
+def redact(text: str, secrets: tuple[str, ...]) -> str:
+    """Remove every non-empty credential from text bound for logs."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    return text
+
+
+def check_proxy_model(model_ref: str, key: str) -> None:
+    """Fail before any agent work unless the proxy serves the configured model."""
+    provider, model = model_ref.split("/", 1)
+    proxy_url = CONFIG["omp_models"]["providers"][provider]["baseUrl"]
+    request = urllib.request.Request(proxy_url.rstrip("/") + "/models", headers={"Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        if model not in {entry["id"] for entry in json.load(response)["data"]}:
+            raise RuntimeError("configured model is not available from the proxy")
+    log("proxy_connected", model=model_ref)
+
+
+def pr_agent_env(repo: str, home: str) -> dict[str, str]:
+    """Build PR-Agent's whole environment: proxy model, App token, publish one review, nothing else."""
+    settings = CONFIG["pr_review"]
+    provider, model = settings["model"].split("/", 1)
+    provider_config = CONFIG["omp_models"]["providers"][provider]
+    context = next(entry["contextWindow"] for entry in provider_config["models"] if entry["id"] == model)
+    return {
+        "PATH": os.environ["PATH"], "HOME": home,
+        "GITHUB__USER_TOKEN": github_token(repo),
+        "OPENAI__KEY": os.environ["CLI_PROXY_API_KEY"],
+        "OPENAI__API_BASE": provider_config["baseUrl"],
+        # litellm routes `openai/<id>` to the proxy's chat completions endpoint. no fallback model,
+        # so a proxy failure fails the review instead of silently reaching another provider.
+        "CONFIG__MODEL": f"openai/{model}",
+        "CONFIG__FALLBACK_MODELS": "[]",
+        "CONFIG__CUSTOM_MODEL_MAX_TOKENS": str(context),
+        "CONFIG__REASONING_EFFORT": settings["thinking"],
+        "CONFIG__ADDITIONAL_REASONING_EFFORT_MODELS": json.dumps([model]),
+        # the proxy's reasoning models reject temperature while reasoning is on.
+        "CONFIG__NO_TEMPERATURE_MODELS": json.dumps([model]),
+        "CONFIG__PUBLISH_OUTPUT": "true",
+        # without this, PR-Agent exits 0 after a failed review.
+        "CONFIG__PROPAGATE_TOOL_ERRORS": "true",
+        # repository .pr_agent.toml files can't redirect the model, key or endpoint.
+        "CONFIG__USE_REPO_SETTINGS_FILE": "false",
+        "CONFIG__USE_GLOBAL_SETTINGS_FILE": "false",
+        "CONFIG__LOG_LEVEL": "INFO",
+        # each run posts its own review comment and changes nothing else on the PR.
+        "PR_REVIEWER__PERSISTENT_COMMENT": "false",
+        "PR_REVIEWER__ENABLE_REVIEW_LABELS_SECURITY": "false",
+        "PR_REVIEWER__ENABLE_REVIEW_LABELS_EFFORT": "false",
+    }
+
+
+@app.function(image=PR_AGENT_IMAGE, secrets=[WORKER_SECRET], retries=0, timeout=300, cpu=0.25, memory=512)
+def pr_review(job: dict[str, Any]) -> None:
+    """Post one PR-Agent review as autokas[bot]. never pushes, commits or resolves threads."""
+    repo, number = job["repo"], job["pr"]
+    automatic = job["kind"] == "pull_request"
+    if not automatic:
+        access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
+        if access.get("permission") not in {"admin", "write"}:
+            log("command_unauthorized", key=job["key"])
+            return
+    pr = github(f"repos/{repo}/pulls/{number}")
+    # explicit commands may review drafts, ignored PRs and generated docs PRs, like other commands.
+    if (pr["state"] != "open" or pr["base"]["repo"]["full_name"] != repo or pr["head"]["repo"]["full_name"] != repo
+            or (automatic and (pr.get("draft") or generated_docs_pr(pr) or autokas_ignored(pr)))):
+        log("pr_not_eligible", key=job["key"])
+        return
+    if automatic and pr["head"]["sha"] != job["head"]:
+        log("review_outdated", key=job["key"])
+        return
+    model = CONFIG["pr_review"]["model"]
+    check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
+    with tempfile.TemporaryDirectory(prefix="pr-agent-") as home:
+        env = pr_agent_env(repo, home)
+        log("pr_review_started", repo=repo, pr=number, key=job["key"], head=pr["head"]["sha"],
+            model=model, thinking=CONFIG["pr_review"]["thinking"])
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pr_agent.cli", "--pr_url", f"https://github.com/{repo}/pull/{number}", "review"],
+                cwd=home, env=env, capture_output=True, text=True, timeout=240,
+            )
+        except subprocess.TimeoutExpired:
+            log("pr_review_failed", key=job["key"], model=model, reason="timeout")
+            raise RuntimeError("PR-Agent review timed out") from None
+        if result.returncode:
+            output = (result.stdout + result.stderr).strip()
+            log("pr_review_failed", key=job["key"], model=model, code=result.returncode,
+                detail=redact(output, (env["GITHUB__USER_TOKEN"], env["OPENAI__KEY"]))[-2000:])
+            raise RuntimeError(f"PR-Agent exited with {result.returncode}")
+    log("pr_review_done", repo=repo, pr=number, key=job["key"], model=model,
+        seconds=round(time.monotonic() - started))
+
+
 @app.function(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
               timeout=180, cpu=0.125, memory=256)
 def worker(job: dict[str, Any]) -> None:
     """Keep the durable intake queue while routing work to one pool per PR."""
+    if job.get("mode") == "pr_review":
+        # reviews post one comment from their own small image; they never start a coding container.
+        call = pr_review.spawn(job)
+        log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
+        return
     if job.get("mode") == "command":
         access = github(f"repos/{job['repo']}/collaborators/{job['author']}/permission")
         if access.get("permission") not in {"admin", "write"}:
@@ -1247,24 +1388,13 @@ class PRWorker:
                 result = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True,
                                         timeout=max(1, deadline - time.monotonic()))
                 if result.returncode:
-                    detail = result.stderr.strip()
-                    for secret in (env["GH_TOKEN"], env["CLI_PROXY_API_KEY"], env.get("JARVIS_RUNNER_TOKEN", "")):
-                        if secret:
-                            detail = detail.replace(secret, "[redacted]")
+                    detail = redact(result.stderr.strip(), (env["GH_TOKEN"], env["CLI_PROXY_API_KEY"],
+                                                            env.get("JARVIS_RUNNER_TOKEN", "")))
                     raise RuntimeError(f"{args[0]} {args[1]} failed ({result.returncode}): {detail[-2000:]}")
                 return result.stdout.strip()
 
             try:
-                provider, model = execution["model"].split("/", 1)
-                proxy_url = CONFIG["omp_models"]["providers"][provider]["baseUrl"]
-                request = urllib.request.Request(
-                    proxy_url.rstrip("/") + "/models",
-                    headers={"Authorization": f"Bearer {env['CLI_PROXY_API_KEY']}"},
-                )
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    if model not in {entry["id"] for entry in json.load(response)["data"]}:
-                        raise RuntimeError("configured model is not available from the proxy")
-                log("proxy_connected", model=execution["model"])
+                check_proxy_model(execution["model"], env["CLI_PROXY_API_KEY"])
                 run(["gh", "auth", "setup-git"])
                 if job.get("mode") == "docs_update":
                     docs_worker(job, root, env, run, deadline, settings)
