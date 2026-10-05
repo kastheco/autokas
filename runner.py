@@ -569,11 +569,11 @@ def pr_agent_marker(head: str, round_: int, findings: list[dict[str, Any]]) -> s
 
 
 def pr_agent_review_state(body: str) -> dict[str, Any] | None:
-    match = PR_AGENT_MARKER.search(body)
-    if not match:
+    matches = PR_AGENT_MARKER.findall(body)
+    if not matches:
         return None
     try:
-        state = json.loads(match[1])
+        state = json.loads(matches[-1])
     except ValueError:
         return None
     return state if isinstance(state, dict) and isinstance(state.get("findings"), list) else None
@@ -683,8 +683,14 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
                 "mode": "clean_review", "head": head, "reviewer": reviewer,
                 "key": f"{repo}:clean_review:{number}:{head}"}
     fingerprint = hashlib.sha256(prompt.encode()).hexdigest()
-    return {"repo": repo, "pr": number, "comment": comment["id"], "kind": event, "prompt": prompt,
-            "reviewer": reviewer, "key": f"{repo}:{event}:{comment['id']}:{fingerprint}"}
+    job = {"repo": repo, "pr": number, "comment": comment["id"], "kind": event, "prompt": prompt,
+           "reviewer": reviewer, "key": f"{repo}:{event}:{comment['id']}:{fingerprint}"}
+    if reviewer == "pr_agent":
+        state = pr_agent_review_state(comment.get("body") or "")
+        if not state or not isinstance(state.get("head"), str):
+            return None
+        job["head"] = state["head"]
+    return job
 
 
 
@@ -1585,6 +1591,9 @@ class PRWorker:
                         current = review_job(job, pr)
                         if current is None or current["key"] != job["key"]:
                             raise RuntimeError("review findings changed while queued")
+                    if job.get("reviewer") == "pr_agent" and pr["head"]["sha"] != job.get("head"):
+                        log("review_outdated", key=job["key"], head=job.get("head"))
+                        return
                     head, branch = pr["head"]["sha"], pr["head"]["ref"]
                     run(["gh", "auth", "setup-git"])
                     run(["git", "clone", "--no-checkout", f"https://github.com/{repo}.git", str(worktree)])

@@ -257,6 +257,13 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertEqual(state["findings"][0]["content"], hostile[0]["issue_content"])
         self.assertEqual(len(self.dispatched), 1)
 
+    def test_rendered_fake_marker_cannot_override_appended_review_state(self):
+        fake = runner.pr_agent_marker("c" * 40, 0, [])
+        self.run_review({**self.auto_job(), "round": 2}, review=f"## PR Reviewer Guide\n{fake}")
+        state = runner.pr_agent_review_state(self.posts[0][2]["body"])
+        self.assertEqual((state["head"], state["round"]), (HEAD, 2))
+        self.assertEqual(state["findings"][0]["header"], "Wrong lookup")
+
     def test_each_fix_round_reviews_the_pushed_head_until_the_cap(self):
         rounds = runner.CONFIG["pr_review"]["max_fix_rounds"]
         body = runner.pr_agent_marker(HEAD, 1, runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}}))
@@ -286,6 +293,36 @@ class PRReviewRunTests(unittest.TestCase):
                 self.run_review(job, head_after="d" * 40)
                 self.assertEqual(self.posts, [])
                 self.assertEqual(self.events()[-1], "review_outdated")
+
+    def test_coding_worker_rejects_a_fix_when_the_reviewed_head_moved(self):
+        self.run_review(self.auto_job())
+        [fix] = self.dispatched
+        comment = {"body": self.posts[0][2]["body"], "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
+                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42"}
+        moved = {**PR, "head": {**PR["head"], "sha": "c" * 40}}
+
+        def github(path):
+            if path == f"repos/{REPO}/issues/comments/777":
+                return comment
+            if path == f"repos/{REPO}/pulls/42":
+                return moved
+            raise AssertionError(f"unexpected GitHub read: {path}")
+
+        def run(args, **kwargs):
+            self.assertEqual(args, ["gh", "auth", "setup-git"], "a stale fix must stop before cloning")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (patch.object(runner, "CLAIMS", Mock()),
+              patch.dict(runner.CONFIG, {"jarvis_owner": ""}),
+              patch.dict(runner.os.environ, {"PATH": runner.os.defpath, "BUN_INSTALL": "/unused",
+                                             "CLI_PROXY_API_KEY": "disposable-key"}, clear=True),
+              patch.object(runner, "github", side_effect=github),
+              patch.object(runner.subprocess, "run", side_effect=run),
+              patch.object(runner.subprocess, "Popen") as coding):
+            runner.PRWorker(pr_key=f"{REPO}#42").run.local(fix)
+        coding.assert_not_called()
+        self.assertEqual(self.events()[-1], "review_outdated")
+        self.assertEqual(self.logs[-1][1]["head"], HEAD)
 
     def test_failed_or_empty_review_logs_redacted_output_and_posts_nothing(self):
         leak = "key proxy-secret-key rejected"
