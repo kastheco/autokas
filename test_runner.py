@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
-from runner import CONFIG, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job
+from runner import CONFIG, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job, upstack
 
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
@@ -473,16 +473,26 @@ class CommandInitializationTests(unittest.TestCase):
         return self.subprocess_run(args, cwd=kwargs.get("cwd", self.upstream),
                                    env=self.git_env, capture_output=True, text=True, check=True)
 
-    def launch(self) -> dict:
-        """Reach omp with a local checkout or an empty reporting-only directory."""
+    def launch(self, agent=None) -> dict:
+        """Reach omp with a local checkout or an empty reporting-only directory.
+
+        With an agent callback, omp "exits 0" after the callback edits the checkout."""
         observed = {}
 
         def read_github(path):
             if path == f"repos/{REPO}/pulls/142":
-                return {"state": "open", "body": getattr(self, "pr_body", ""), "base": {"repo": {"full_name": REPO}},
-                        "head": {"sha": self.head, "ref": self.branch, "repo": {"full_name": REPO}}}
+                return {"state": "open", "body": getattr(self, "pr_body", ""), "base": {"ref": "main", "repo": {"full_name": REPO}},
+                        "head": {"sha": getattr(self, "remote_head", self.head), "ref": self.branch, "repo": {"full_name": REPO}}}
             if path == f"repos/{REPO}/commits?sha={self.head}&per_page=100&page=1":
                 return [{"sha": self.head, "commit": {"message": "base"}}]
+            if path.startswith(f"repos/{REPO}/pulls?state=open&per_page=100&page=1&base="):
+                return getattr(self, "stack", {}).get(path.rsplit("base=", 1)[1], [])
+            if path == f"repos/{REPO}":
+                return {"default_branch": "main"}
+            if path.startswith(f"repos/{REPO}/branches/"):
+                return {"protected": False}
+            if path.startswith(f"repos/{REPO}/compare/"):
+                return {"merge_base_commit": {"sha": "f" * 40}, "ahead_by": 1}
             raise AssertionError(f"unexpected GitHub read: {path}")
 
         def run(args, **kwargs):
@@ -506,6 +516,9 @@ class CommandInitializationTests(unittest.TestCase):
             if observed["has_checkout"]:
                 observed["head"] = self.git(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()
                 observed["branch"] = self.git(["git", "branch", "--show-current"], cwd=cwd).stdout.strip()
+            if agent:
+                agent(cwd)
+                return Mock(pid=-1, **{"wait.return_value": 0})
             raise self.Interrupted
 
         model = CONFIG["model"].split("/", 1)[1]
@@ -517,8 +530,12 @@ class CommandInitializationTests(unittest.TestCase):
               patch("runner.github", side_effect=read_github),
               patch("runner.urllib.request.urlopen", return_value=StringIO(json.dumps({"data": [{"id": model}]}))),
               patch("runner.subprocess.run", side_effect=run),
-              patch("runner.subprocess.Popen", side_effect=popen)):
-            self.deliver()
+              patch("runner.subprocess.Popen", side_effect=popen),
+              patch("runner.os.killpg")):
+            if agent:
+                PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
+            else:
+                self.deliver()
         return observed
 
     def assert_execution_launch(self, observed) -> None:
@@ -550,6 +567,23 @@ class CommandInitializationTests(unittest.TestCase):
         self.pr_body = "<!-- omp-runner:docs-update -->"
         self.assert_execution_launch(self.launch())
 
+    def test_launch_gives_the_agent_the_branches_stacked_above_its_pr(self) -> None:
+        child = {"number": 143, "head": {"ref": "feature/child", "sha": "c" * 40, "repo": {"full_name": REPO}}}
+        self.stack = {"feature%2Fcommand": [child]}
+        self.assertEqual(self.launch()["context"]["upstack"],
+                         [{"pr": 143, "branch": "feature/child", "parent": "feature/command"}])
+
+    def test_fix_counts_as_published_when_the_restack_leaves_head_upstack(self) -> None:
+        def fix_then_restack(cwd):
+            commit = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "--allow-empty", "-m", "fix"]
+            self.git(commit, cwd=cwd)
+            self.remote_head = self.git(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()
+            self.git(["git", "checkout", "-b", "feature/child"], cwd=cwd)
+            self.git(commit[:-1] + ["chore(stack): merge feature/command into feature/child"], cwd=cwd)
+
+        self.launch(agent=fix_then_restack)
+        self.assertEqual(self.values["command:" + self.job["key"]]["published_head"], self.remote_head)
+
     def test_legacy_start_without_execution_record_stays_reporting_only(self) -> None:
         self.values["started:" + self.job["key"]] = "started"
         self.deliver()
@@ -578,6 +612,45 @@ class CommandInitializationTests(unittest.TestCase):
                 else:
                     self.assert_reporting_launch(observed, "completed" if state == "completed" else "uncertain")
                     self.assertEqual(self.values["command:" + self.job["key"]], record)
+
+
+class StackTests(unittest.TestCase):
+    @staticmethod
+    def pr(number: int, branch: str, repo: str | None = REPO) -> dict:
+        return {"number": number, "head": {"ref": branch, "sha": branch.upper(), "repo": repo and {"full_name": repo}}}
+
+    def test_upstack_walks_every_page_of_real_children_and_never_targets_other_branches(self) -> None:
+        forks = [self.pr(100 + n, f"fork-{n}", "outsider/example-app") for n in range(94)]
+        children = {
+            ("a", 1): [self.pr(2, "b"), self.pr(9, "fork", "outsider/example-app"), self.pr(8, "gone", None),
+                       self.pr(10, "main"), self.pr(11, "release"), self.pr(12, "unrelated"), *forks],
+            ("a", 2): [self.pr(7, "x")],
+            ("b", 1): [self.pr(3, "c"), self.pr(4, "d")],
+            ("c", 1): [self.pr(5, "a")],
+        }
+        # a child built on its parent shares a merge base that isn't on the parent's base yet.
+        merge_bases = {("A", "B"): "a1", ("A", "X"): "a1", ("B", "C"): "b1", ("B", "D"): "b1", ("A", "UNRELATED"): "m0"}
+        ahead = {("main", "a1"), ("a", "b1")}
+
+        def read(path):
+            route, _, query = path.removeprefix(f"repos/{REPO}").partition("?")
+            if route == "":
+                return {"default_branch": "main"}
+            if route.startswith("/branches/"):
+                return {"protected": route == "/branches/release"}
+            if route.startswith("/compare/"):
+                left, right = route.removeprefix("/compare/").split("...")
+                if (left, right) in merge_bases:
+                    return {"merge_base_commit": {"sha": merge_bases[left, right]}}
+                # a diverged base still counts: only commits the base lacks matter.
+                return {"ahead_by": 2 if (left, right) in ahead else 0, "status": "diverged"}
+            params = dict(part.split("=", 1) for part in query.split("&"))
+            return children.get((params["base"], int(params["page"])), [])
+
+        with patch("runner.github", side_effect=read), patch("runner.log"):
+            stack = upstack(REPO, "a", "A", "main")
+        self.assertEqual([(entry["pr"], entry["branch"], entry["parent"]) for entry in stack],
+                         [(2, "b", "a"), (7, "x", "a"), (3, "c", "b"), (4, "d", "b")])
 
 
 class DocsMergeTests(unittest.TestCase):

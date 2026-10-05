@@ -395,5 +395,159 @@ class PRReviewRunTests(unittest.TestCase):
                              for value in call.kwargs["env"].values()))
 
 
+class FixPublicationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.origin = self.root / "origin.git"
+        self.parent = self.root / "parent"
+        self.parent.mkdir()
+        self.real_run = subprocess.run
+        self.real_popen = subprocess.Popen
+        self.env = {"PATH": runner.os.defpath, "HOME": temporary.name, "GIT_CONFIG_NOSYSTEM": "1"}
+        self.git(["init", "--bare", str(self.origin)])
+        self.git(["init", "-b", PR["head"]["ref"]], self.parent)
+        (self.parent / "parser.py").write_text("result = 'broken'\n")
+        self.commit(self.parent, "base")
+        self.starting_head = self.git(["rev-parse", "HEAD"], self.parent)
+        self.git(["remote", "add", "origin", str(self.origin)], self.parent)
+        self.git(["push", "origin", f"HEAD:refs/heads/{PR['head']['ref']}", "HEAD:refs/pull/42/head"], self.parent)
+        self.git(["checkout", "-b", "parent"], self.parent)
+        (self.parent / "parent.txt").write_text("parent change\n")
+        self.commit(self.parent, "parent change")
+        self.body = runner.pr_agent_marker(self.starting_head, 1, runner.pr_agent_findings(
+            {"review": {"key_issues_to_review": ISSUES}}))
+        self.job = {"repo": REPO, "pr": 42, "comment": 777, "kind": "issue_comment",
+                    "reviewer": "pr_agent", "head": self.starting_head,
+                    "prompt": runner.pr_agent_prompt(self.body), "key": "publication-race"}
+
+    def git(self, args, cwd=None):
+        return self.real_run(["git", *args], cwd=cwd or self.root, env=self.env,
+                             capture_output=True, text=True, check=True).stdout.strip()
+
+    def commit(self, cwd, message):
+        self.git(["add", "."], cwd)
+        self.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", message], cwd)
+
+    def run_fix(self, movement="restack", pr_changes=None, compare_error=None, code=0):
+        self.dispatched, self.logs = [], []
+        comment = {"body": self.body, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
+                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
+                   "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+        self.launched = False
+
+        def github(path):
+            if path == f"repos/{REPO}/issues/comments/777":
+                return comment
+            if path == f"repos/{REPO}/pulls/42":
+                pr = copy.deepcopy(PR)
+                pr["head"]["sha"] = self.git(["rev-parse", f"refs/heads/{PR['head']['ref']}"], self.origin)
+                if self.launched and pr_changes:
+                    pr["head"].update(pr_changes)
+                return pr
+            if "/pulls?" in path:
+                return []
+            if "/compare/" in path:
+                if compare_error:
+                    raise compare_error
+                base, head = path.rsplit("/", 1)[1].split("...")
+                common = self.git(["merge-base", base, head], self.origin)
+                return {"status": "identical" if base == head else
+                        "ahead" if common == base else "behind" if common == head else "diverged"}
+            raise AssertionError(f"unexpected GitHub read: {path}")
+
+        def run(args, **kwargs):
+            if args == ["gh", "auth", "setup-git"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:3] == ["git", "clone", "--no-checkout"]:
+                args = [*args[:3], str(self.origin), args[-1]]
+            self.assertEqual(args[0], "git")
+            return self.real_run(args, **kwargs)
+
+        def popen(args, *, cwd, **kwargs):
+            if args[0] == "git":
+                return self.real_popen(args, cwd=cwd, **kwargs)
+            self.assertEqual(args[0], "omp")
+            if movement != "no_change":
+                (cwd / "parser.py").write_text("result = 'fixed'\n")
+                self.commit(cwd, "fix: parser")
+                self.fix_head = self.git(["rev-parse", "HEAD"], cwd)
+                # Keep the candidate object available to the compare API without
+                # publishing it on the PR branch.
+                if movement in {"unpublished", "diverged"}:
+                    self.git(["fetch", str(cwd), self.fix_head], self.origin)
+                if movement not in {"unpublished", "diverged"}:
+                    self.git(["push", "origin", f"HEAD:refs/heads/{PR['head']['ref']}"], cwd)
+                if movement == "restack":
+                    self.git(["fetch", "origin"], self.parent)
+                    self.git(["checkout", "-B", PR["head"]["ref"], f"origin/{PR['head']['ref']}"], self.parent)
+                    self.git(["-c", "user.name=test", "-c", "user.email=test@example.com",
+                              "merge", "--no-ff", "parent", "-m", "chore(stack): merge parent into child"], self.parent)
+                    self.git(["push", "origin", PR["head"]["ref"]], self.parent)
+            if movement in {"no_change", "diverged"}:
+                self.git(["push", "origin", f"parent:refs/heads/{PR['head']['ref']}"], self.parent)
+            self.remote_head = self.git(["rev-parse", f"refs/heads/{PR['head']['ref']}"], self.origin)
+            self.launched = True
+            return Mock(pid=-1, **{"wait.return_value": code})
+
+        with (patch.object(runner, "CLAIMS", Mock()),
+              patch.dict(runner.CONFIG, {"jarvis_owner": ""}),
+              patch.dict(runner.os.environ, {"PATH": runner.os.defpath, "BUN_INSTALL": "/unused",
+                                             "CLI_PROXY_API_KEY": "disposable-key"}, clear=True),
+              patch.object(runner, "github_token", return_value="disposable-token"),
+              patch.object(runner, "check_proxy_model"),
+              patch.object(runner, "github", side_effect=github),
+              patch.object(runner, "subprocess", Mock(run=run, Popen=popen)),
+              patch.object(runner.os, "killpg"),
+              patch.object(runner, "dispatch", side_effect=self.dispatched.append),
+              patch.object(runner, "log", side_effect=lambda event, **fields: self.logs.append((event, fields)))):
+            runner.PRWorker(pr_key=f"{REPO}#42").run.local(self.job)
+
+    def test_parent_restack_preserves_fix_publication_and_reviews_merged_head(self):
+        self.run_fix()
+        self.assertNotEqual(self.fix_head, self.remote_head)
+        self.assertEqual(self.git(["merge-base", self.fix_head, self.remote_head], self.origin), self.fix_head)
+        self.assertEqual(self.git(["show", f"{self.remote_head}:parser.py"], self.origin), "result = 'fixed'")
+        self.assertEqual([(job["head"], job["round"]) for job in self.dispatched], [(self.remote_head, 2)])
+        self.assertTrue(next(fields["update_confirmed"] for event, fields in self.logs if event == "exited"))
+
+    def test_exact_pushed_head_still_reviews_fix(self):
+        self.run_fix("exact")
+        self.assertEqual([job["head"] for job in self.dispatched], [self.fix_head])
+
+    def test_unpublished_local_fix_does_not_start_review(self):
+        self.run_fix("unpublished")
+        self.assertEqual(self.dispatched, [])
+        self.assertFalse(next(fields["update_confirmed"] for event, fields in self.logs if event == "exited"))
+
+    def test_unchanged_fix_does_not_review_someone_elses_push(self):
+        self.run_fix("no_change")
+        self.assertEqual(self.dispatched, [])
+
+    def test_unrelated_advanced_head_does_not_confirm_local_fix(self):
+        self.run_fix("diverged")
+        self.assertNotEqual(self.remote_head, self.starting_head)
+        self.assertEqual(self.dispatched, [])
+        self.assertFalse(next(fields["update_confirmed"] for event, fields in self.logs if event == "exited"))
+
+    def test_changed_head_branch_does_not_confirm_publication(self):
+        self.run_fix("exact", pr_changes={"ref": "other-branch"})
+        self.assertEqual(self.dispatched, [])
+
+    def test_changed_head_repository_does_not_confirm_publication(self):
+        self.run_fix("exact", pr_changes={"repo": {"full_name": "someone/fork"}})
+        self.assertEqual(self.dispatched, [])
+
+    def test_deleted_head_repository_does_not_confirm_publication(self):
+        self.run_fix("exact", pr_changes={"repo": None})
+        self.assertEqual(self.dispatched, [])
+
+    def test_failed_ancestry_lookup_leaves_publication_unconfirmed(self):
+        with self.assertRaisesRegex(TimeoutError, "compare unavailable"):
+            self.run_fix(compare_error=TimeoutError("compare unavailable"))
+        self.assertEqual(self.dispatched, [])
+
+
 if __name__ == "__main__":
     unittest.main()
