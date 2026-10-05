@@ -168,6 +168,64 @@ class BugbotIntakeTests(unittest.TestCase):
         self.assertNotIn("Parent-only finding", canonical["prompt"])
 
 
+SECURITY_BODY = (
+    "<!-- CURSOR_AUTOMATION_ID: 00000000-0000-0000-0000-000000000000 | RUN_ID: bc-00000000 -->\n"
+    "🔒 **Agentic Security Review**\nSeverity: HIGH\n\n"
+    "`upstack()` trusts any PR based on the job branch as a restack target.\n\n"
+    "**Impact:** the App can be directed to push a protected branch.\n\n"
+    '<div><a href="https://cursor.com/open?link=TOKEN" target="_blank"><img alt="Fix in Cursor"></a></div>\n\n'
+    "<sup>Reviewed by [Cursor Security Reviewer](https://cursor.com/docs/security-review) for commit abc. "
+    "Configure [here](https://www.cursor.com/dashboard/security-agents/x).</sup>"
+)
+
+
+class CursorSecurityIntakeTests(unittest.TestCase):
+    def security_event(self, body: str = SECURITY_BODY) -> dict:
+        event = bugbot_comment_event()
+        event["comment"]["body"] = body
+        return event
+
+    def test_inline_security_finding_becomes_a_job_without_cursor_links(self) -> None:
+        job = event_job("pull_request_review_comment", self.security_event())
+        assert job is not None
+        self.assertEqual((job["reviewer"], job["kind"]), ("bugbot", "pull_request_review_comment"))
+        self.assertEqual(job["prompt"], "Cursor security review\nSeverity: HIGH\n\n"
+                                        "`upstack()` trusts any PR based on the job branch as a restack target.\n\n"
+                                        "**Impact:** the App can be directed to push a protected branch.")
+
+    def test_security_summaries_other_accounts_and_unmarked_text_start_nothing(self) -> None:
+        summary = review_event()
+        summary["sender"] = summary["review"]["user"] = dict(BUGBOT)
+        summary["review"]["body"] = "<!-- CURSOR_AUTOMATION_ID: x | RUN_ID: y -->\nSecurity review found one high-severity issue."
+        self.assertIsNone(event_job("pull_request_review", summary))
+        impostor = self.security_event()
+        impostor["sender"] = impostor["comment"]["user"] = {**BUGBOT, "id": 1}
+        self.assertIsNone(event_job("pull_request_review_comment", impostor))
+        unmarked = SECURITY_BODY.split("\n", 1)[1]
+        self.assertIsNone(event_job("pull_request_review_comment", self.security_event(unmarked)))
+        empty = SECURITY_BODY.split("Severity: HIGH\n\n")[0] + "Severity: HIGH\n\n<sup>Reviewed.</sup>"
+        self.assertIsNone(event_job("pull_request_review_comment", self.security_event(empty)))
+
+    def test_security_and_bugbot_findings_in_one_review_batch_together(self) -> None:
+        bugbot = {"id": 9000000002, "user": dict(BUGBOT), "pull_request_review_id": 77, "body": BUGBOT_BODY,
+                  "pull_request_url": PR_URL, "html_url": "https://github.com/x#discussion_r1"}
+        security = {**bugbot, "id": 9000000003, "body": SECURITY_BODY, "html_url": "https://github.com/x#discussion_r2"}
+        review = {"user": dict(BUGBOT), "state": "commented", "pull_request_url": PR_URL,
+                  "body": "<!-- CURSOR_AUTOMATION_ID: x -->\nSecurity review found one issue.",
+                  "html_url": "https://github.com/x#pullrequestreview-77"}
+        responses = {f"repos/{REPO}/pulls/comments/9000000003": security,
+                     f"repos/{REPO}/pulls/142/reviews/77": review,
+                     f"repos/{REPO}/pulls/142/reviews/77/comments?per_page=100&page=1": [security, bugbot]}
+        job = event_job("pull_request_review_comment", {**self.security_event(), "comment": security})
+        assert job is not None
+        with patch("runner.github", side_effect=lambda path: responses[path]):
+            canonical = review_job(job, {"number": 142, "base": {"repo": {"full_name": REPO}}})
+        assert canonical is not None
+        self.assertEqual([target["comment"] for target in canonical["targets"]], [9000000002, 9000000003])
+        self.assertIn("Cursor security review", canonical["prompt"])
+        self.assertNotIn("cursor.com", canonical["prompt"])
+
+
 class ReviewIntakeTests(unittest.TestCase):
     def test_submitted_review_becomes_a_scoped_job(self) -> None:
         job = event_job("pull_request_review", review_event())

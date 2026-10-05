@@ -545,7 +545,9 @@ def clean_review_head(body: str) -> str:
 
 
 BUGBOT_SECTION = re.compile(r"<!-- (?P<name>DESCRIPTION|LOCATIONS) START(?: -->)?\n(?P<text>.*?)\n(?:<!-- )?(?P=name) END -->", re.DOTALL)
-REVIEWER_NAMES = {"coderabbit": "CodeRabbit", "bugbot": "Cursor Bugbot", "pr_agent": "PR-Agent"}
+REVIEWER_NAMES = {"coderabbit": "CodeRabbit", "bugbot": "Cursor", "pr_agent": "PR-Agent"}
+CURSOR_SECURITY = re.compile(r"^\W*\*\*Agentic Security Review\*\*[ \t]*\nSeverity: (?P<severity>\w+)[ \t]*\n(?P<text>.*?)"
+                             r"(?=^<div>|^<sup>|\Z)", re.DOTALL | re.MULTILINE)
 SEVERITIES = ("P0", "P1", "P2", "P3")
 # PR-Agent has no per-finding severity, so every review asks for one in each finding's header.
 SEVERITY_INSTRUCTIONS = (
@@ -660,11 +662,24 @@ def bugbot_prompt(body: str) -> str:
     return "\n".join(lines) + "\n\n" + sections["DESCRIPTION"]
 
 
+def cursor_security_prompt(body: str) -> str:
+    """Rebuild one Cursor Security Reviewer finding from its severity and description, dropping its Cursor links."""
+    if "<!-- CURSOR_AUTOMATION_ID:" not in body:
+        return ""
+    finding = CURSOR_SECURITY.search(body)
+    if not finding or not finding["text"].strip():
+        return ""
+    return f"Cursor security review\nSeverity: {finding['severity']}\n\n{finding['text'].strip()}"
+
+
 def finding_prompt(reviewer: str, body: str) -> str:
-    """Extract the reviewer's actionable finding text, or nothing."""
+    """Extract the reviewer's actionable finding text, or nothing. cursor[bot] posts both Bugbot and Security
+    Reviewer findings, so its comments are read in either format."""
     if reviewer == "pr_agent":
         return pr_agent_prompt(body)
-    return bugbot_prompt(body) if reviewer == "bugbot" else agent_prompt(body)
+    if reviewer == "bugbot":
+        return bugbot_prompt(body) or cursor_security_prompt(body)
+    return agent_prompt(body)
 
 
 def reviewer_of(user: dict[str, Any]) -> str | None:
