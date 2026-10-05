@@ -897,7 +897,7 @@ def set_fix_label(repo: str, number: int, state: str, key: str) -> None:
 
 def fix_state(code: int, pushed: bool, reported: str) -> str:
     """Map omp's exit, the confirmed push and its reported outcome to one label. anything unclear is blocked."""
-    if not reported:
+    if reported not in {"published", "rejected", "blocked", "uncertain", "already handled"}:
         return "blocked"
     if code == 0 and reported not in {"blocked", "uncertain"}:
         if pushed or reported == "already handled":

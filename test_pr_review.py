@@ -424,7 +424,8 @@ class PRReviewRunTests(unittest.TestCase):
                  ("rejected", 0, False, "rejected", "rejected"), ("pushed but blocked", 0, True, "blocked", "blocked"),
                  ("claims a push that didn't land", 0, False, "published", "blocked"),
                  ("omp failed", 1, True, None, "blocked"),
-                 ("malformed outcome after push", 0, True, b"\xff\n", "fixed"),
+                 ("unknown outcome after push", 0, True, "not an outcome", "blocked"),
+                 ("malformed outcome after push", 0, True, b"\xff\n", "blocked"),
                  ("malformed outcome without push", 0, False, b"\xff\n", "blocked"))
         for name, code, push, reported, label in cases:
             with self.subTest(name):
