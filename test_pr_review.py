@@ -405,7 +405,11 @@ class PRReviewRunTests(unittest.TestCase):
                    "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
                    "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
         pushed = "f" * 40
-        cases = (("pushed", 0, True, None, "fixed"), ("already handled", 0, False, "already handled", "fixed"),
+        cases = (("pushed", 0, True, "published", "fixed"),
+                 ("pushed without outcome", 0, True, None, "blocked"),
+                 ("pushed with empty outcome", 0, True, "", "blocked"),
+                 ("pushed with whitespace outcome", 0, True, " \t\n", "blocked"),
+                 ("already handled", 0, False, "already handled", "fixed"),
                  ("rejected", 0, False, "rejected", "rejected"), ("pushed but blocked", 0, True, "blocked", "blocked"),
                  ("claims a push that didn't land", 0, False, "published", "blocked"),
                  ("omp failed", 1, True, None, "blocked"),
@@ -425,7 +429,7 @@ class PRReviewRunTests(unittest.TestCase):
                 def omp(args, **kwargs):
                     policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
                     context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
-                    if reported:
+                    if reported is not None:
                         outcome_file = Path(context["outcome_file"])
                         if isinstance(reported, bytes):
                             outcome_file.write_bytes(reported)

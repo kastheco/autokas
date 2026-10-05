@@ -39,7 +39,7 @@ each finding in a review is tagged `[P0]` to `[P3]`: P0 is a security hole, data
 
 each PR-Agent review also runs as an `autokas review` check on the head it reviewed, so it shows next to CI and goes stale on the next push like any other check. it fails when the review has findings at or above `pr_review.fix_severity`, the same ones that start a fix, and passes otherwise. its title counts the findings by severity and its details link to the review comment. a review that stops early ends as `skipped` (empty diff), `cancelled` (the head moved) or `neutral` (PR-Agent failed).
 
-fix jobs for CodeRabbit, Bugbot and PR-Agent findings set one label for the latest job's outcome, replacing any earlier one: `autokas:fixing` while omp runs, then `autokas:fixed` (a fix was pushed, or an earlier job already handled the findings), `autokas:rejected` (the findings didn't warrant a change) or `autokas:blocked` (omp failed, got blocked, or couldn't confirm its push). the label follows the latest job, not the head, so read it next to the check. `@autokas` commands and docs jobs don't set labels.
+fix jobs for CodeRabbit, Bugbot and PR-Agent findings set one label for the latest job's outcome, replacing any earlier one: `autokas:fixing` while omp runs, then `autokas:fixed` (a fix was pushed, or an earlier job already handled the findings), `autokas:rejected` (the findings didn't warrant a change) or `autokas:blocked` (omp failed, got blocked, couldn't confirm its push, or reported no outcome even after a confirmed push). the label follows the latest job, not the head, so read it next to the check. `@autokas` commands and docs jobs don't set labels.
 
 that's enough for gh-dash sections, for example:
 
