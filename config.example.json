@@ -16,12 +16,18 @@
     "login": "cursor[bot]",
     "id": 206951365
   },
+  "pr_agent": {
+    "login": "autokas[bot]",
+    "id": 334744567
+  },
   "pr_review": {
     "enabled": true,
     "pr_agent_version": "0.47.0",
     "model": "railway-codex/gpt-6-astra",
     "thinking": "medium",
-    "max_model_tokens": 200000
+    "max_model_tokens": 200000,
+    "fix_severity": "P2",
+    "max_fix_rounds": 3
   },
   "timeout_seconds": 3600,
   "omp_version": "18.4.10",

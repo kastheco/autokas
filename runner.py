@@ -530,7 +530,71 @@ def clean_review_head(body: str) -> str:
 
 
 BUGBOT_SECTION = re.compile(r"<!-- (?P<name>DESCRIPTION|LOCATIONS) START(?: -->)?\n(?P<text>.*?)\n(?:<!-- )?(?P=name) END -->", re.DOTALL)
-REVIEWER_NAMES = {"coderabbit": "CodeRabbit", "bugbot": "Cursor Bugbot"}
+REVIEWER_NAMES = {"coderabbit": "CodeRabbit", "bugbot": "Cursor Bugbot", "pr_agent": "PR-Agent"}
+SEVERITIES = ("P0", "P1", "P2", "P3")
+# PR-Agent has no per-finding severity, so every review asks for one in each finding's header.
+SEVERITY_INSTRUCTIONS = (
+    "start every key issue header with exactly one severity tag: [P0], [P1], [P2] or [P3]. "
+    "P0: a security hole, data loss or corruption, or an outage. "
+    "P1: a bug that breaks expected behavior in normal use. "
+    "P2: a real bug or behavior gap that shows up only under specific inputs or conditions. "
+    "P3: maintainability, style, naming, docs, or a speculative concern. "
+    "report a concrete security problem as a key issue too, not only under security concerns."
+)
+PR_AGENT_MARKER = re.compile(r"<!-- autokas:pr-agent (\{.*?\}) -->")
+SEVERITY_TAG = re.compile(r"^\s*\[(P[0-3])\]\s*")
+
+
+def pr_agent_findings(review: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read PR-Agent's structured key issues. an untagged finding counts as P2, so it's never dropped silently."""
+    findings = []
+    for issue in (review.get("review") or {}).get("key_issues_to_review") or []:
+        if not isinstance(issue, dict):
+            continue
+        header = str(issue.get("issue_header") or "").strip()
+        tag = SEVERITY_TAG.match(header)
+        findings.append({
+            "severity": tag[1] if tag else "P2", "header": header[tag.end():] if tag else header,
+            "file": str(issue.get("relevant_file") or "").strip(),
+            "lines": f"{issue.get('start_line')}-{issue.get('end_line')}",
+            "content": str(issue.get("issue_content") or "").strip(),
+        })
+    return findings
+
+
+def pr_agent_marker(head: str, round_: int, findings: list[dict[str, Any]]) -> str:
+    """Record the reviewed head, fix round and findings in the posted comment, so a fix job can revalidate them."""
+    data = json.dumps({"head": head, "round": round_, "findings": findings}, separators=(",", ":"))
+    return "<!-- autokas:pr-agent " + data.replace("<", "\\u003c").replace(">", "\\u003e") + " -->"
+
+
+def pr_agent_review_state(body: str) -> dict[str, Any] | None:
+    match = PR_AGENT_MARKER.search(body)
+    if not match:
+        return None
+    try:
+        state = json.loads(match[1])
+    except ValueError:
+        return None
+    return state if isinstance(state, dict) and isinstance(state.get("findings"), list) else None
+
+
+def pr_agent_prompt(body: str) -> str:
+    """Turn a PR-Agent review into one fix prompt: findings at or above `fix_severity`, while rounds remain."""
+    settings = CONFIG["pr_review"]
+    state = pr_agent_review_state(body)
+    if not state or settings.get("fix_severity") not in SEVERITIES or state.get("round", 1) > settings["max_fix_rounds"]:
+        return ""
+    threshold = SEVERITIES.index(settings["fix_severity"])
+    selected = [finding for finding in state["findings"]
+                if isinstance(finding, dict) and finding.get("severity") in SEVERITIES[:threshold + 1]]
+    if not selected:
+        return ""
+    lines = [f"PR-Agent review of {state.get('head')}, fix round {state.get('round', 1)}."]
+    for finding in selected:
+        lines.append(f"\n[{finding['severity']}] {finding.get('header', '')} ({finding.get('file', '')}, lines {finding.get('lines', '')})\n"
+                     + str(finding.get("content", "")))
+    return "\n".join(lines)
 
 
 def bugbot_prompt(body: str) -> str:
@@ -552,6 +616,8 @@ def bugbot_prompt(body: str) -> str:
 
 def finding_prompt(reviewer: str, body: str) -> str:
     """Extract the reviewer's actionable finding text, or nothing."""
+    if reviewer == "pr_agent":
+        return pr_agent_prompt(body)
     return bugbot_prompt(body) if reviewer == "bugbot" else agent_prompt(body)
 
 
@@ -580,6 +646,8 @@ def event_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if reviewer is None:
         return None
     if reviewer == "bugbot" and event != "pull_request_review_comment":
+        return None
+    if reviewer == "pr_agent" and event != "issue_comment":
         return None
     comment = payload.get("review" if event == "pull_request_review" else "comment", {})
     if event == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
@@ -1172,10 +1240,10 @@ def pr_agent_env(home: str, instructions: str = "") -> dict[str, str]:
         # write the whole review to the output file in one piece.
         "PR_REVIEWER__PERSISTENT_COMMENT": "false",
     }
-    if instructions:
-        # PR-Agent's settings parse env values as TOML or dynaconf tokens like `@json`; a leading
-        # plain-text prefix keeps the commenter's words a literal string.
-        env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] = f"the commenter asked: {instructions}"
+    # PR-Agent's settings parse env values as TOML or dynaconf tokens like `@json`; starting with
+    # plain text keeps the commenter's words a literal string.
+    env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] = SEVERITY_INSTRUCTIONS + (
+        f"\n\nthe commenter asked: {instructions}" if instructions else "")
     return env
 
 
@@ -1210,7 +1278,8 @@ def checkout_pr_diff(repo: str, merge_base: str, head: str, checkout: Path) -> s
 def pr_review(job: dict[str, Any]) -> None:
     """Post one PR-Agent review of one exact head as autokas[bot]. never pushes, commits or resolves threads."""
     repo, number = job["repo"], job["pr"]
-    automatic = job["kind"] == "pull_request"
+    # automatic: a PR became ready (`pull_request`) or an autokas fix landed (`fix`). anything else is a command.
+    automatic = job["kind"] in {"pull_request", "fix"}
     if not automatic:
         access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
         if access.get("permission") not in {"admin", "write"}:
@@ -1231,7 +1300,8 @@ def pr_review(job: dict[str, Any]) -> None:
     check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
     merge_base = github(f"repos/{repo}/compare/{pr['base']['sha']}...{head}?per_page=1")["merge_base_commit"]["sha"]
     with tempfile.TemporaryDirectory(prefix="pr-agent-") as home:
-        checkout, diff_file, output = Path(home, "repo"), Path(home, "pr.diff"), Path(home, "review.md")
+        checkout, diff_file = Path(home, "repo"), Path(home, "pr.diff")
+        output, structured = Path(home, "review.md"), Path(home, "review.json")
         diff = checkout_pr_diff(repo, merge_base, head, checkout)
         if not diff.strip():
             log("pr_review_empty", key=job["key"], head=head)
@@ -1239,30 +1309,58 @@ def pr_review(job: dict[str, Any]) -> None:
         diff_file.write_text(diff)
         env = pr_agent_env(home, job.get("instructions", ""))
         log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
-            model=model, thinking=CONFIG["pr_review"]["thinking"])
+            model=model, thinking=CONFIG["pr_review"]["thinking"], round=job.get("round", 1))
         started = time.monotonic()
         try:
             # plain-diff mode inside the checkout: full file context for the exact head, no GitHub access.
             result = subprocess.run(
-                [sys.executable, "-m", "pr_agent.cli", "--diff-file", str(diff_file), "--output", str(output), "review"],
+                [sys.executable, "-m", "pr_agent.cli", "--diff-file", str(diff_file), "--output", str(output),
+                 "--json-output", str(structured), "review"],
                 cwd=checkout, env=env, capture_output=True, text=True, timeout=240,
             )
         except subprocess.TimeoutExpired:
             log("pr_review_failed", key=job["key"], model=model, reason="timeout")
             raise RuntimeError("PR-Agent review timed out") from None
         review = output.read_text().strip() if output.is_file() else ""
-        if result.returncode or not review:
+        if result.returncode or not review or not structured.is_file():
             detail = redact((result.stdout + result.stderr).strip(), (env["OPENAI__KEY"],))
             log("pr_review_failed", key=job["key"], model=model, code=result.returncode, detail=detail[-2000:])
             raise RuntimeError(f"PR-Agent exited with {result.returncode} and {len(review)} review characters")
+        findings = pr_agent_findings(json.loads(structured.read_text()))
     current = github(f"repos/{repo}/pulls/{number}")
     if current["state"] != "open" or current["head"]["sha"] != head:
         log("review_outdated", key=job["key"], head=head)
         return
-    github_request("POST", f"repos/{repo}/issues/{number}/comments",
-                   {"body": f"{review}\n\n<sub>reviewed head {head}</sub>"})
-    log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model,
-        seconds=round(time.monotonic() - started))
+    round_ = job.get("round", 1)
+    comment = github_request("POST", f"repos/{repo}/issues/{number}/comments", {
+        "body": f"{review}\n\n<sub>reviewed head {head}</sub>\n\n{pr_agent_marker(head, round_, findings)}"})
+    log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
+        findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
+    # the same job the webhook builds from this comment, so whichever arrives second is a duplicate claim.
+    fix = event_job("issue_comment", {
+        "action": "created", "repository": {"full_name": repo}, "sender": comment["user"], "comment": comment,
+        "issue": {**current, "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/{number}"}},
+    })
+    if fix is None:
+        log("pr_review_no_fix", key=job["key"], round=round_)
+        return
+    dispatch(fix)
+
+
+def dispatch(job: dict[str, Any]) -> None:
+    """Queue a runner-made job exactly like a webhook delivery: claim its key once, then spawn the worker."""
+    if not CLAIMS.put(job["key"], "claimed", skip_if_exists=True):
+        log("duplicate", key=job["key"])
+        return
+    call = worker.spawn(job)
+    log("dispatched", key=job["key"], call_id=call.object_id)
+
+
+def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict[str, Any]:
+    """The next review round, pinned to the head a PR-Agent fix pushed. `max_fix_rounds` ends the loop."""
+    state = pr_agent_review_state(review_body) or {}
+    return {"mode": "pr_review", "kind": "fix", "repo": repo, "pr": number, "head": head,
+            "round": int(state.get("round", 1)) + 1, "key": f"{repo}:pr_review:{number}:{head}"}
 
 
 @app.function(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
@@ -1570,6 +1668,8 @@ class PRWorker:
                     elif code == 0 and final_head == head and remote_head == head:
                         record["state"] = "completed"
                     CLAIMS.put("command:" + job["key"], record)
+                if job.get("reviewer") == "pr_agent" and final_head != head and remote_head == final_head:
+                    dispatch(next_review_job(repo, number, comment.get("body") or "", final_head))
                 if code:
                     raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
             except Exception as error:
