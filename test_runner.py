@@ -629,7 +629,7 @@ class StackAndRereviewTests(unittest.TestCase):
                          [(2, "b", "a"), (3, "c", "b"), (4, "d", "b")])
 
     def test_rereview_is_requested_only_where_bugbot_already_checks(self) -> None:
-        for runs, expected in (([{"name": "Cursor Bugbot"}], [{"body": "cursor review"}]), ([], [])):
+        for runs, expected in (([{"name": "Cursor Bugbot"}], [{"body": "@cursor review"}]), ([], [])):
             posted = []
             with (self.subTest(bugbot=bool(runs)),
                   patch("runner.github", return_value={"check_runs": runs}) as read,
