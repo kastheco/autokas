@@ -1140,21 +1140,23 @@ def pr_agent_env(repo: str, home: str) -> dict[str, str]:
     """Build PR-Agent's whole environment: proxy model, App token, publish one review, nothing else."""
     settings = CONFIG["pr_review"]
     provider, model = settings["model"].split("/", 1)
-    provider_config = CONFIG["omp_models"]["providers"][provider]
-    context = next(entry["contextWindow"] for entry in provider_config["models"] if entry["id"] == model)
+    base_url = CONFIG["omp_models"]["providers"][provider]["baseUrl"]
     return {
         "PATH": os.environ["PATH"], "HOME": home,
         "GITHUB__USER_TOKEN": github_token(repo),
         "OPENAI__KEY": os.environ["CLI_PROXY_API_KEY"],
-        "OPENAI__API_BASE": provider_config["baseUrl"],
+        "OPENAI__API_BASE": base_url,
         # litellm routes `openai/<id>` to the proxy's chat completions endpoint. no fallback model,
         # so a proxy failure fails the review instead of silently reaching another provider.
         "CONFIG__MODEL": f"openai/{model}",
         "CONFIG__FALLBACK_MODELS": "[]",
-        "CONFIG__CUSTOM_MODEL_MAX_TOKENS": str(context),
+        # one review's prompt limit. bigger diffs are pruned to fit. the custom value covers
+        # proxy models missing from PR-Agent's pinned litellm table.
+        "CONFIG__MAX_MODEL_TOKENS": str(settings["max_model_tokens"]),
+        "CONFIG__CUSTOM_MODEL_MAX_TOKENS": str(settings["max_model_tokens"]),
         "CONFIG__REASONING_EFFORT": settings["thinking"],
         "CONFIG__ADDITIONAL_REASONING_EFFORT_MODELS": json.dumps([model]),
-        # the proxy's reasoning models reject temperature while reasoning is on.
+        # litellm rejects temperature for these reasoning models while reasoning is on.
         "CONFIG__NO_TEMPERATURE_MODELS": json.dumps([model]),
         "CONFIG__PUBLISH_OUTPUT": "true",
         # without this, PR-Agent exits 0 after a failed review.
@@ -1170,7 +1172,7 @@ def pr_agent_env(repo: str, home: str) -> dict[str, str]:
     }
 
 
-@app.function(image=PR_AGENT_IMAGE, secrets=[WORKER_SECRET], retries=0, timeout=300, cpu=0.25, memory=512)
+@app.function(image=PR_AGENT_IMAGE, secrets=[WORKER_SECRET], retries=0, timeout=300, cpu=0.5, memory=1024)
 def pr_review(job: dict[str, Any]) -> None:
     """Post one PR-Agent review as autokas[bot]. never pushes, commits or resolves threads."""
     repo, number = job["repo"], job["pr"]

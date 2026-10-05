@@ -19,8 +19,9 @@
   "pr_review": {
     "enabled": false,
     "pr_agent_version": "0.47.0",
-    "model": "railway-codex/gpt-6-luna",
-    "thinking": "medium"
+    "model": "railway-codex/gpt-6-astra",
+    "thinking": "medium",
+    "max_model_tokens": 200000
   },
   "timeout_seconds": 3600,
   "omp_version": "18.4.10",
