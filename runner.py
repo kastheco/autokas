@@ -1,5 +1,6 @@
 """Review-bot event -> isolated PR worktree -> configured omp -> exit."""
 
+import base64
 import hashlib
 import hmac
 import json
@@ -98,7 +99,8 @@ IMAGE = with_runner_files(
 )
 # PR-Agent brings its own fastapi and PyJWT; keep it out of the omp coding image.
 PR_AGENT_IMAGE = with_runner_files(
-    modal.Image.debian_slim(python_version="3.12").pip_install(f"pr-agent=={CONFIG['pr_review']['pr_agent_version']}")
+    modal.Image.debian_slim(python_version="3.12").apt_install("git")
+    .pip_install(f"pr-agent=={CONFIG['pr_review']['pr_agent_version']}")
 )
 
 PROMPT_SECTION = re.compile(
@@ -1136,14 +1138,13 @@ def check_proxy_model(model_ref: str, key: str) -> None:
     log("proxy_connected", model=model_ref)
 
 
-def pr_agent_env(repo: str, home: str) -> dict[str, str]:
-    """Build PR-Agent's whole environment: proxy model, App token, publish one review, nothing else."""
+def pr_agent_env(home: str) -> dict[str, str]:
+    """Build PR-Agent's whole environment: the proxy model and nothing else, not even a GitHub token."""
     settings = CONFIG["pr_review"]
     provider, model = settings["model"].split("/", 1)
     base_url = CONFIG["omp_models"]["providers"][provider]["baseUrl"]
     return {
         "PATH": os.environ["PATH"], "HOME": home,
-        "GITHUB__USER_TOKEN": github_token(repo),
         "OPENAI__KEY": os.environ["CLI_PROXY_API_KEY"],
         "OPENAI__API_BASE": base_url,
         # litellm routes `openai/<id>` to the proxy's chat completions endpoint. no fallback model,
@@ -1158,23 +1159,47 @@ def pr_agent_env(repo: str, home: str) -> dict[str, str]:
         "CONFIG__ADDITIONAL_REASONING_EFFORT_MODELS": json.dumps([model]),
         # litellm rejects temperature for these reasoning models while reasoning is on.
         "CONFIG__NO_TEMPERATURE_MODELS": json.dumps([model]),
-        "CONFIG__PUBLISH_OUTPUT": "true",
         # without this, PR-Agent exits 0 after a failed review.
         "CONFIG__PROPAGATE_TOOL_ERRORS": "true",
-        # repository .pr_agent.toml files can't redirect the model, key or endpoint.
+        # repository settings files can't redirect the model, key or endpoint.
         "CONFIG__USE_REPO_SETTINGS_FILE": "false",
         "CONFIG__USE_GLOBAL_SETTINGS_FILE": "false",
         "CONFIG__LOG_LEVEL": "INFO",
-        # each run posts its own review comment and changes nothing else on the PR.
+        # write the whole review to the output file in one piece.
         "PR_REVIEWER__PERSISTENT_COMMENT": "false",
-        "PR_REVIEWER__ENABLE_REVIEW_LABELS_SECURITY": "false",
-        "PR_REVIEWER__ENABLE_REVIEW_LABELS_EFFORT": "false",
     }
 
 
-@app.function(image=PR_AGENT_IMAGE, secrets=[WORKER_SECRET], retries=0, timeout=300, cpu=0.5, memory=1024)
+def checkout_pr_diff(repo: str, merge_base: str, head: str, checkout: Path) -> str:
+    """Check out the exact head and return its diff from the merge base. the token stays in git's env."""
+    token = github_token(repo)
+    header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    env = {"PATH": os.environ["PATH"], "HOME": str(checkout.parent), "GIT_TERMINAL_PROMPT": "0",
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_COUNT": "1",
+           "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+           "GIT_CONFIG_VALUE_0": f"Authorization: Basic {header}"}
+
+    def git(*args: str) -> str:
+        result = subprocess.run(["git", *args], cwd=checkout, env=env, capture_output=True, text=True, timeout=120)
+        if result.returncode:
+            detail = redact(result.stderr.strip(), (token, header))
+            raise RuntimeError(f"git {args[0]} failed ({result.returncode}): {detail[-2000:]}")
+        return result.stdout
+
+    checkout.mkdir()
+    git("init", "-q")
+    git("fetch", "-q", "--depth=1", "--no-tags", f"https://github.com/{repo}.git", merge_base, head)
+    git("checkout", "-q", "--detach", head)
+    diff = git("diff", "--no-color", "--no-ext-diff", merge_base, head)
+    # PR-Agent tries to load `[tool.pr-agent]` from its working directory's root pyproject.toml at import.
+    # 0.47.0 doesn't apply it, but the checkout is PR-controlled, so never give a later version the chance.
+    (checkout / "pyproject.toml").unlink(missing_ok=True)
+    return diff
+
+
+@app.function(image=PR_AGENT_IMAGE, secrets=[WORKER_SECRET], retries=0, timeout=420, cpu=0.5, memory=1024)
 def pr_review(job: dict[str, Any]) -> None:
-    """Post one PR-Agent review as autokas[bot]. never pushes, commits or resolves threads."""
+    """Post one PR-Agent review of one exact head as autokas[bot]. never pushes, commits or resolves threads."""
     repo, number = job["repo"], job["pr"]
     automatic = job["kind"] == "pull_request"
     if not automatic:
@@ -1188,30 +1213,46 @@ def pr_review(job: dict[str, Any]) -> None:
             or (automatic and (pr.get("draft") or generated_docs_pr(pr) or autokas_ignored(pr)))):
         log("pr_not_eligible", key=job["key"])
         return
-    if automatic and pr["head"]["sha"] != job["head"]:
+    # automatic reviews are pinned to the queued head, commands to the head they started on.
+    head = job["head"] if automatic else pr["head"]["sha"]
+    if pr["head"]["sha"] != head:
         log("review_outdated", key=job["key"])
         return
     model = CONFIG["pr_review"]["model"]
     check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
+    merge_base = github(f"repos/{repo}/compare/{pr['base']['sha']}...{head}?per_page=1")["merge_base_commit"]["sha"]
     with tempfile.TemporaryDirectory(prefix="pr-agent-") as home:
-        env = pr_agent_env(repo, home)
-        log("pr_review_started", repo=repo, pr=number, key=job["key"], head=pr["head"]["sha"],
+        checkout, diff_file, output = Path(home, "repo"), Path(home, "pr.diff"), Path(home, "review.md")
+        diff = checkout_pr_diff(repo, merge_base, head, checkout)
+        if not diff.strip():
+            log("pr_review_empty", key=job["key"], head=head)
+            return
+        diff_file.write_text(diff)
+        env = pr_agent_env(home)
+        log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
             model=model, thinking=CONFIG["pr_review"]["thinking"])
         started = time.monotonic()
         try:
+            # plain-diff mode inside the checkout: full file context for the exact head, no GitHub access.
             result = subprocess.run(
-                [sys.executable, "-m", "pr_agent.cli", "--pr_url", f"https://github.com/{repo}/pull/{number}", "review"],
-                cwd=home, env=env, capture_output=True, text=True, timeout=240,
+                [sys.executable, "-m", "pr_agent.cli", "--diff-file", str(diff_file), "--output", str(output), "review"],
+                cwd=checkout, env=env, capture_output=True, text=True, timeout=240,
             )
         except subprocess.TimeoutExpired:
             log("pr_review_failed", key=job["key"], model=model, reason="timeout")
             raise RuntimeError("PR-Agent review timed out") from None
-        if result.returncode:
-            output = (result.stdout + result.stderr).strip()
-            log("pr_review_failed", key=job["key"], model=model, code=result.returncode,
-                detail=redact(output, (env["GITHUB__USER_TOKEN"], env["OPENAI__KEY"]))[-2000:])
-            raise RuntimeError(f"PR-Agent exited with {result.returncode}")
-    log("pr_review_done", repo=repo, pr=number, key=job["key"], model=model,
+        review = output.read_text().strip() if output.is_file() else ""
+        if result.returncode or not review:
+            detail = redact((result.stdout + result.stderr).strip(), (env["OPENAI__KEY"],))
+            log("pr_review_failed", key=job["key"], model=model, code=result.returncode, detail=detail[-2000:])
+            raise RuntimeError(f"PR-Agent exited with {result.returncode} and {len(review)} review characters")
+    current = github(f"repos/{repo}/pulls/{number}")
+    if current["state"] != "open" or current["head"]["sha"] != head:
+        log("review_outdated", key=job["key"], head=head)
+        return
+    github_request("POST", f"repos/{repo}/issues/{number}/comments",
+                   {"body": f"{review}\n\n<sub>reviewed head {head}</sub>"})
+    log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model,
         seconds=round(time.monotonic() - started))
 
 

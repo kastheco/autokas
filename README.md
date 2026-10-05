@@ -31,7 +31,7 @@ Bugbot review summaries and issue comments don't start finding jobs, even when t
 
 autokas posts one PR-Agent `/review` comment as `autokas[bot]` on a same-repo PR when it's opened as ready, or when it moves from draft to ready. later pushes don't trigger another review. drafts, closed PRs, fork heads, generated docs PRs and PRs marked `autokas:ignore` are skipped. setting `pr_review.enabled` to `false` turns off both the automatic reviews and `@autokas review`.
 
-the review runs in its own small Modal function with the pinned `pr_review.pr_agent_version`, not in the omp coding container. it calls `pr_review.model` through the same CLIProxyAPI service with no fallback model, and uses the repo's App installation token. it posts one comment and never pushes, commits, labels or resolves threads. repository `.pr_agent.toml` files are ignored.
+the review runs in its own small Modal function with the pinned `pr_review.pr_agent_version`, not in the omp coding container. autokas checks out the exact queued head and hands PR-Agent only the diff from the merge base, with that checkout for file context, so PR-Agent never gets a GitHub token. it calls `pr_review.model` through the same CLIProxyAPI service with no fallback model. autokas posts the result as one comment, and only if the PR is still on the reviewed head. a push during the review means nothing is posted. it never pushes, commits, labels or resolves threads. PR-Agent doesn't see the PR title, description or commit messages, and repository `.pr_agent.toml` files are ignored.
 
 ## @autokas commands
 
