@@ -1,4 +1,4 @@
-"""Review and inline deliveries must share one coding run and inline statuses."""
+"""Review and inline deliveries must share one coding run and post no queued comments."""
 
 import copy
 import unittest
@@ -85,7 +85,7 @@ class ReviewDispatchTests(unittest.TestCase):
                 runner.worker.local(job)
         return jobs
 
-    def test_both_event_orders_start_one_job_with_only_inline_queue_comments(self):
+    def test_both_event_orders_start_one_job_without_queue_comments(self):
         review = ("pull_request_review", REVIEW)
         first, second = [("pull_request_review_comment", c) for c in COMMENTS]
         for deliveries in ((review, first, second, review), (first, second, review, first)):
@@ -95,9 +95,7 @@ class ReviewDispatchTests(unittest.TestCase):
                 self.assertEqual(len(jobs), 1)
                 self.assertEqual({t["comment"] for t in jobs[0]["targets"]}, {123, 124})
                 self.assertEqual(jobs[0]["prompt"], runner.agent_prompt(REVIEW["body"]))
-                self.assertEqual({c["in_reply_to_id"] for c in fake.comments}, {123, 124})
-                self.assertEqual(len(fake.comments), 2)
-                self.assertEqual({t["acknowledgment"]["id"] for t in jobs[0]["targets"]}, {901, 902})
+                self.assertEqual(fake.comments, [])
 
     def test_review_without_inline_findings_keeps_one_whole_review_job(self):
         fake = ReviewGitHub()
@@ -105,8 +103,7 @@ class ReviewDispatchTests(unittest.TestCase):
         jobs = self.run_events(fake, [("pull_request_review", REVIEW)] * 2)
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["targets"], [])
-        self.assertEqual(len(fake.comments), 1)
-        self.assertIsNone(fake.comments[0]["in_reply_to_id"])
+        self.assertEqual(fake.comments, [])
 
     def test_inline_delivery_can_recover_a_review_without_an_aggregate_prompt(self):
         fake = ReviewGitHub()
@@ -115,9 +112,9 @@ class ReviewDispatchTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         for c in COMMENTS:
             self.assertIn(runner.agent_prompt(c["body"]), jobs[0]["prompt"])
-        self.assertEqual(len(fake.comments), 2)
+        self.assertEqual(fake.comments, [])
 
-    def test_review_comments_are_paginated_without_queuing_other_authors(self):
+    def test_review_comments_are_paginated_without_targeting_other_authors(self):
         fake = ReviewGitHub()
         foreign = [{**copy.deepcopy(COMMENTS[0]), "id": 1000 + n, "user": {"id": 1, "login": "outsider"}}
                    for n in range(99)]
@@ -125,7 +122,7 @@ class ReviewDispatchTests(unittest.TestCase):
         jobs = self.run_events(fake, [("pull_request_review", REVIEW)])
         self.assertEqual(len(jobs), 1)
         self.assertEqual({t["comment"] for t in jobs[0]["targets"]}, {123, 124})
-        self.assertEqual({c["in_reply_to_id"] for c in fake.comments}, {123, 124})
+        self.assertEqual(fake.comments, [])
 
     def test_pending_dismissed_or_spoofed_review_cannot_start_from_inline_event(self):
         for change in ({"state": "PENDING"}, {"state": "DISMISSED"}, {"user": {**BOT, "id": 1}}):

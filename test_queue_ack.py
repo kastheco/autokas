@@ -140,15 +140,30 @@ class QueueAcknowledgmentTests(unittest.TestCase):
                     runner.worker.local(dict(command))
                 self.assertEqual(cls.return_value.run.spawn.call_count, runs)
                 self.assertEqual(len(fake.comments), runs)
-    def test_uncertain_ack_does_not_cancel_dispatched_agent(self):
-        fake = GitHubFake(lost_response=True, receipt_user=999, reply_source=123)
+
+    def test_finding_job_dispatches_without_a_queue_comment(self):
+        fake = GitHubFake()
         with patch.object(runner.urllib.request, "urlopen", fake), patch.object(runner, "PRWorker") as cls:
             cls.return_value.run.spawn.return_value = Mock(object_id="call-queued")
             runner.worker.local(job("issue_comment"))
             self.assertEqual(cls.return_value.run.spawn.call_count, 1)
         self.assertIn("routed", self.logs)
+        self.assertEqual(fake.comments, [])
+
+    def test_uncertain_command_ack_does_not_cancel_dispatched_agent(self):
+        command = {**job("issue_comment"), "mode": "command", "author": "someone", "key": f"{REPO}:command:123"}
+        fake = GitHubFake(lost_response=True, receipt_user=999, reply_source=123)
+        real = runner.github
+        access = lambda path, *args, **kwargs: ({"permission": "write"} if "/collaborators/" in path
+                                                else real(path, *args, **kwargs))
+        with patch.object(runner.urllib.request, "urlopen", fake), patch.object(runner, "github", side_effect=access), \
+                patch.object(runner, "PRWorker") as cls:
+            cls.return_value.run.spawn.return_value = Mock(object_id="call-queued")
+            runner.worker.local(command)
+            self.assertEqual(cls.return_value.run.spawn.call_count, 1)
+        self.assertIn("routed", self.logs)
         self.assertIn("ack_uncertain", self.logs)
-        self.assertEqual([method for method, _, _ in fake.calls], ["GET", "POST", "GET", "GET"])
+        self.assertEqual([method for method, _, _ in fake.calls], ["POST", "GET", "GET"])
 
 
 if __name__ == "__main__":
