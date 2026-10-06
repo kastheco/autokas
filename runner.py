@@ -265,10 +265,12 @@ use only the exact keys from trusted context finding_keys, and include only find
 actually fixed by that commit. never add this marker for rejected or blocked work.
 for an already-handled exit, write {"outcome_comment_id":<earlier PR conversation
 comment ID>} to outcome_evidence_file before writing outcome_file. the earlier
-comment must have this marker covering every finding key. the host verifies its
-author, PR relationship, age and reachable commit, and requires the current Git
-tree to equal that fixed commit's tree. without this evidence, or after any tree
-change, report the verification limit on the PR and finish uncertain instead.
+comment must have this marker covering every finding key. the host requires its
+own publication receipt binding every marker key to the publishing job's trusted
+finding_keys. it also verifies the comment's author, PR relationship, age and
+reachable commit, and requires the current Git tree to equal that fixed commit's
+tree. missing receipts or later tree changes leave verification unconfirmed.
+report that limit on the PR and finish uncertain instead.
 If every finding is already fixed and covered by that verified runner outcome,
 stop without any PR comment, thread reply, commit or push. Record "already handled"
 and the existing outcome URL in your final local output. For a mixed event, link
@@ -1022,6 +1024,10 @@ def already_handled_confirmed(job: dict[str, Any], pr: dict[str, Any], branch: s
         commit = outcome["commit"]
         if (not isinstance(covered, list) or not all(key in covered for key in finding_keys(job))
                 or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+            return False
+        publication = CLAIMS.get(f"fix:{repo}:{number}:{commit}", None)
+        if (not isinstance(publication, dict) or publication.get("branch") != branch
+                or not all(key in publication["findings"] for key in covered)):
             return False
         current_head = pr["head"]["sha"]
         if github(f"repos/{repo}/compare/{commit}...{current_head}")["status"] not in {"ahead", "identical"}:
@@ -2044,6 +2050,9 @@ class PRWorker:
                     CLAIMS.put("command:" + job["key"], record)
                 if labeled:
                     reported = outcome_file.read_text(encoding="utf-8", errors="replace").strip().lower() if outcome_file.is_file() else ""
+                    if code == 0 and publication_confirmed and reported == "published":
+                        CLAIMS.put(f"fix:{repo}:{number}:{final_head}", {
+                            "branch": branch, "findings": finding_keys(job)}, skip_if_exists=True)
                     handled = (code == 0 and reported == "already handled" and final_head == head
                                and already_handled_confirmed(job, pr, branch, evidence_file, started_at))
                     set_fix_label(repo, number, fix_state(code, publication_confirmed, reported, handled), job["key"])

@@ -747,6 +747,7 @@ class FixPublicationTests(unittest.TestCase):
         self.job = {"repo": REPO, "pr": 42, "comment": 777, "kind": "issue_comment",
                     "reviewer": "pr_agent", "head": self.starting_head,
                     "prompt": runner.pr_agent_prompt(self.body), "key": "publication-race"}
+        self.claims = {}
 
     def git(self, args, cwd=None):
         return self.real_run(["git", *args], cwd=cwd or self.root, env=self.env,
@@ -764,6 +765,15 @@ class FixPublicationTests(unittest.TestCase):
                    "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
         self.launched = False
 
+        def claim(key, value, skip_if_exists=False):
+            if skip_if_exists and key in self.claims:
+                return False
+            self.claims[key] = copy.deepcopy(value)
+            return True
+
+        store = Mock(put=Mock(side_effect=claim),
+                     get=Mock(side_effect=lambda key, default=None: copy.deepcopy(self.claims.get(key, default))))
+
         def github(path):
             if path == f"repos/{REPO}/issues/comments/888":
                 return prior_outcome
@@ -771,7 +781,7 @@ class FixPublicationTests(unittest.TestCase):
                 return {"login": "autokas[bot]", "id": 334744567, "type": "Bot"}
             if f"repos/{REPO}/commits/" in path:
                 sha = path.rsplit("/", 1)[1]
-                tree, parents = self.git(["show", "-s", "--format=%T%n%P", sha], self.origin).split("\n")
+                tree, _, parents = self.git(["show", "-s", "--format=%T%n%P", sha], self.origin).partition("\n")
                 return {"sha": sha, "commit": {"tree": {"sha": tree}},
                         "committer": {"id": 334744567 if commit_owner is None else commit_owner},
                         "parents": [{"sha": parent} for parent in parents.split()]}
@@ -833,7 +843,7 @@ class FixPublicationTests(unittest.TestCase):
             self.launched = True
             return Mock(pid=-1, **{"wait.return_value": code})
 
-        with (patch.object(runner, "CLAIMS", Mock()),
+        with (patch.object(runner, "CLAIMS", store),
               patch.dict(runner.CONFIG, {"jarvis_owner": ""}),
               patch.dict(runner.os.environ, {"PATH": runner.os.defpath, "BUN_INSTALL": "/unused",
                                              "CLI_PROXY_API_KEY": "disposable-key"}, clear=True),
@@ -911,6 +921,8 @@ class FixPublicationTests(unittest.TestCase):
         self.job["prompt"] = runner.agent_prompt(self.body)
         self.job["targets"] = [{"comment": 779, "finding_url": f"https://github.com/{REPO}/pull/42#discussion_r779",
                                 "key": "inline-fingerprint"}]
+        self.claims[f"fix:{REPO}:42:{self.fix_head}"] = {
+            "branch": PR["head"]["ref"], "findings": runner.finding_keys(self.job)}
         return {"user": {"login": "autokas[bot]", "id": 334744567},
                 "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
                 "updated_at": "2026-01-01T00:00:00Z",
@@ -923,6 +935,35 @@ class FixPublicationTests(unittest.TestCase):
         self.assertEqual(self.labels, ["fixing", "fixed"])
         self.assertEqual(self.git(["rev-parse", f"refs/heads/{PR['head']['ref']}"], self.origin), self.fix_head)
         self.assertEqual(self.dispatched, [])
+
+    def test_published_job_cannot_claim_an_unrelated_later_finding(self):
+        self.run_fix("exact")
+        self.git(["update-ref", "refs/pull/42/head", self.fix_head], self.origin)
+        self.job.pop("head")
+        self.job.update(reviewer="coderabbit", key="unrelated-finding")
+        self.body = "<details>\n<summary>Prompt for AI Agents</summary>\n\n```\nfix another bug\n```\n\n</details>"
+        self.job["prompt"] = runner.agent_prompt(self.body)
+        outcome = {"user": {"login": "autokas[bot]", "id": 334744567},
+                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
+                   "updated_at": "2026-01-01T00:00:00Z",
+                   "body": "published.\n<!-- omp-runner:fix " + json.dumps({
+                       "commit": self.fix_head, "findings": ["publication-race", self.job["key"]]}) + " -->"}
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(self.labels, ["fixing", "blocked"])
+        self.assertEqual(self.remote_head, self.fix_head)
+        self.assertEqual(self.dispatched, [])
+
+    def test_extra_marker_key_is_rejected_even_when_current_findings_are_covered(self):
+        outcome = self.earlier_fix()
+        outcome["body"] = outcome["body"].replace('"inline-fingerprint"', '"inline-fingerprint", "unrelated"')
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(self.labels, ["fixing", "blocked"])
+
+    def test_earlier_fix_without_a_host_receipt_is_not_confirmed(self):
+        outcome = self.earlier_fix()
+        self.claims.clear()
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(self.labels, ["fixing", "blocked"])
 
     def test_unverified_earlier_outcomes_never_set_fixed(self):
         outcome = self.earlier_fix()
