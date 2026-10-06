@@ -236,10 +236,14 @@ outcome, keeping its acknowledgment_marker. That edited comment is the single
 overall PR outcome, so don't post another one. Use gh api --method PATCH
 <acknowledgment.path> with the replacement body as JSON on stdin. Before editing,
 fetch the comment and verify its author against the GitHub user identified by
-trusted acknowledgment_author, its exact marker and its PR relationship. Never edit
-another author's comment. Read back an uncertain PATCH rather than blindly
-repeating it. Only if that acknowledgment cannot be found or confirmed, post the
-outcome as a new comment.
+trusted acknowledgment_author and its exact marker. For issue commands, verify
+issue_url matches https://api.github.com/repos/<repo>/issues/<pr>. For PR commands,
+verify its PR relationship. Never edit another author's comment. Read back an
+uncertain PATCH once rather than blindly repeating it. Post a new outcome comment
+only when a successful read confirms that the acknowledgment is absent or invalid.
+If the read confirms the updated outcome, reporting is complete. If the read fails
+or can't establish the result, leave the edit uncertain and report that limit in
+the final output without posting another comment.
 Only report a fix after commit, push and remote-head confirmation. Then post the
 single overall PR outcome described below, and resolve only the exact targeted
 threads whose findings were actually fixed.
@@ -261,8 +265,9 @@ the earlier outcome for handled findings in this job's outcome and report the
 remaining findings in full.
 Do not silence findings that are merely obsolete, fixed without a verified earlier
 runner outcome, blocked, or uncertain.
-Except for that verified already-handled exit and an edited command acknowledgment,
-before every normal exit post one concise outcome comment on this job's PR using
+Except for that verified already-handled exit or a command acknowledgment whose
+edit is confirmed or uncertain, before every normal exit post one concise outcome
+comment on this job's PR using
 gh pr comment <pr> --repo <repo> --body-file - with your own summary on stdin.
 Include trusted modal_run_links as Markdown links in the overall outcome.
 Preserve the dispatcher link and add the coding run link.
