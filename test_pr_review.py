@@ -117,14 +117,21 @@ class PRReviewRunTests(unittest.TestCase):
         self.addCleanup(environ.stop)
 
     def run_review(self, job, pr=None, permission="write", code=0, stderr="", review="## PR Reviewer Guide",
-                   head_after=HEAD, issues=None, checks_denied=False, diff="diff --git a/parser.py b/parser.py\n"):
+                   head_after=HEAD, issues=None, comments=None, prior_merge_base=None,
+                   checks_denied=False, diff="diff --git a/parser.py b/parser.py\n"):
         """Run pr_review with GitHub and the checkout faked; PR-Agent writes `review` and `issues` to its outputs."""
         pulls = iter([copy.deepcopy(pr or PR), {**copy.deepcopy(pr or PR), "head": {**PR["head"], "sha": head_after}}])
 
         def github(path):
             if path.endswith("/permission"):
                 return {"permission": permission}
+            if "/comments?" in path:
+                return (comments or {}).get(int(path.rsplit("page=", 1)[1]), [])
             if "/compare/" in path:
+                if job.get("previous_head") and f"/{job['previous_head']}..." in path:
+                    if isinstance(prior_merge_base, Exception):
+                        raise prior_merge_base
+                    return {"merge_base_commit": {"sha": prior_merge_base or job["previous_head"]}}
                 return {"merge_base_commit": {"sha": MERGE_BASE}}
             return next(pulls)
 
@@ -223,6 +230,46 @@ class PRReviewRunTests(unittest.TestCase):
         run = self.run_review({**self.command_job(), "instructions": "@json {\"a\": 1}"})
         self.assertTrue(run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"].endswith(
             "\n\nthe commenter asked: @json {\"a\": 1}"))
+
+    def test_fix_review_limits_diff_to_the_previous_review(self):
+        previous = "c" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker(previous, 1, findings), HEAD)
+        self.run_review(job)
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, previous, HEAD))
+
+    def test_force_pushed_fix_review_falls_back_to_the_pr_merge_base(self):
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD)
+        self.run_review(job, prior_merge_base="d" * 40)
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
+
+    def test_unavailable_previous_head_falls_back_but_other_compare_errors_fail(self):
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD)
+        missing = runner.urllib.error.HTTPError("compare", 404, "not found", {}, None)
+        self.run_review(job, prior_merge_base=missing)
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
+        denied = runner.urllib.error.HTTPError("compare", 403, "forbidden", {}, None)
+        with self.assertRaises(runner.urllib.error.HTTPError):
+            self.run_review(job, prior_merge_base=denied)
+        self.assertEqual(self.posts, [])
+        self.checkout.assert_not_called()
+
+    def test_manual_reviews_keep_the_pr_budget_across_pages_and_older_rounds(self):
+        def comment(round_, user=None):
+            return {"body": runner.pr_agent_marker("c" * 40, round_, []),
+                    "user": user or runner.CONFIG["pr_agent"]}
+
+        comments = {1: [comment(2)] + [{"body": "ordinary comment", "user": {}}] * 99,
+                    2: [comment(3), comment(1), comment(100, {"login": "outsider", "id": 1})]}
+        self.run_review(self.command_job(), comments=comments)
+        body = self.posts[0][2]["body"]
+        self.assertEqual(runner.pr_agent_review_state(body)["round"], 4)
+        self.assertEqual(self.dispatched, [])
+        comments[2].append({"body": body, "user": runner.CONFIG["pr_agent"]})
+        self.run_review(self.command_job(), comments=comments)
+        self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 5)
+        self.assertEqual(self.dispatched, [])
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
 
     def test_review_queues_one_fix_for_findings_at_or_above_the_threshold(self):
         self.run_review(self.command_job())

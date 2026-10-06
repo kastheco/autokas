@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
-from runner import CONFIG, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job, upstack
+from runner import CONFIG, POLICY, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job, upstack
 
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
@@ -630,17 +630,11 @@ class CommandInitializationTests(unittest.TestCase):
         self.stack = {"feature%2Fcommand": [child]}
         self.assertEqual(self.launch()["context"]["upstack"],
                          [{"pr": 143, "branch": "feature/child", "parent": "feature/command"}])
-
-    def test_fix_counts_as_published_when_the_restack_leaves_head_upstack(self) -> None:
-        def fix_then_restack(cwd):
-            commit = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "--allow-empty", "-m", "fix"]
-            self.git(commit, cwd=cwd)
-            self.remote_head = self.git(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()
-            self.git(["git", "checkout", "-b", "feature/child"], cwd=cwd)
-            self.git(commit[:-1] + ["chore(stack): merge feature/command into feature/child"], cwd=cwd)
-
-        self.launch(agent=fix_then_restack)
-        self.assertEqual(self.values["command:" + self.job["key"]]["published_head"], self.remote_head)
+        policy = POLICY
+        self.assertIn("Leave every upstack branch unchanged: never create merge commits", policy)
+        self.assertIn("restack by its owner", policy)
+        self.assertNotIn("chore(stack): merge", policy)
+        self.assertNotIn("Report which branches you updated", policy)
 
     def test_legacy_start_without_execution_record_stays_reporting_only(self) -> None:
         self.values["started:" + self.job["key"]] = "started"
