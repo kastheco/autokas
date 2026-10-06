@@ -639,10 +639,10 @@ def pr_agent_review_state(body: str) -> dict[str, Any] | None:
     return state if isinstance(state, dict) and isinstance(state.get("findings"), list) else None
 
 
-def pr_agent_history(repo: str, number: int, previous_head: str | None = None) -> tuple[int, list[dict[str, Any]]]:
-    """Read the next counted round and findings for a prior head from bot-authored comments."""
+def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, list[dict[str, Any]]]]:
+    """Read the next counted round and completed heads in latest-review order from bot-authored comments."""
     highest = 0
-    findings: list[dict[str, Any]] = []
+    reviews: dict[str, list[dict[str, Any]]] = {}
     for page in range(1, 1000):
         batch = github(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
         for comment in batch:
@@ -652,13 +652,15 @@ def pr_agent_history(repo: str, number: int, previous_head: str | None = None) -
             state = pr_agent_review_state(comment.get("body") or "")
             if not state:
                 continue
-            if previous_head and state.get("head") == previous_head:
-                findings = state["findings"]
+            head = state.get("head")
+            if isinstance(head, str) and re.fullmatch(r"[0-9a-fA-F]{40}", head):
+                reviews.pop(head, None)
+                reviews[head] = state["findings"]
             round_ = state.get("round")
             if not state.get("restack") and type(round_) is int and round_ > highest:
                 highest = round_
         if len(batch) < 100:
-            return highest + 1, findings
+            return highest + 1, reviews
     raise RuntimeError("PR-Agent review history exceeds the comment pagination limit")
 
 
@@ -1533,10 +1535,12 @@ def pr_review(job: dict[str, Any]) -> None:
     try:
         merge_base = github(f"repos/{repo}/compare/{pr['base']['sha']}...{head}?per_page=1")["merge_base_commit"]["sha"]
         pushed = job.get("action") == "synchronize"
-        next_round, previous_findings = pr_agent_history(repo, number, job.get("previous_head") if pushed else None)
+        next_round, reviews = pr_agent_history(repo, number)
         round_ = max(job.get("round", 1), next_round)
         diff_base = merge_base
         restack = False
+        previous_is_ancestor = False
+        previous_findings = None
         if (job["kind"] == "fix" or pushed) and job.get("previous_head"):
             previous = job["previous_head"]
             try:
@@ -1546,9 +1550,27 @@ def pr_review(job: dict[str, Any]) -> None:
                     raise
                 # a force-push can make the old reviewed commit unavailable.
             else:
-                if compared["merge_base_commit"]["sha"] == previous:
+                previous_is_ancestor = compared["merge_base_commit"]["sha"] == previous
+                if previous_is_ancestor and job["kind"] == "fix":
                     diff_base = previous
-            restack = pushed and diff_base != previous
+            restack = pushed and not previous_is_ancestor
+        if pushed and not restack:
+            # the event's before head may never have completed a review. cover every push
+            # since the latest reviewed ancestor and keep that review's unresolved findings.
+            for reviewed_head, findings in reversed(reviews.items()):
+                if reviewed_head == job.get("previous_head"):
+                    ancestor = previous_is_ancestor
+                else:
+                    try:
+                        compared = github(f"repos/{repo}/compare/{reviewed_head}...{head}?per_page=1")
+                    except urllib.error.HTTPError as error:
+                        if error.code != 404:
+                            raise
+                        continue
+                    ancestor = compared["merge_base_commit"]["sha"] == reviewed_head
+                if ancestor:
+                    diff_base, previous_findings = reviewed_head, findings
+                    break
         if restack:
             round_ = next_round - 1
         model = CONFIG["pr_review"]["restack_model" if restack else "model"]
@@ -1563,7 +1585,7 @@ def pr_review(job: dict[str, Any]) -> None:
                 return
             diff_file.write_text(diff)
             env = pr_agent_env(home, job.get("instructions", ""), model=model)
-            if job["kind"] == "fix" or (pushed and not restack):
+            if job["kind"] == "fix" or previous_findings is not None:
                 env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] += (
                     "\n\nthis is a scoped re-review. confirm whether each prior finding was fixed in the current checkout. "
                     "include every unresolved prior finding in key_issues_to_review with its severity tag and current location, "

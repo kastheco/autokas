@@ -144,7 +144,7 @@ class PRReviewRunTests(unittest.TestCase):
 
     def run_review(self, job, pr=None, permission="write", code=0, stderr="", review="## PR Reviewer Guide",
                    head_after=HEAD, issues=None, comments=None, prior_merge_base=None,
-                   checks_denied=False, diff="diff --git a/parser.py b/parser.py\n"):
+                   checks_denied=False, diff="diff --git a/parser.py b/parser.py\n", compare_bases=None):
         """Run pr_review with GitHub and the checkout faked; PR-Agent writes `review` and `issues` to its outputs."""
         pulls = iter([copy.deepcopy(pr or PR), {**copy.deepcopy(pr or PR), "head": {**PR["head"], "sha": head_after}}])
 
@@ -154,6 +154,12 @@ class PRReviewRunTests(unittest.TestCase):
             if "/comments?" in path:
                 return (comments or {}).get(int(path.rsplit("page=", 1)[1]), [])
             if "/compare/" in path:
+                left = path.split("/compare/", 1)[1].split("...", 1)[0]
+                if left in (compare_bases or {}):
+                    base = compare_bases[left]
+                    if isinstance(base, Exception):
+                        raise base
+                    return {"merge_base_commit": {"sha": base}}
                 if job.get("previous_head") and f"/{job['previous_head']}..." in path:
                     if isinstance(prior_merge_base, Exception):
                         raise prior_merge_base
@@ -271,6 +277,59 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertIn(json.dumps(findings), run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"])
         self.assertEqual(run.call_args.kwargs["env"]["CONFIG__MODEL"], "openai/" + runner.CONFIG["pr_review"]["model"].split("/", 1)[1])
         self.assertEqual(self.checks[0][2]["head_sha"], HEAD)
+
+    def test_consecutive_pushes_after_cancelled_review_use_the_reviewed_ancestor(self):
+        reviewed, intermediate = "d" * 40, "c" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        comments = {1: [{"body": runner.pr_agent_marker(reviewed, 1, findings), "user": runner.CONFIG["pr_agent"]}]}
+        first = {**self.push_job(), "previous_head": reviewed, "head": intermediate}
+        self.run_review(first, pr={**PR, "head": {**PR["head"], "sha": intermediate}}, comments=comments)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "cancelled")
+        self.assertEqual(self.posts, [])
+
+        run = self.run_review(self.push_job(), comments=comments, compare_bases={reviewed: reviewed})
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, reviewed, HEAD))
+        self.assertIn(json.dumps(findings), run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"])
+        state = runner.pr_agent_review_state(self.posts[0][2]["body"])
+        self.assertEqual(state["round"], 2)
+        self.assertFalse(state.get("restack", False))
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+
+    def test_unreviewed_push_base_falls_back_to_full_diff_and_counts_a_round(self):
+        spoofed = {"body": runner.pr_agent_marker("c" * 40, 99, []),
+                   "user": {"login": runner.CONFIG["pr_agent"]["login"], "id": 1}}
+        self.run_review(self.push_job(), comments={1: [spoofed]})
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
+        state = runner.pr_agent_review_state(self.posts[0][2]["body"])
+        self.assertEqual(state["round"], 1)
+        self.assertFalse(state.get("restack", False))
+
+    def test_unusable_recent_review_falls_back_to_an_older_verified_ancestor(self):
+        reviewed, recent = "d" * 40, "f" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        comments = {
+            1: [{"body": runner.pr_agent_marker(reviewed, 1, findings), "user": runner.CONFIG["pr_agent"]}]
+               + [{"body": "ordinary comment", "user": {}}] * 99,
+            2: [{"body": runner.pr_agent_marker(recent, 2, []), "user": runner.CONFIG["pr_agent"]}],
+        }
+        missing = runner.urllib.error.HTTPError("compare", 404, "not found", {}, None)
+        for base in (MERGE_BASE, missing):
+            with self.subTest(base=base):
+                run = self.run_review(self.push_job(), comments=comments,
+                                      compare_bases={recent: base, reviewed: reviewed})
+                self.assertEqual(self.checkout.call_args.args[:3], (REPO, reviewed, HEAD))
+                self.assertIn(json.dumps(findings), run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"])
+                self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 3)
+
+    def test_failed_reviewed_ancestor_lookup_never_posts_a_passing_review(self):
+        reviewed = "d" * 40
+        comments = {1: [{"body": runner.pr_agent_marker(reviewed, 1, []), "user": runner.CONFIG["pr_agent"]}]}
+        denied = runner.urllib.error.HTTPError("compare", 403, "forbidden", {}, None)
+        with self.assertRaises(runner.urllib.error.HTTPError):
+            self.run_review(self.push_job(), comments=comments, compare_bases={reviewed: denied})
+        self.assertEqual(self.posts, [])
+        self.checkout.assert_not_called()
+        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
 
     def test_restack_uses_configured_model_and_does_not_advance_the_budget(self):
         previous = runner.pr_agent_marker("c" * 40, 2, [])
