@@ -117,7 +117,7 @@ class PRReviewRunTests(unittest.TestCase):
         self.addCleanup(environ.stop)
 
     def run_review(self, job, pr=None, permission="write", code=0, stderr="", review="## PR Reviewer Guide",
-                   head_after=HEAD, issues=None):
+                   head_after=HEAD, issues=None, checks_denied=False, diff="diff --git a/parser.py b/parser.py\n"):
         """Run pr_review with GitHub and the checkout faked; PR-Agent writes `review` and `issues` to its outputs."""
         pulls = iter([copy.deepcopy(pr or PR), {**copy.deepcopy(pr or PR), "head": {**PR["head"], "sha": head_after}}])
 
@@ -136,14 +136,19 @@ class PRReviewRunTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, code, "", stderr)
 
         def post(method, path, payload):
+            if "/check-runs" in path:
+                if checks_denied:
+                    raise runner.urllib.error.HTTPError(path, 403, "Resource not accessible by integration", {}, None)
+                self.checks.append((method, path, payload))
+                return {"id": 88}
             self.posts.append((method, path, payload))
             return {"id": 777, "body": payload["body"], "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
                     "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
                     "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
 
         self.run = Mock(side_effect=pr_agent)
-        self.checkout = Mock(return_value="diff --git a/parser.py b/parser.py\n")
-        self.posts, self.dispatched = [], []
+        self.checkout = Mock(return_value=diff)
+        self.posts, self.checks, self.dispatched = [], [], []
         with patch.object(runner, "github", side_effect=github), patch.object(runner.subprocess, "run", self.run), \
                 patch.object(runner, "checkout_pr_diff", self.checkout), \
                 patch.object(runner, "github_request", side_effect=post), \
@@ -335,6 +340,44 @@ class PRReviewRunTests(unittest.TestCase):
                 self.assertEqual(self.posts, [])
                 self.assertEqual(self.events()[-1], "review_outdated")
 
+    def test_review_check_fails_only_on_findings_that_start_a_fix(self):
+        """The check sits on the reviewed head and ends with every way a review can stop."""
+        cases = (("fix finding", {}, None, "failure", "1 P1, 1 P3, fix threshold P2"),
+                 ("below threshold", {"issues": [ISSUES[1]]}, None, "success", "1 P3"),
+                 ("clean", {"issues": []}, None, "success", "no findings"),
+                 ("head moved", {"head_after": "d" * 40}, None, "cancelled", "the PR head moved during the review"),
+                 ("pr-agent failed", {"code": 1}, RuntimeError, "neutral", "the review didn't finish"))
+        for name, kwargs, error, conclusion, title in cases:
+            with self.subTest(name):
+                if error:
+                    with self.assertRaises(error):
+                        self.run_review(self.auto_job(), **kwargs)
+                else:
+                    self.run_review(self.auto_job(), **kwargs)
+                start, finish = self.checks
+                self.assertEqual((start[0], start[2]["head_sha"], start[2]["status"]), ("POST", HEAD, "in_progress"))
+                self.assertEqual((finish[0], finish[1]), ("PATCH", f"repos/{REPO}/check-runs/88"))
+                self.assertEqual((finish[2]["conclusion"], finish[2]["output"]["title"]), (conclusion, title))
+                self.assertEqual("details_url" in finish[2], bool(self.posts))
+
+    def test_empty_diff_finishes_check_as_skipped(self):
+        run = self.run_review(self.auto_job(), diff="")
+        start, finish = self.checks
+        self.assertEqual((start[0], start[2]["head_sha"], start[2]["status"]), ("POST", HEAD, "in_progress"))
+        self.assertEqual((finish[0], finish[1]), ("PATCH", f"repos/{REPO}/check-runs/88"))
+        self.assertEqual((finish[2]["status"], finish[2]["conclusion"], finish[2]["output"]["title"]),
+                         ("completed", "skipped", "no diff to review"))
+        run.assert_not_called()
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.dispatched, [])
+
+    def test_check_api_failure_never_stops_the_review(self):
+        # the installation may not have accepted the checks permission yet.
+        self.run_review(self.auto_job(), checks_denied=True)
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(len(self.dispatched), 1)
+        self.assertIn("check_uncertain", self.events())
+
     def test_coding_worker_rejects_a_fix_when_the_reviewed_head_moved(self):
         self.run_review(self.auto_job())
         [fix] = self.dispatched
@@ -364,6 +407,89 @@ class PRReviewRunTests(unittest.TestCase):
         coding.assert_not_called()
         self.assertEqual(self.events()[-1], "review_outdated")
         self.assertEqual(self.logs[-1][1]["head"], HEAD)
+
+    def test_finding_job_labels_its_outcome(self):
+        """`fixing` while omp runs, then one outcome label from the exit, the confirmed push and the reported outcome."""
+        self.run_review(self.auto_job())
+        [fix] = self.dispatched
+        comment = {"body": self.posts[0][2]["body"], "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
+                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
+                   "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+        pushed = "f" * 40
+        cases = (("pushed", 0, True, "published", "fixed"),
+                 ("pushed without outcome", 0, True, None, "blocked"),
+                 ("pushed with empty outcome", 0, True, "", "blocked"),
+                 ("pushed with whitespace outcome", 0, True, " \t\n", "blocked"),
+                 ("already handled", 0, False, "already handled", "fixed"),
+                 ("rejected", 0, False, "rejected", "rejected"), ("pushed but blocked", 0, True, "blocked", "blocked"),
+                 ("claims a push that didn't land", 0, False, "published", "blocked"),
+                 ("omp failed", 1, True, None, "blocked"),
+                 ("unknown outcome after push", 0, True, "not an outcome", "blocked"),
+                 ("malformed outcome after push", 0, True, b"\xff\n", "blocked"),
+                 ("malformed outcome without push", 0, False, b"\xff\n", "blocked"))
+        for name, code, push, reported, label in cases:
+            with self.subTest(name):
+                pulls = iter([PR, {**PR, "head": {**PR["head"], "sha": pushed if push else HEAD}}])
+                heads = iter([HEAD, pushed if push else HEAD])
+
+                def github(path):
+                    if "/pulls?" in path:
+                        return []
+                    return comment if path.endswith("/issues/comments/777") else copy.deepcopy(next(pulls))
+
+                def run(args, **kwargs):
+                    return subprocess.CompletedProcess(args, 0, next(heads) if args[1:2] == ["rev-parse"] else "", "")
+
+                def omp(args, **kwargs):
+                    policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
+                    context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
+                    if reported is not None:
+                        outcome_file = Path(context["outcome_file"])
+                        if isinstance(reported, bytes):
+                            outcome_file.write_bytes(reported)
+                        else:
+                            outcome_file.write_text(reported + "\n")
+                    return Mock(pid=1, wait=Mock(return_value=code))
+
+                labels = []
+                with (patch.object(runner, "CLAIMS", Mock()),
+                      patch.dict(runner.CONFIG, {"jarvis_owner": ""}),
+                      patch.dict(runner.os.environ, {"PATH": runner.os.defpath, "BUN_INSTALL": "/unused",
+                                                     "CLI_PROXY_API_KEY": "disposable-key"}, clear=True),
+                      patch.object(runner, "github", side_effect=github),
+                      patch.object(runner.subprocess, "run", side_effect=run),
+                      patch.object(runner.subprocess, "Popen", side_effect=omp),
+                      patch.object(runner.os, "killpg"),
+                      patch.object(runner, "dispatch") as dispatch,
+                      patch.object(runner, "set_fix_label", side_effect=lambda repo, pr, state, key: labels.append(state))):
+                    if code:
+                        with self.assertRaises(RuntimeError):
+                            runner.PRWorker(pr_key=f"{REPO}#42").run.local(copy.deepcopy(fix))
+                    else:
+                        runner.PRWorker(pr_key=f"{REPO}#42").run.local(copy.deepcopy(fix))
+                self.assertEqual(labels, ["fixing", label])
+                if push:
+                    [follow_up] = [call.args[0] for call in dispatch.call_args_list]
+                    self.assertEqual((follow_up["mode"], follow_up["head"]), ("pr_review", pushed))
+                else:
+                    dispatch.assert_not_called()
+
+    def test_fix_label_replaces_only_other_fix_labels(self):
+        calls = []
+
+        def request(method, path, payload=None):
+            calls.append((method, path))
+            if path.endswith("/labels") and "issues" not in path:
+                raise runner.urllib.error.HTTPError(path, 422, "already exists", {}, None)
+            if method == "POST":
+                return [{"name": name} for name in ("autokas:fixed", "autokas:fixing", "autokas:ignore", "bug")]
+            return []
+
+        with patch.object(runner, "github_request", side_effect=request):
+            runner.set_fix_label(REPO, 42, "fixed", "key")
+        self.assertEqual(calls, [("POST", f"repos/{REPO}/labels"), ("POST", f"repos/{REPO}/issues/42/labels"),
+                                 ("DELETE", f"repos/{REPO}/issues/42/labels/autokas%3Afixing")])
+        self.assertEqual(self.events(), ["label_set"])
 
     def test_failed_or_empty_review_logs_redacted_output_and_posts_nothing(self):
         leak = "key proxy-secret-key rejected"
@@ -431,7 +557,7 @@ class FixPublicationTests(unittest.TestCase):
         self.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", message], cwd)
 
     def run_fix(self, movement="restack", pr_changes=None, compare_error=None, code=0):
-        self.dispatched, self.logs = [], []
+        self.dispatched, self.logs, self.labels = [], [], []
         comment = {"body": self.body, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
                    "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
                    "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
@@ -469,6 +595,9 @@ class FixPublicationTests(unittest.TestCase):
             if args[0] == "git":
                 return self.real_popen(args, cwd=cwd, **kwargs)
             self.assertEqual(args[0], "omp")
+            policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
+            context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
+            Path(context["outcome_file"]).write_text("published\n")
             if movement != "no_change":
                 (cwd / "parser.py").write_text("result = 'fixed'\n")
                 self.commit(cwd, "fix: parser")
@@ -501,11 +630,13 @@ class FixPublicationTests(unittest.TestCase):
               patch.object(runner, "subprocess", Mock(run=run, Popen=popen)),
               patch.object(runner.os, "killpg"),
               patch.object(runner, "dispatch", side_effect=self.dispatched.append),
+              patch.object(runner, "set_fix_label", side_effect=lambda repo, pr, state, key: self.labels.append(state)),
               patch.object(runner, "log", side_effect=lambda event, **fields: self.logs.append((event, fields)))):
             runner.PRWorker(pr_key=f"{REPO}#42").run.local(self.job)
 
     def test_parent_restack_preserves_fix_publication_and_reviews_merged_head(self):
         self.run_fix()
+        self.assertEqual(self.labels, ["fixing", "fixed"])
         self.assertNotEqual(self.fix_head, self.remote_head)
         self.assertEqual(self.git(["merge-base", self.fix_head, self.remote_head], self.origin), self.fix_head)
         self.assertEqual(self.git(["show", f"{self.remote_head}:parser.py"], self.origin), "result = 'fixed'")
@@ -514,38 +645,46 @@ class FixPublicationTests(unittest.TestCase):
 
     def test_exact_pushed_head_still_reviews_fix(self):
         self.run_fix("exact")
+        self.assertEqual(self.labels, ["fixing", "fixed"])
         self.assertEqual([job["head"] for job in self.dispatched], [self.fix_head])
 
     def test_unpublished_local_fix_does_not_start_review(self):
         self.run_fix("unpublished")
+        self.assertEqual(self.labels, ["fixing", "blocked"])
         self.assertEqual(self.dispatched, [])
         self.assertFalse(next(fields["update_confirmed"] for event, fields in self.logs if event == "exited"))
 
     def test_unchanged_fix_does_not_review_someone_elses_push(self):
         self.run_fix("no_change")
+        self.assertEqual(self.labels, ["fixing", "blocked"])
         self.assertEqual(self.dispatched, [])
 
     def test_unrelated_advanced_head_does_not_confirm_local_fix(self):
         self.run_fix("diverged")
+        self.assertEqual(self.labels, ["fixing", "blocked"])
         self.assertNotEqual(self.remote_head, self.starting_head)
         self.assertEqual(self.dispatched, [])
         self.assertFalse(next(fields["update_confirmed"] for event, fields in self.logs if event == "exited"))
 
     def test_changed_head_branch_does_not_confirm_publication(self):
         self.run_fix("exact", pr_changes={"ref": "other-branch"})
+        self.assertEqual(self.labels, ["fixing", "blocked"])
         self.assertEqual(self.dispatched, [])
 
     def test_changed_head_repository_does_not_confirm_publication(self):
         self.run_fix("exact", pr_changes={"repo": {"full_name": "someone/fork"}})
+        self.assertEqual(self.labels, ["fixing", "blocked"])
         self.assertEqual(self.dispatched, [])
 
     def test_deleted_head_repository_does_not_confirm_publication(self):
         self.run_fix("exact", pr_changes={"repo": None})
+        self.assertEqual(self.labels, ["fixing", "blocked"])
         self.assertEqual(self.dispatched, [])
 
     def test_failed_ancestry_lookup_leaves_publication_unconfirmed(self):
         with self.assertRaisesRegex(TimeoutError, "compare unavailable"):
             self.run_fix(compare_error=TimeoutError("compare unavailable"))
+        self.assertEqual(self.labels, ["fixing", "blocked"])
         self.assertEqual(self.dispatched, [])
 
 
