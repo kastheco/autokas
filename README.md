@@ -22,7 +22,7 @@ the runner dispatches the job, not the agent's working process. omp owns investi
 2. the receiver accepts only completed CodeRabbit reviews or comments that carry the fenced agent prompt, and `cursor[bot]` inline comments that carry a Bugbot marked finding or a Security Reviewer finding, on a PR whose head belongs to the approved base repository. each bot is matched by its configured login and id from `config.example.json`, and a bot's comments are only parsed with that bot's own format.
 3. a Modal Dict claims the review and finding fingerprints, so duplicate deliveries don't start a second job.
 4. one `PRWorker` per repo and PR clones the repo, checks out the PR head, verifies its SHA and starts omp with the job's model profile.
-5. omp fixes what's still valid, commits as `autokas[bot]` in Conventional Commits form, pushes, updates its queued status comments and posts one outcome comment.
+5. omp fixes what's still valid, commits as `autokas[bot]` in Conventional Commits form, pushes, updates its queued status comments and posts one outcome comment. a job without inline findings, such as a PR-Agent fix, writes the outcome into its queued conversation comment instead of posting another.
 6. the container exits.
 
 Cursor's Bugbot and Security Reviewer both post as `cursor[bot]`, so its inline comments are read in either format. a Security Reviewer finding has a `CURSOR_AUTOMATION_ID` marker and an "Agentic Security Review" heading, and its prompt keeps only the severity and description. review summaries and issue comments from either don't start finding jobs, even when they contain marked finding text. a Cursor review batch uses only its collected inline findings as the agent prompt. CodeRabbit keeps its review-prompt-first behavior, falling back to joined inline prompts when the review has none.
@@ -36,6 +36,24 @@ autokas posts one PR-Agent `/review` comment as `autokas[bot]` on a same-repo PR
 the review runs in its own small Modal function with the pinned `pr_review.pr_agent_version`, not in the omp coding container. autokas checks out the exact queued head and hands PR-Agent the diff from the merge base for ready and command reviews, with that checkout for file context, so PR-Agent never gets a GitHub token. it calls `pr_review.model` through the same CLIProxyAPI service with no fallback model. autokas posts the result as one comment, and only if the PR is still on the reviewed head. a push during the review means nothing is posted. it never pushes, commits, labels or resolves threads. PR-Agent doesn't see the PR title, description or commit messages, and repository `.pr_agent.toml` files are ignored.
 
 each finding in a review is tagged `[P0]` to `[P3]`: P0 is a security hole, data loss or an outage, P1 a bug in normal use, P2 a bug under specific inputs or conditions, and P3 maintainability, style or a speculative concern. an untagged finding counts as P2. when a review has findings at or above `pr_review.fix_severity` (default `P2`), autokas queues one fix job for them through the same path as CodeRabbit and Bugbot findings, with a queued status linking the review. if that fix pushes a commit, autokas reviews only the diff from the prior reviewed head to the new head, with the full new checkout for context. the prior findings go into extra instructions: confirm whether each was fixed and report only problems introduced by the diff, not unrelated pre-existing findings. if the prior head is no longer an ancestor after a force-push, or GitHub no longer has it, the review falls back to the merge-base diff. a review with nothing at or above the threshold, a fix that pushes nothing, a push from someone else during a round, or reaching `pr_review.max_fix_rounds` (default 3 review rounds eligible for fixes per PR) ends the loop. the last review is still posted. every ready, fix and command review continues from the highest round in that PR's existing bot-authored markers; a manual `@autokas review` never resets the budget. set `fix_severity` to `null` to keep reviews and turn off the fixes. PRs marked `autokas:ignore` and generated docs PRs get no automatic fixes, even when `@autokas review` reviewed them.
+
+### status on the PR
+
+each PR-Agent review also runs as an `autokas review` check on the head it reviewed, so it shows next to CI and goes stale on the next push like any other check. it fails when the review has findings at or above `pr_review.fix_severity`, the same ones that start a fix, and passes otherwise. its title counts the findings by severity and its details link to the review comment. a review that stops early ends as `skipped` (empty diff), `cancelled` (the head moved) or `neutral` (PR-Agent failed).
+
+fix jobs for CodeRabbit, Bugbot and PR-Agent findings set one label for the latest job's outcome, replacing any earlier one: `autokas:fixing` while omp runs, then `autokas:fixed` (a fix was pushed, or an earlier job already handled the findings), `autokas:rejected` (the findings didn't warrant a change) or `autokas:blocked` (omp failed, got blocked, couldn't confirm its push, or reported a missing or unrecognized outcome even after a confirmed push). the label follows the latest job, not the head, so read it next to the check. `@autokas` commands and docs jobs don't set labels.
+
+that's enough for gh-dash sections, for example:
+
+```yaml
+prSections:
+  - title: autokas blocked
+    filters: is:open author:@me label:autokas:blocked
+  - title: autokas fixing
+    filters: is:open author:@me label:autokas:fixing
+  - title: ready
+    filters: is:open author:@me -label:autokas:fixing -label:autokas:blocked status:success
+```
 
 ## @autokas commands
 
@@ -114,6 +132,8 @@ python -m unittest discover -v
 ```
 
 covers intake and identity boundaries, review state and prompt selection, installation token isolation, clean-review acknowledgments, deploy reconciliation and docs follow-up merge safety, all without external calls.
+
+`test_pr_review` also covers the empty-diff check lifecycle: the review completes its check as `skipped` without running PR-Agent, posting a review or queuing a fix.
 
 ## stop it
 
