@@ -101,6 +101,9 @@ def reconcile_repo(repo: str, since: str) -> None:
             call = worker.spawn(job)
             print(json.dumps({'reconciled_job': job['key'], 'call_id': call.object_id}), flush=True)
 
+    # Like opened and ready_for_review, synchronize is not reconstructed here:
+    # current PR metadata cannot recover the push's before/after heads or sender.
+    # verify() replays an actual App delivery through the normal intake instead.
     for issue in pages(f'repos/{repo}/issues?state=all&since={since}'):
         if 'pull_request' not in issue:
             continue

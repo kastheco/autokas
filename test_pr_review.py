@@ -1,4 +1,4 @@
-"""PR-Agent reviews: one per ready PR or explicit command, never a coding job."""
+"""PR-Agent reviews: ready and pushed PR heads or explicit commands, never coding jobs."""
 
 import copy
 import json
@@ -24,8 +24,8 @@ ISSUES = [{"relevant_file": "parser.py\n", "issue_header": "[P1] Wrong lookup\n"
 
 
 def pr_event(action, **changes):
-    return {"action": action, "repository": {"full_name": REPO},
-            "pull_request": {**copy.deepcopy(PR), **changes}}
+    return {"action": action, "repository": {"full_name": REPO}, "before": "c" * 40, "after": HEAD,
+            "sender": {"login": "kas", "id": 1}, "pull_request": {**copy.deepcopy(PR), **changes}}
 
 
 def comment_event(body, user_type="User", on_issue=False, event="issue_comment"):
@@ -46,18 +46,44 @@ def enabled(value=True):
 
 
 class PRReviewIntakeTests(unittest.TestCase):
-    def test_reviews_once_when_ready_never_on_push(self):
-        cases = (("opened", {}, True), ("opened", {"draft": True}, False),
-                 ("ready_for_review", {}, True), ("synchronize", {}, False), ("reopened", {}, False))
-        for action, changes, expected in cases:
-            with self.subTest(action=action, changes=changes), enabled():
-                job = runner.event_job("pull_request", pr_event(action, **changes))
-                if expected:
-                    self.assertEqual(job["mode"], "pr_review")
-                    self.assertEqual(job["head"], HEAD)
-                    self.assertEqual(job["key"], f"{REPO}:pr_review:42:{HEAD}")
-                else:
-                    self.assertIsNone(job)
+    def test_ready_and_synchronize_reviews_are_pinned_to_each_head(self):
+        for action in ("opened", "ready_for_review", "synchronize"):
+            with self.subTest(action), enabled():
+                job = runner.event_job("pull_request", pr_event(action))
+                self.assertEqual((job["mode"], job["head"], job["key"]),
+                                 ("pr_review", HEAD, f"{REPO}:pr_review:42:{HEAD}"))
+        self.assertIsNone(runner.event_job("pull_request", pr_event("synchronize", draft=True)))
+        self.assertIsNone(runner.event_job("pull_request", pr_event("reopened")))
+
+    def test_autokas_push_is_skipped_but_spoofed_identity_is_not(self):
+        payload = pr_event("synchronize")
+        payload["sender"] = runner.CONFIG["pr_agent"]
+        self.assertIsNone(runner.event_job("pull_request", payload))
+        for sender in ({"login": "autokas[bot]", "id": 1}, {"login": "outsider", "id": runner.CONFIG["pr_agent"]["id"]}):
+            payload["sender"] = sender
+            self.assertIsNotNone(runner.event_job("pull_request", payload))
+
+    def test_synchronize_requires_the_exact_before_and_after(self):
+        for change in ({"before": "bad"}, {"after": "bad"}, {"after": "d" * 40}):
+            with self.subTest(change):
+                self.assertIsNone(runner.event_job("pull_request", {**pr_event("synchronize"), **change}))
+
+    def test_push_redelivery_and_fix_rereview_share_one_head_claim(self):
+        claims = set()
+
+        def claim(key, value, **kwargs):
+            if key in claims:
+                return False
+            claims.add(key)
+            return True
+        with (patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim))),
+              patch.object(runner, "worker") as worker, patch.object(runner, "log")):
+            worker.spawn.return_value = Mock(object_id="call")
+            job = runner.event_job("pull_request", pr_event("synchronize"))
+            runner.dispatch(job)
+            runner.dispatch(copy.deepcopy(job))
+            runner.dispatch(runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD))
+            self.assertEqual(worker.spawn.call_count, 1)
 
     def test_ineligible_prs_are_not_reviewed(self):
         cases = {
@@ -118,7 +144,7 @@ class PRReviewRunTests(unittest.TestCase):
 
     def run_review(self, job, pr=None, permission="write", code=0, stderr="", review="## PR Reviewer Guide",
                    head_after=HEAD, issues=None, comments=None, prior_merge_base=None,
-                   checks_denied=False, diff="diff --git a/parser.py b/parser.py\n"):
+                   checks_denied=False, diff="diff --git a/parser.py b/parser.py\n", compare_bases=None):
         """Run pr_review with GitHub and the checkout faked; PR-Agent writes `review` and `issues` to its outputs."""
         pulls = iter([copy.deepcopy(pr or PR), {**copy.deepcopy(pr or PR), "head": {**PR["head"], "sha": head_after}}])
 
@@ -128,6 +154,12 @@ class PRReviewRunTests(unittest.TestCase):
             if "/comments?" in path:
                 return (comments or {}).get(int(path.rsplit("page=", 1)[1]), [])
             if "/compare/" in path:
+                left = path.split("/compare/", 1)[1].split("...", 1)[0]
+                if left in (compare_bases or {}):
+                    base = compare_bases[left]
+                    if isinstance(base, Exception):
+                        raise base
+                    return {"merge_base_commit": {"sha": base}}
                 if job.get("previous_head") and f"/{job['previous_head']}..." in path:
                     if isinstance(prior_merge_base, Exception):
                         raise prior_merge_base
@@ -230,6 +262,118 @@ class PRReviewRunTests(unittest.TestCase):
         run = self.run_review({**self.command_job(), "instructions": "@json {\"a\": 1}"})
         self.assertTrue(run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"].endswith(
             "\n\nthe commenter asked: @json {\"a\": 1}"))
+
+    def push_job(self):
+        return {**self.auto_job(), "action": "synchronize", "previous_head": "c" * 40}
+
+    def test_ordinary_push_reviews_only_the_push_and_consumes_a_round(self):
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        comments = {1: [{"body": runner.pr_agent_marker("c" * 40, 2, findings), "user": runner.CONFIG["pr_agent"]}]}
+        run = self.run_review(self.push_job(), comments=comments)
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, "c" * 40, HEAD))
+        state = runner.pr_agent_review_state(self.posts[0][2]["body"])
+        self.assertEqual(state["round"], 3)
+        self.assertFalse(state.get("restack", False))
+        self.assertIn(json.dumps(findings), run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"])
+        self.assertEqual(run.call_args.kwargs["env"]["CONFIG__MODEL"], "openai/" + runner.CONFIG["pr_review"]["model"].split("/", 1)[1])
+        self.assertEqual(self.checks[0][2]["head_sha"], HEAD)
+
+    def test_consecutive_pushes_after_cancelled_review_use_the_reviewed_ancestor(self):
+        reviewed, intermediate = "d" * 40, "c" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        comments = {1: [{"body": runner.pr_agent_marker(reviewed, 1, findings), "user": runner.CONFIG["pr_agent"]}]}
+        first = {**self.push_job(), "previous_head": reviewed, "head": intermediate}
+        self.run_review(first, pr={**PR, "head": {**PR["head"], "sha": intermediate}}, comments=comments)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "cancelled")
+        self.assertEqual(self.posts, [])
+
+        run = self.run_review(self.push_job(), comments=comments, compare_bases={reviewed: reviewed})
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, reviewed, HEAD))
+        self.assertIn(json.dumps(findings), run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"])
+        state = runner.pr_agent_review_state(self.posts[0][2]["body"])
+        self.assertEqual(state["round"], 2)
+        self.assertFalse(state.get("restack", False))
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+
+    def test_unreviewed_push_base_falls_back_to_full_diff_and_counts_a_round(self):
+        spoofed = {"body": runner.pr_agent_marker("c" * 40, 99, []),
+                   "user": {"login": runner.CONFIG["pr_agent"]["login"], "id": 1}}
+        self.run_review(self.push_job(), comments={1: [spoofed]})
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
+        state = runner.pr_agent_review_state(self.posts[0][2]["body"])
+        self.assertEqual(state["round"], 1)
+        self.assertFalse(state.get("restack", False))
+
+    def test_unusable_recent_review_falls_back_to_an_older_verified_ancestor(self):
+        reviewed, recent = "d" * 40, "f" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        comments = {
+            1: [{"body": runner.pr_agent_marker(reviewed, 1, findings), "user": runner.CONFIG["pr_agent"]}]
+               + [{"body": "ordinary comment", "user": {}}] * 99,
+            2: [{"body": runner.pr_agent_marker(recent, 2, []), "user": runner.CONFIG["pr_agent"]}],
+        }
+        missing = runner.urllib.error.HTTPError("compare", 404, "not found", {}, None)
+        for base in (MERGE_BASE, missing):
+            with self.subTest(base=base):
+                run = self.run_review(self.push_job(), comments=comments,
+                                      compare_bases={recent: base, reviewed: reviewed})
+                self.assertEqual(self.checkout.call_args.args[:3], (REPO, reviewed, HEAD))
+                self.assertIn(json.dumps(findings), run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"])
+                self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 3)
+
+    def test_failed_reviewed_ancestor_lookup_never_posts_a_passing_review(self):
+        reviewed = "d" * 40
+        comments = {1: [{"body": runner.pr_agent_marker(reviewed, 1, []), "user": runner.CONFIG["pr_agent"]}]}
+        denied = runner.urllib.error.HTTPError("compare", 403, "forbidden", {}, None)
+        with self.assertRaises(runner.urllib.error.HTTPError):
+            self.run_review(self.push_job(), comments=comments, compare_bases={reviewed: denied})
+        self.assertEqual(self.posts, [])
+        self.checkout.assert_not_called()
+        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+
+    def test_restack_uses_configured_model_and_does_not_advance_the_budget(self):
+        previous = runner.pr_agent_marker("c" * 40, 2, [])
+        comments = {1: [{"body": previous, "user": runner.CONFIG["pr_agent"]}]}
+        with patch.dict(runner.CONFIG["pr_review"], restack_model="railway-codex/custom-restack"):
+            run = self.run_review(self.push_job(), comments=comments, prior_merge_base=MERGE_BASE)
+        self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
+        self.assertEqual(run.call_args.kwargs["env"]["CONFIG__MODEL"], "openai/custom-restack")
+        runner.check_proxy_model.assert_called_with("railway-codex/custom-restack", "proxy-secret-key")
+        body = self.posts[0][2]["body"]
+        state = runner.pr_agent_review_state(body)
+        self.assertEqual((state["round"], state["restack"]), (2, True))
+        self.assertIn("fix round 3", self.dispatched[0]["prompt"])
+        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40)["round"], 4)
+        comments[1].append({"body": body, "user": runner.CONFIG["pr_agent"]})
+        self.run_review(self.command_job(), comments=comments)
+        self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 3)
+
+    def test_restack_at_the_cap_reports_findings_without_starting_a_fix(self):
+        comments = {1: [{"body": runner.pr_agent_marker("c" * 40, 3, []), "user": runner.CONFIG["pr_agent"]}]}
+        self.run_review(self.push_job(), comments=comments, prior_merge_base=MERGE_BASE)
+        self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 3)
+        self.assertEqual(self.dispatched, [])
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+
+    def test_first_restack_has_no_counted_round_but_its_fix_does(self):
+        self.run_review(self.push_job(), prior_merge_base=MERGE_BASE)
+        body = self.posts[0][2]["body"]
+        state = runner.pr_agent_review_state(body)
+        self.assertEqual((state["round"], state["restack"]), (0, True))
+        self.assertIn("fix round 1", self.dispatched[0]["prompt"])
+        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40)["round"], 2)
+
+    def test_restack_markers_do_not_count_even_with_a_higher_stored_round(self):
+        comments = [{"body": runner.pr_agent_marker(HEAD, 2, []), "user": runner.CONFIG["pr_agent"]},
+                    {"body": runner.pr_agent_marker(HEAD, 99, [], restack=True), "user": runner.CONFIG["pr_agent"]}]
+        with patch.object(runner, "github", return_value=comments):
+            self.assertEqual(runner.pr_agent_round(REPO, 42), 3)
+
+    def test_queued_push_superseded_by_a_new_head_cancels_its_check(self):
+        self.run_review({**self.push_job(), "head": "d" * 40})
+        self.run.assert_not_called()
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.checks[-1][2]["conclusion"], "cancelled")
 
     def test_fix_review_limits_diff_to_the_previous_review(self):
         previous = "c" * 40
@@ -424,6 +568,15 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(len(self.dispatched), 1)
         self.assertIn("check_uncertain", self.events())
+        fields = next(fields for event, fields in self.logs if event == "check_uncertain")
+        self.assertEqual(fields["status_code"], 403)
+        self.assertNotIn("body", fields)
+
+    def test_finish_check_error_logs_only_the_http_status(self):
+        error = runner.urllib.error.HTTPError("check", 403, "private secret", {}, None)
+        with patch.object(runner, "github_request", side_effect=error):
+            runner.finish_review_check(REPO, 88, "key", "success", "done")
+        self.assertEqual(self.logs, [("check_uncertain", {"key": "key", "reason": "HTTPError", "status_code": 403})])
 
     def test_coding_worker_rejects_a_fix_when_the_reviewed_head_moved(self):
         self.run_review(self.auto_job())

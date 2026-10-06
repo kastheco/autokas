@@ -24,6 +24,7 @@
     "enabled": true,
     "pr_agent_version": "0.47.0",
     "model": "railway-codex/gpt-6-astra",
+    "restack_model": "railway-codex/gpt-6-luna",
     "thinking": "medium",
     "max_model_tokens": 200000,
     "fix_severity": "P2",
@@ -95,6 +96,7 @@
       "contents": "read/write",
       "workflows": "read/write",
       "pull_requests": "read/write",
+      "checks": "read/write",
       "issues": "read/write"
     },
     "app_id_env": "GITHUB_APP_ID",

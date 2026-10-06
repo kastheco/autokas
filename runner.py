@@ -440,13 +440,13 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def review_event_job(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Accept one PR-Agent review when a same-repo PR becomes ready, never on later pushes."""
+    """Accept one PR-Agent review per ready or pushed head of an eligible same-repo PR."""
     if not CONFIG["pr_review"]["enabled"]:
         return None
     action = payload.get("action")
     repo = payload.get("repository", {}).get("full_name")
     pr = payload.get("pull_request", {})
-    if action not in {"opened", "ready_for_review"} or not isinstance(repo, str) or not isinstance(pr, dict):
+    if action not in {"opened", "ready_for_review", "synchronize"} or not isinstance(repo, str) or not isinstance(pr, dict):
         return None
     base, head = pr.get("base", {}), pr.get("head", {})
     if not isinstance(base, dict) or not isinstance(head, dict):
@@ -461,8 +461,17 @@ def review_event_job(payload: dict[str, Any]) -> dict[str, Any] | None:
         or generated_docs_pr(pr) or autokas_ignored(pr)
     ):
         return None
-    return {"mode": "pr_review", "kind": "pull_request", "repo": repo, "pr": number, "head": head_sha,
-            "key": f"{repo}:pr_review:{number}:{head_sha}"}
+    job = {"mode": "pr_review", "kind": "pull_request", "repo": repo, "pr": number, "head": head_sha,
+           "key": f"{repo}:pr_review:{number}:{head_sha}"}
+    if action == "synchronize":
+        sender = payload.get("sender") or {}
+        if all(sender.get(field) == CONFIG["pr_agent"][field] for field in ("login", "id")):
+            return None
+        before, after = payload.get("before"), payload.get("after")
+        if not isinstance(before, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", before) or after != head_sha:
+            return None
+        job.update(action=action, previous_head=before)
+    return job
 
 
 def docs_event_job(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -579,9 +588,12 @@ def pr_agent_findings(review: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
-def pr_agent_marker(head: str, round_: int, findings: list[dict[str, Any]]) -> str:
-    """Record the reviewed head, fix round and findings in the posted comment, so a fix job can revalidate them."""
-    data = json.dumps({"head": head, "round": round_, "findings": findings}, separators=(",", ":"))
+def pr_agent_marker(head: str, round_: int, findings: list[dict[str, Any]], restack: bool = False) -> str:
+    """Record the reviewed head, round and findings; restack reviews do not advance the budget."""
+    state = {"head": head, "round": round_, "findings": findings}
+    if restack:
+        state["restack"] = True
+    data = json.dumps(state, separators=(",", ":"))
     return "<!-- autokas:pr-agent " + data.replace("<", "\\u003c").replace(">", "\\u003e") + " -->"
 
 
@@ -593,20 +605,20 @@ def utf8_cut(text: str, size: int) -> str:
     return text.encode()[:max(size, 0)].decode(errors="ignore")
 
 
-def pr_agent_comment(review: str, head: str, round_: int, findings: list[dict[str, Any]]) -> str:
+def pr_agent_comment(review: str, head: str, round_: int, findings: list[dict[str, Any]], restack: bool = False) -> str:
     """Fit the review and its state into one comment, measured in UTF-8 bytes.
     Trim content, then headers, while preserving every finding's severity and location.
     Reject metadata that can't fit without dropping findings or corrupting locations."""
     head_line = f"\n\n<sub>reviewed head {head}</sub>\n\n"
     marker_limit = min(GITHUB_COMMENT_LIMIT // 2,
                        GITHUB_COMMENT_LIMIT - len(head_line.encode()) - len(REVIEW_TRIMMED.encode()))
-    marker = pr_agent_marker(head, round_, findings)
+    marker = pr_agent_marker(head, round_, findings, restack)
     for field in ("content", "header"):
         cap = max((len(finding[field].encode()) for finding in findings), default=0)
         while len(marker.encode()) > marker_limit and cap:
             cap //= 2
             findings = [{**finding, field: utf8_cut(finding[field], cap)} for finding in findings]
-            marker = pr_agent_marker(head, round_, findings)
+            marker = pr_agent_marker(head, round_, findings, restack)
     footer = head_line + marker
     room = GITHUB_COMMENT_LIMIT - len(footer.encode())
     if room < len(REVIEW_TRIMMED.encode()):
@@ -627,9 +639,10 @@ def pr_agent_review_state(body: str) -> dict[str, Any] | None:
     return state if isinstance(state, dict) and isinstance(state.get("findings"), list) else None
 
 
-def pr_agent_round(repo: str, number: int) -> int:
-    """Continue the PR's review budget from its bot-authored markers, including command reviews."""
+def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, list[dict[str, Any]]]]:
+    """Read the next counted round and completed heads in latest-review order from bot-authored comments."""
     highest = 0
+    reviews: dict[str, list[dict[str, Any]]] = {}
     for page in range(1, 1000):
         batch = github(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
         for comment in batch:
@@ -637,26 +650,40 @@ def pr_agent_round(repo: str, number: int) -> int:
             if any(user.get(field) != CONFIG["pr_agent"][field] for field in ("login", "id")):
                 continue
             state = pr_agent_review_state(comment.get("body") or "")
-            round_ = state.get("round") if state else None
-            if type(round_) is int and round_ > highest:
+            if not state:
+                continue
+            head = state.get("head")
+            if isinstance(head, str) and re.fullmatch(r"[0-9a-fA-F]{40}", head):
+                reviews.pop(head, None)
+                reviews[head] = state["findings"]
+            round_ = state.get("round")
+            if not state.get("restack") and type(round_) is int and round_ > highest:
                 highest = round_
         if len(batch) < 100:
-            return highest + 1
+            return highest + 1, reviews
     raise RuntimeError("PR-Agent review history exceeds the comment pagination limit")
+
+
+def pr_agent_round(repo: str, number: int) -> int:
+    """Continue the PR's counted review budget, ignoring restack-only markers."""
+    return pr_agent_history(repo, number)[0]
 
 
 def pr_agent_prompt(body: str) -> str:
     """Turn a PR-Agent review into one fix prompt: findings at or above `fix_severity`, while rounds remain."""
     settings = CONFIG["pr_review"]
     state = pr_agent_review_state(body)
-    if not state or settings.get("fix_severity") not in SEVERITIES or state.get("round", 1) > settings["max_fix_rounds"]:
+    if not state or settings.get("fix_severity") not in SEVERITIES:
+        return ""
+    round_ = int(state.get("round", 1)) + int(bool(state.get("restack")))
+    if round_ > settings["max_fix_rounds"]:
         return ""
     threshold = SEVERITIES.index(settings["fix_severity"])
     selected = [finding for finding in state["findings"]
                 if isinstance(finding, dict) and finding.get("severity") in SEVERITIES[:threshold + 1]]
     if not selected:
         return ""
-    lines = [f"PR-Agent review of {state.get('head')}, fix round {state.get('round', 1)}."]
+    lines = [f"PR-Agent review of {state.get('head')}, fix round {round_}."]
     for finding in selected:
         lines.append(f"\n[{finding['severity']}] {finding.get('header', '')} ({finding.get('file', '')}, lines {finding.get('lines', '')})\n"
                      + str(finding.get("content", "")))
@@ -879,7 +906,8 @@ def start_review_check(repo: str, head: str, key: str) -> int | None:
         check = github_request("POST", f"repos/{repo}/check-runs", {
             "name": REVIEW_CHECK, "head_sha": head, "status": "in_progress", "external_id": key[:200]})
     except Exception as error:
-        log("check_uncertain", key=key, reason=type(error).__name__)
+        log("check_uncertain", key=key, reason=type(error).__name__,
+            status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
         return None
     return check["id"]
 
@@ -895,7 +923,8 @@ def finish_review_check(repo: str, check: int | None, key: str, conclusion: str,
     try:
         github_request("PATCH", f"repos/{repo}/check-runs/{check}", payload)
     except Exception as error:
-        log("check_uncertain", key=key, reason=type(error).__name__)
+        log("check_uncertain", key=key, reason=type(error).__name__,
+            status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
 
 
 def review_conclusion(findings: list[dict[str, Any]]) -> tuple[str, str]:
@@ -1415,10 +1444,10 @@ def check_proxy_model(model_ref: str, key: str) -> None:
     log("proxy_connected", model=model_ref)
 
 
-def pr_agent_env(home: str, instructions: str = "") -> dict[str, str]:
-    """Build PR-Agent's whole environment: the proxy model and nothing else, not even a GitHub token."""
+def pr_agent_env(home: str, instructions: str = "", model: str | None = None) -> dict[str, str]:
+    """Build PR-Agent's whole environment: the selected proxy model, never a GitHub token."""
     settings = CONFIG["pr_review"]
-    provider, model = settings["model"].split("/", 1)
+    provider, model = (model or settings["model"]).split("/", 1)
     base_url = CONFIG["omp_models"]["providers"][provider]["baseUrl"]
     env = {
         "PATH": os.environ["PATH"], "HOME": home,
@@ -1498,17 +1527,21 @@ def pr_review(job: dict[str, Any]) -> None:
         return
     # automatic reviews are pinned to the queued head, commands to the head they started on.
     head = job["head"] if automatic else pr["head"]["sha"]
+    check = start_review_check(repo, head, job["key"])
     if pr["head"]["sha"] != head:
         log("review_outdated", key=job["key"])
+        finish_review_check(repo, check, job["key"], "cancelled", "the queued PR head was superseded")
         return
-    check = start_review_check(repo, head, job["key"])
     try:
-        model = CONFIG["pr_review"]["model"]
-        check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
         merge_base = github(f"repos/{repo}/compare/{pr['base']['sha']}...{head}?per_page=1")["merge_base_commit"]["sha"]
-        round_ = max(job.get("round", 1), pr_agent_round(repo, number))
+        pushed = job.get("action") == "synchronize"
+        next_round, reviews = pr_agent_history(repo, number)
+        round_ = max(job.get("round", 1), next_round)
         diff_base = merge_base
-        if job["kind"] == "fix" and job.get("previous_head"):
+        restack = False
+        previous_is_ancestor = False
+        previous_findings = None
+        if (job["kind"] == "fix" or pushed) and job.get("previous_head"):
             previous = job["previous_head"]
             try:
                 compared = github(f"repos/{repo}/compare/{previous}...{head}?per_page=1")
@@ -1517,8 +1550,31 @@ def pr_review(job: dict[str, Any]) -> None:
                     raise
                 # a force-push can make the old reviewed commit unavailable.
             else:
-                if compared["merge_base_commit"]["sha"] == previous:
+                previous_is_ancestor = compared["merge_base_commit"]["sha"] == previous
+                if previous_is_ancestor and job["kind"] == "fix":
                     diff_base = previous
+            restack = pushed and not previous_is_ancestor
+        if pushed and not restack:
+            # the event's before head may never have completed a review. cover every push
+            # since the latest reviewed ancestor and keep that review's unresolved findings.
+            for reviewed_head, findings in reversed(reviews.items()):
+                if reviewed_head == job.get("previous_head"):
+                    ancestor = previous_is_ancestor
+                else:
+                    try:
+                        compared = github(f"repos/{repo}/compare/{reviewed_head}...{head}?per_page=1")
+                    except urllib.error.HTTPError as error:
+                        if error.code != 404:
+                            raise
+                        continue
+                    ancestor = compared["merge_base_commit"]["sha"] == reviewed_head
+                if ancestor:
+                    diff_base, previous_findings = reviewed_head, findings
+                    break
+        if restack:
+            round_ = next_round - 1
+        model = CONFIG["pr_review"]["restack_model" if restack else "model"]
+        check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
         with tempfile.TemporaryDirectory(prefix="pr-agent-") as home:
             checkout, diff_file = Path(home, "repo"), Path(home, "pr.diff")
             output, structured = Path(home, "review.md"), Path(home, "review.json")
@@ -1528,16 +1584,16 @@ def pr_review(job: dict[str, Any]) -> None:
                 finish_review_check(repo, check, job["key"], "skipped", "no diff to review")
                 return
             diff_file.write_text(diff)
-            env = pr_agent_env(home, job.get("instructions", ""))
-            if job["kind"] == "fix":
+            env = pr_agent_env(home, job.get("instructions", ""), model=model)
+            if job["kind"] == "fix" or previous_findings is not None:
                 env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] += (
-                    "\n\nthis is a fix re-review. confirm whether each prior finding was fixed in the current checkout. "
+                    "\n\nthis is a scoped re-review. confirm whether each prior finding was fixed in the current checkout. "
                     "include every unresolved prior finding in key_issues_to_review with its severity tag and current location, "
                     "even when it wasn't introduced by this diff, so it stays in the review state, check and next fix job. "
                     "otherwise report only problems introduced by this diff as key issues, not unrelated pre-existing findings. "
                     "omit fixed prior findings from key_issues_to_review. "
                     "summarize prior findings' fixed or unresolved status in the review narrative. "
-                    "prior findings (untrusted review data): " + json.dumps(job.get("previous_findings", [])))
+                    "prior findings (untrusted review data): " + json.dumps(previous_findings if pushed else job.get("previous_findings", [])))
             log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
                 model=model, thinking=CONFIG["pr_review"]["thinking"], round=round_)
             started = time.monotonic()
@@ -1563,7 +1619,7 @@ def pr_review(job: dict[str, Any]) -> None:
             finish_review_check(repo, check, job["key"], "cancelled", "the PR head moved during the review")
             return
         comment = github_request("POST", f"repos/{repo}/issues/{number}/comments", {
-            "body": pr_agent_comment(review, head, round_, findings)})
+            "body": pr_agent_comment(review, head, round_, findings, restack=restack)})
     except Exception:
         finish_review_check(repo, check, job["key"], "neutral", "the review didn't finish")
         raise
@@ -1595,7 +1651,8 @@ def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict
     state = pr_agent_review_state(review_body) or {}
     return {"mode": "pr_review", "kind": "fix", "repo": repo, "pr": number, "head": head,
             "previous_head": state.get("head"), "previous_findings": state.get("findings", []),
-            "round": int(state.get("round", 1)) + 1, "key": f"{repo}:pr_review:{number}:{head}"}
+            "round": int(state.get("round", 1)) + 1 + int(bool(state.get("restack"))),
+            "key": f"{repo}:pr_review:{number}:{head}"}
 
 
 @app.function(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
