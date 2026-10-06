@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/autokas-readme.svg" alt="autokas. review fixes, docs management, fully automated in the cloud. powered by omp and modal.com." width="860">
+  <img src="docs/assets/autokas-readme.svg" alt="autokas. reviews every PR, fixes the findings, keeps the docs current. powered by omp and modal.com." width="860">
 </p>
 
 <p align="center">
@@ -12,11 +12,38 @@
   <a href="skills">skills</a>
 </p>
 
-autokas fixes CodeRabbit, Cursor Bugbot and Cursor Security Reviewer findings without anyone sitting at a keyboard. a signed GitHub webhook lands on Modal, a configured omp agent checks out the pull request in a disposable container, runs the repo's checks, commits, pushes to the PR branch and exits.
+autokas is a GitHub App that reviews pull requests, fixes review findings and keeps docs current without anyone sitting at a keyboard. a signed GitHub webhook lands on Modal, and each job runs in a disposable container: PR-Agent for reviews, a configured omp agent for anything that changes code. the container exits when the job is done.
 
-the runner dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, scheduler, database or recovery loop. the one review autokas writes itself comes from PR-Agent, described below.
+the runner dispatches the job, not the agent's working process. omp owns investigation, edits, checks and publication. there is no controller, scheduler, database or recovery loop.
 
-## how a job runs
+## what it does
+
+- **reviews every PR.** a PR-Agent review posts as `autokas[bot]` when a PR is ready and again on each push, and shows as an `autokas review` check next to CI. findings are tagged `[P0]` to `[P3]`. see [reviews](#reviews).
+- **fixes review findings.** findings from CodeRabbit, Cursor Bugbot, Cursor Security Reviewer and autokas's own reviews go to an omp job that fixes what's still valid, runs the repo's checks and pushes to the PR branch. its own findings get up to three fix rounds, each re-reviewed. an `autokas:*` label shows the latest outcome. see [fixes](#fixes).
+- **takes instructions.** start a comment with `@autokas` on a PR or issue and it does the work, opening a PR for issues. see [commands](#autokas-commands).
+- **keeps docs current.** after a merge in a configured repo, it opens, validates and merges a follow-up docs PR. see [docs follow-ups](#docs-follow-ups).
+- **leaves stacks linear.** fixes never merge into or rewrite upstack branches, and a review after a restack spends no fix round.
+- **checks business intent.** a paired advisor answers intent questions before omp changes intended behavior. see [advisors](#advisors).
+
+## reviews
+
+autokas posts one PR-Agent `/review` comment as `autokas[bot]` on a same-repo PR when it's opened as ready, when it moves from draft to ready, and on each later push (`pull_request.synchronize`). a push whose sender matches the configured autokas bot login and ID is skipped because the fix path already reviews that head. webhook redeliveries and fix re-reviews share the same repo/PR/head claim, so a head is reviewed once. drafts, closed PRs, fork heads, generated docs PRs and PRs marked `autokas:ignore` are skipped. setting `pr_review.enabled` to `false` turns off both the automatic reviews and `@autokas review`.
+
+the review runs in its own small Modal function with the pinned `pr_review.pr_agent_version`, not in the omp coding container. autokas checks out the exact queued head and hands PR-Agent the diff from the merge base for ready and command reviews, with that checkout for file context, so PR-Agent never gets a GitHub token. it calls `pr_review.model` (or `pr_review.restack_model` for restacks) through the same CLIProxyAPI service with no fallback model. autokas posts the result as one comment, and only if the PR is still on the reviewed head. a push during the review means nothing is posted. it never pushes, commits, labels or resolves threads. PR-Agent doesn't see the PR title, description or commit messages, and repository `.pr_agent.toml` files are ignored.
+
+ordinary pushes scope the diff to the latest completed bot-authored review whose head is a verified ancestor of the new head, with that review's findings and the full new checkout. if the intermediate review was cancelled, the next review covers every push since that completed review instead of trusting the event's unreviewed before head. if no completed reviewed ancestor is available, it reviews the full merge-base diff with the normal model and consumes a round. if the event's before head is not an ancestor of after, the push is a restack: review the full merge-base diff using `pr_review.restack_model` (default `railway-codex/gpt-6-luna`). a restack marker records `restack: true` and the unchanged counted round, so the restack itself spends no fix budget. a fix started from it uses the next round as usual; its follow-up review counts too.
+
+each finding in a review is tagged `[P0]` to `[P3]`: P0 is a security hole, data loss or an outage, P1 a bug in normal use, P2 a bug under specific inputs or conditions, and P3 maintainability, style or a speculative concern. an untagged finding counts as P2. when a review has findings at or above `pr_review.fix_severity` (default `P2`), autokas queues one fix job for them through the same path as CodeRabbit and Bugbot findings, so a review with fixable findings gets the review comment, then one fix outcome comment. if that fix pushes a commit, autokas reviews only the diff from the prior reviewed head to the new head, with the full new checkout for context. the prior findings go into extra instructions: confirm whether each was fixed, keep every unresolved prior finding in `key_issues_to_review` with its severity and current location, and otherwise report only problems introduced by the diff, not unrelated pre-existing findings. fixed prior findings stay out of that structured list. the narrative summarizes both fixed and unresolved status. unresolved findings still inform the check and the next fix job, subject to the same severity threshold and round cap. if the prior head is no longer an ancestor after a force-push, or GitHub no longer has it, the review falls back to the merge-base diff. a review with nothing at or above the threshold, a fix that pushes nothing, a push from someone else during a round, or reaching `pr_review.max_fix_rounds` (default 3 review rounds eligible for fixes per PR) ends the loop. the last review is still posted. every ready, ordinary push, fix and command review continues from the highest counted round in that PR's existing bot-authored markers, ignoring restack-only markers; a manual `@autokas review` never resets the budget. set `fix_severity` to `null` to keep reviews and turn off the fixes. PRs marked `autokas:ignore` and generated docs PRs get no automatic fixes, even when `@autokas review` reviewed them.
+
+### the review check
+
+each PR-Agent review also runs as an `autokas review` check on the head it reviewed, so it shows next to CI and goes stale on the next push like any other check. it fails when the review has findings at or above `pr_review.fix_severity`, the same ones that start a fix, and passes otherwise. its title counts the findings by severity and its details link to the review comment. a review that stops early ends as `skipped` (empty diff), `cancelled` (the head moved) or `neutral` (PR-Agent failed).
+
+the GitHub App needs checks read/write permission, declared in `config.example.json`. installations must accept the updated permission before check runs can be written. a check API failure logs its HTTP status code without response bodies or tokens and does not stop the review.
+
+## fixes
+
+a fix job starts from CodeRabbit or Cursor findings, or from a PR-Agent review's findings at or above the fix threshold described above. CodeRabbit and Cursor findings follow this path:
 
 1. GitHub sends `issue_comment`, `pull_request_review_comment` or `pull_request_review` to the Modal webhook. unsigned requests get `401`.
 2. the receiver accepts only completed CodeRabbit reviews or comments that carry the fenced agent prompt, and `cursor[bot]` inline comments that carry a Bugbot marked finding or a Security Reviewer finding, on a PR whose head belongs to the approved base repository. each bot is matched by its configured login and id from `config.example.json`, and a bot's comments are only parsed with that bot's own format.
@@ -29,21 +56,7 @@ Cursor's Bugbot and Security Reviewer both post as `cursor[bot]`, so its inline 
 
 for stacked PRs, a confirmed fix push ends branch publication. the overall outcome names the upstack PRs and branches that need a restack by their owners. autokas leaves those branches unchanged, without merge commits or history rewrites.
 
-### PR-Agent reviews
-
-autokas posts one PR-Agent `/review` comment as `autokas[bot]` on a same-repo PR when it's opened as ready, when it moves from draft to ready, and on each later push (`pull_request.synchronize`). a push whose sender matches the configured autokas bot login and ID is skipped because the fix path already reviews that head. webhook redeliveries and fix re-reviews share the same repo/PR/head claim, so a head is reviewed once. drafts, closed PRs, fork heads, generated docs PRs and PRs marked `autokas:ignore` are skipped. setting `pr_review.enabled` to `false` turns off both the automatic reviews and `@autokas review`.
-
-the review runs in its own small Modal function with the pinned `pr_review.pr_agent_version`, not in the omp coding container. autokas checks out the exact queued head and hands PR-Agent the diff from the merge base for ready and command reviews, with that checkout for file context, so PR-Agent never gets a GitHub token. it calls `pr_review.model` (or `pr_review.restack_model` for restacks) through the same CLIProxyAPI service with no fallback model. autokas posts the result as one comment, and only if the PR is still on the reviewed head. a push during the review means nothing is posted. it never pushes, commits, labels or resolves threads. PR-Agent doesn't see the PR title, description or commit messages, and repository `.pr_agent.toml` files are ignored.
-
-ordinary pushes scope the diff to the latest completed bot-authored review whose head is a verified ancestor of the new head, with that review's findings and the full new checkout. if the intermediate review was cancelled, the next review covers every push since that completed review instead of trusting the event's unreviewed before head. if no completed reviewed ancestor is available, it reviews the full merge-base diff with the normal model and consumes a round. if the event's before head is not an ancestor of after, the push is a restack: review the full merge-base diff using `pr_review.restack_model` (default `railway-codex/gpt-6-luna`). a restack marker records `restack: true` and the unchanged counted round, so the restack itself spends no fix budget. a fix started from it uses the next round as usual; its follow-up review counts too.
-
-each finding in a review is tagged `[P0]` to `[P3]`: P0 is a security hole, data loss or an outage, P1 a bug in normal use, P2 a bug under specific inputs or conditions, and P3 maintainability, style or a speculative concern. an untagged finding counts as P2. when a review has findings at or above `pr_review.fix_severity` (default `P2`), autokas queues one fix job for them through the same path as CodeRabbit and Bugbot findings, so a review with fixable findings gets the review comment, then one fix outcome comment. if that fix pushes a commit, autokas reviews only the diff from the prior reviewed head to the new head, with the full new checkout for context. the prior findings go into extra instructions: confirm whether each was fixed, keep every unresolved prior finding in `key_issues_to_review` with its severity and current location, and otherwise report only problems introduced by the diff, not unrelated pre-existing findings. fixed prior findings stay out of that structured list. the narrative summarizes both fixed and unresolved status. unresolved findings still inform the check and the next fix job, subject to the same severity threshold and round cap. if the prior head is no longer an ancestor after a force-push, or GitHub no longer has it, the review falls back to the merge-base diff. a review with nothing at or above the threshold, a fix that pushes nothing, a push from someone else during a round, or reaching `pr_review.max_fix_rounds` (default 3 review rounds eligible for fixes per PR) ends the loop. the last review is still posted. every ready, ordinary push, fix and command review continues from the highest counted round in that PR's existing bot-authored markers, ignoring restack-only markers; a manual `@autokas review` never resets the budget. set `fix_severity` to `null` to keep reviews and turn off the fixes. PRs marked `autokas:ignore` and generated docs PRs get no automatic fixes, even when `@autokas review` reviewed them.
-
-### status on the PR
-
-each PR-Agent review also runs as an `autokas review` check on the head it reviewed, so it shows next to CI and goes stale on the next push like any other check. it fails when the review has findings at or above `pr_review.fix_severity`, the same ones that start a fix, and passes otherwise. its title counts the findings by severity and its details link to the review comment. a review that stops early ends as `skipped` (empty diff), `cancelled` (the head moved) or `neutral` (PR-Agent failed).
-
-the GitHub App needs checks read/write permission, declared in `config.example.json`. installations must accept the updated permission before check runs can be written. a check API failure logs its HTTP status code without response bodies or tokens and does not stop the review.
+### labels
 
 fix jobs for CodeRabbit, Bugbot and PR-Agent findings set one label for the latest job's outcome, replacing any earlier one: `autokas:fixing` while omp runs, then `autokas:fixed` (a fix was pushed, or the host verified an earlier outcome against its publishing-job receipt, the exact findings and an unchanged published fixed tree), `autokas:rejected` (the findings didn't warrant a change) or `autokas:blocked` (omp failed, got blocked, couldn't confirm publication or earlier handling, or reported a missing or unrecognized outcome even after a confirmed push). earlier outcomes without a host receipt, including pre-receipt outcomes and expired receipts, can't confirm `already handled`. the label follows the latest job, not the head, so read it next to the check. `@autokas` commands and docs jobs don't set labels.
 
@@ -81,6 +94,8 @@ a repo can be paired with an advisor: an external service omp consults before it
 `consult.py` is the client. it sends a bounded question, keeps the full answer in a private temp file for omp to read, and fails closed on any interrupted or empty response. an advisor's bearer and endpoint go only to jobs for repos it's paired with.
 
 the advisor is paired to one repository owner through `jarvis_owner` in the config. other owners get technical fixes with no advisor, and business-logic changes there are reported instead of made. the full policy is in [docs/operations.md](docs/operations.md).
+
+## docs follow-ups
 
 autokas also opens follow-up docs PRs after merges. docs jobs targeting the same repo/base branch wait in the existing Modal worker pool, while reviews keep per-PR concurrency. publication refreshes the base and reconciles stale docs and declared postprocess outputs before an exact-head merge. explicit write-authorized commands can still repair generated docs PRs. see [operations](docs/operations.md) for the bounded recovery and verification limits.
 
@@ -137,7 +152,7 @@ repository reconciliation does not reconstruct `opened`, `ready_for_review` or `
 python -m unittest discover -v
 ```
 
-covers intake and identity boundaries, review state and prompt selection, installation token isolation, clean-review acknowledgments, deploy reconciliation and docs follow-up merge safety, all without external calls.
+covers intake and identity boundaries, review state and prompt selection, PR-Agent reviews, checks and the fix loop, installation token isolation, clean-review acknowledgments, deploy reconciliation and docs follow-up merge safety, all without external calls.
 
 `test_pr_review` also covers the empty-diff check lifecycle: the review completes its check as `skipped` without running PR-Agent, posting a review or queuing a fix.
 
