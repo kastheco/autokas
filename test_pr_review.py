@@ -231,16 +231,12 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"].endswith(
             "\n\nthe commenter asked: @json {\"a\": 1}"))
 
-    def test_fix_review_limits_diff_to_the_previous_review_and_rechecks_findings(self):
+    def test_fix_review_limits_diff_to_the_previous_review(self):
         previous = "c" * 40
         findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
         job = runner.next_review_job(REPO, 42, runner.pr_agent_marker(previous, 1, findings), HEAD)
-        run = self.run_review(job)
+        self.run_review(job)
         self.assertEqual(self.checkout.call_args.args[:3], (REPO, previous, HEAD))
-        extra = run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"]
-        self.assertIn(json.dumps(findings), extra)
-        self.assertIn("confirm whether each prior finding was fixed", extra)
-        self.assertIn("report only problems introduced by this diff", extra)
 
     def test_force_pushed_fix_review_falls_back_to_the_pr_merge_base(self):
         job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD)

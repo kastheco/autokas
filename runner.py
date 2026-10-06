@@ -1532,7 +1532,10 @@ def pr_review(job: dict[str, Any]) -> None:
             if job["kind"] == "fix":
                 env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] += (
                     "\n\nthis is a fix re-review. confirm whether each prior finding was fixed in the current checkout. "
-                    "report only problems introduced by this diff as key issues, not unrelated pre-existing findings. "
+                    "include every unresolved prior finding in key_issues_to_review with its severity tag and current location, "
+                    "even when it wasn't introduced by this diff, so it stays in the review state, check and next fix job. "
+                    "otherwise report only problems introduced by this diff as key issues, not unrelated pre-existing findings. "
+                    "omit fixed prior findings from key_issues_to_review. "
                     "summarize prior findings' fixed or unresolved status in the review narrative. "
                     "prior findings (untrusted review data): " + json.dumps(job.get("previous_findings", [])))
             log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
