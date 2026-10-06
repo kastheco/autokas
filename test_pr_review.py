@@ -467,7 +467,7 @@ class PRReviewRunTests(unittest.TestCase):
                  ("pushed without outcome", 0, True, None, "blocked"),
                  ("pushed with empty outcome", 0, True, "", "blocked"),
                  ("pushed with whitespace outcome", 0, True, " \t\n", "blocked"),
-                 ("already handled", 0, False, "already handled", "fixed"),
+                 ("unverified already handled", 0, False, "already handled", "blocked"),
                  ("rejected", 0, False, "rejected", "rejected"), ("pushed but blocked", 0, True, "blocked", "blocked"),
                  ("claims a push that didn't land", 0, False, "published", "blocked"),
                  ("omp failed", 1, True, None, "blocked"),
@@ -603,14 +603,25 @@ class FixPublicationTests(unittest.TestCase):
         self.git(["add", "."], cwd)
         self.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", message], cwd)
 
-    def run_fix(self, movement="restack", pr_changes=None, compare_error=None, code=0):
+    def run_fix(self, movement="restack", pr_changes=None, compare_error=None, code=0, prior_outcome=None,
+                write_evidence=True, commit_owner=None):
         self.dispatched, self.logs, self.labels = [], [], []
-        comment = {"body": self.body, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
+        comment = {"body": self.body, "user": {**runner.CONFIG[self.job["reviewer"]], "type": "Bot"},
                    "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
                    "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
         self.launched = False
 
         def github(path):
+            if path == f"repos/{REPO}/issues/comments/888":
+                return prior_outcome
+            if path.startswith("users/"):
+                return {"login": "autokas[bot]", "id": 334744567, "type": "Bot"}
+            if f"repos/{REPO}/commits/" in path:
+                sha = path.rsplit("/", 1)[1]
+                tree, parents = self.git(["show", "-s", "--format=%T%n%P", sha], self.origin).split("\n")
+                return {"sha": sha, "commit": {"tree": {"sha": tree}},
+                        "committer": {"id": 334744567 if commit_owner is None else commit_owner},
+                        "parents": [{"sha": parent} for parent in parents.split()]}
             if path == f"repos/{REPO}/issues/comments/777":
                 return comment
             if path == f"repos/{REPO}/pulls/42":
@@ -644,8 +655,10 @@ class FixPublicationTests(unittest.TestCase):
             self.assertEqual(args[0], "omp")
             policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
             context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
-            Path(context["outcome_file"]).write_text("published\n")
-            if movement != "no_change":
+            Path(context["outcome_file"]).write_text("already handled\n" if movement == "handled" else "published\n")
+            if movement == "handled" and write_evidence:
+                Path(context["outcome_evidence_file"]).write_text(json.dumps({"outcome_comment_id": 888}))
+            if movement not in {"no_change", "handled"}:
                 (cwd / "parser.py").write_text("result = 'fixed'\n")
                 self.commit(cwd, "fix: parser")
                 self.fix_head = self.git(["rev-parse", "HEAD"], cwd)
@@ -731,6 +744,92 @@ class FixPublicationTests(unittest.TestCase):
     def test_failed_ancestry_lookup_leaves_publication_unconfirmed(self):
         with self.assertRaisesRegex(TimeoutError, "compare unavailable"):
             self.run_fix(compare_error=TimeoutError("compare unavailable"))
+        self.assertEqual(self.labels, ["fixing", "blocked"])
+        self.assertEqual(self.dispatched, [])
+
+    def earlier_fix(self):
+        (self.parent / "parser.py").write_text("result = 'fixed'\n")
+        self.commit(self.parent, "fix: parser")
+        self.fix_head = self.git(["rev-parse", "HEAD"], self.parent)
+        self.git(["push", "origin", f"HEAD:refs/heads/{PR['head']['ref']}", "HEAD:refs/pull/42/head"], self.parent)
+        self.job.pop("head")  # CodeRabbit finding jobs aren't pinned to the reviewed head.
+        self.job["reviewer"] = "coderabbit"
+        self.body = "<details>\n<summary>Prompt for AI Agents</summary>\n\n```\nfix the parser\n```\n\n</details>"
+        self.job["prompt"] = runner.agent_prompt(self.body)
+        self.job["targets"] = [{"comment": 779, "finding_url": f"https://github.com/{REPO}/pull/42#discussion_r779",
+                                "key": "inline-fingerprint"}]
+        return {"user": {"login": "autokas[bot]", "id": 334744567},
+                "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "body": "published.\n<!-- omp-runner:fix " + json.dumps({
+                    "commit": self.fix_head, "findings": [self.job["key"], "inline-fingerprint"]}) + " -->"}
+
+    def test_verified_earlier_fix_keeps_the_no_push_path(self):
+        outcome = self.earlier_fix()
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(self.labels, ["fixing", "fixed"])
+        self.assertEqual(self.git(["rev-parse", f"refs/heads/{PR['head']['ref']}"], self.origin), self.fix_head)
+        self.assertEqual(self.dispatched, [])
+
+    def test_unverified_earlier_outcomes_never_set_fixed(self):
+        outcome = self.earlier_fix()
+        cases = (("missing evidence", outcome, {"write_evidence": False}),
+                 ("wrong author id", {**outcome, "user": {"login": "autokas[bot]", "id": 1}}, {}),
+                 ("wrong author login", {**outcome, "user": {"login": "other", "id": 334744567}}, {}),
+                 ("another PR", {**outcome, "issue_url": f"https://api.github.com/repos/{REPO}/issues/99"}, {}),
+                 ("queued acknowledgment", {**outcome, "body": "queued for investigation"}, {}),
+                 ("malformed marker", {**outcome, "body": "<!-- omp-runner:fix {broken} -->"}, {}),
+                 ("partial coverage", {**outcome, "body": outcome["body"].replace('"inline-fingerprint"', '"other"')}, {}),
+                 ("changed source", {**outcome, "body": outcome["body"].replace('"publication-race"', '"other"')}, {}),
+                 ("newly edited outcome", {**outcome, "updated_at": "2100-01-01T00:00:00Z"}, {}),
+                 ("foreign commit", outcome, {"commit_owner": 1}),
+                 ("unavailable ancestry", outcome, {"compare_error": TimeoutError("compare unavailable")}),
+                 ("changed head branch", outcome, {"pr_changes": {"ref": "other"}}),
+                 ("deleted head repository", outcome, {"pr_changes": {"repo": None}}))
+        for name, receipt, kwargs in cases:
+            with self.subTest(name=name):
+                self.run_fix("handled", prior_outcome=receipt, **kwargs)
+                self.assertEqual(self.labels, ["fixing", "blocked"])
+                self.assertEqual(self.dispatched, [])
+
+    def test_reverted_earlier_fix_is_not_already_handled(self):
+        outcome = self.earlier_fix()
+        (self.parent / "parser.py").write_text("result = 'broken'\n")
+        self.commit(self.parent, "revert: parser fix")
+        self.git(["push", "origin", f"HEAD:refs/heads/{PR['head']['ref']}", "HEAD:refs/pull/42/head"], self.parent)
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(self.labels, ["fixing", "blocked"])
+        self.assertEqual(self.dispatched, [])
+
+    def test_identical_descendant_tree_preserves_earlier_fix(self):
+        outcome = self.earlier_fix()
+        self.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty",
+                  "-m", "chore: record metadata"], self.parent)
+        self.git(["push", "origin", f"HEAD:refs/heads/{PR['head']['ref']}", "HEAD:refs/pull/42/head"], self.parent)
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(self.labels, ["fixing", "fixed"])
+        self.assertNotEqual(self.remote_head, self.fix_head)
+        self.assertEqual(self.dispatched, [])
+
+    def test_unreachable_commit_with_the_same_tree_is_not_a_fix_receipt(self):
+        outcome = self.earlier_fix()
+        tree = self.git(["rev-parse", f"{self.fix_head}^{{tree}}"], self.parent)
+        sibling = self.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit-tree",
+                            tree, "-p", self.starting_head, "-m", "fix: sibling parser"], self.parent)
+        self.git(["push", "origin", f"{sibling}:refs/heads/sibling"], self.parent)
+        outcome["body"] = outcome["body"].replace(self.fix_head, sibling)
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(self.labels, ["fixing", "blocked"])
+        self.assertEqual(self.dispatched, [])
+
+    def test_empty_commit_does_not_confirm_an_earlier_fix(self):
+        outcome = self.earlier_fix()
+        self.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty",
+                  "-m", "fix: empty receipt"], self.parent)
+        empty = self.git(["rev-parse", "HEAD"], self.parent)
+        self.git(["push", "origin", f"HEAD:refs/heads/{PR['head']['ref']}", "HEAD:refs/pull/42/head"], self.parent)
+        outcome["body"] = outcome["body"].replace(self.fix_head, empty)
+        self.run_fix("handled", prior_outcome=outcome)
         self.assertEqual(self.labels, ["fixing", "blocked"])
         self.assertEqual(self.dispatched, [])
 
