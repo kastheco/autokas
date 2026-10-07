@@ -2008,7 +2008,6 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
     for reader in readers:
         reader.start()
     messages: list[str] = []
-    errors: list[str] = []
     rpc_queue = linear_intake.session_queue(job["linear"]["session_id"])
     next_poll = 0.0
     code = 0
@@ -2041,18 +2040,15 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
             except queue.Empty:
                 continue
             if name == "stderr":
-                if line:
-                    errors.append(line.rstrip())
-                    errors = errors[-30:]
                 continue
             if line is None:
-                raise RuntimeError("omp RPC closed before completing: " + "\n".join(errors))
+                raise RuntimeError("omp RPC closed before completing")
             try:
                 event = json.loads(line)
             except ValueError:
                 raise RuntimeError("omp emitted a non-JSON RPC frame") from None
             if event.get("type") == "response" and event.get("success") is False:
-                raise RuntimeError("omp RPC rejected " + str(event.get("command")) + ": " + str(event.get("error")))
+                raise RuntimeError("omp RPC rejected a command")
             if event.get("type") == "message_end":
                 message = event.get("message", {})
                 if message.get("role") == "assistant":
@@ -2062,7 +2058,6 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
                         messages.append(text)
                     if message.get("stopReason") in {"error", "aborted"}:
                         code = 1
-                        errors.append(message.get("errorMessage", message["stopReason"]))
             if event.get("type") == "tool_execution_start":
                 # These are receipts of dispatched tools, not claims they passed.
                 tool = event.get("toolName", "")
@@ -2077,7 +2072,10 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
                 break
         process.stdin.close()
         exit_code = process.wait(timeout=max(1, deadline - time.monotonic()))
-        return exit_code or code, "\n\n".join(messages[-1:]) + ("\n" + "\n".join(errors) if code else "")
+        code = exit_code or code
+        # Failure output can contain prompts, tool results or credentials.
+        # Only successful runs may provide a summary for Linear write-back.
+        return code, "" if code else "\n\n".join(messages[-1:])
     finally:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -2349,7 +2347,7 @@ class PRWorker:
                         })
                     code, summary = linear_rpc(args, worktree, env, job, prompt_file.read_text(), deadline)
                     if code:
-                        raise RuntimeError(f"omp RPC exited with {code}: {summary[-4000:]}")
+                        raise RuntimeError(f"omp RPC exited with {code}")
                     if not summary.strip():
                         raise RuntimeError("omp RPC completed without an outcome")
                     if plan_only:

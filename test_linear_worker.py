@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -83,6 +84,8 @@ class LinearWorkerTests(unittest.TestCase):
         def rpc(args, worktree, env, job, prompt, deadline):
             seen["args"] = args
             seen["record_at_launch"] = self.claims.get("command:" + self.job["key"])
+            if callable(rpc_result):
+                return rpc_result(args, worktree, env, job, prompt, deadline)
             return rpc_result
 
         with patch.dict(os.environ, PATH=os.environ["PATH"], BUN_INSTALL="/tmp", CLI_PROXY_API_KEY="test"), \
@@ -141,6 +144,52 @@ class LinearWorkerTests(unittest.TestCase):
             self.invoke((0, "Attempted changes"), remote="other")
         self.assertEqual(self.state.call_args.args[1], "error")
         self.assertEqual(self.activity.call_args.args[1], "error")
+
+    def test_rpc_failures_do_not_publish_agent_output(self):
+        private = "private prompt /work/private/file synthetic-gh-token synthetic-proxy-key synthetic-jarvis-token"
+        assistant = {"role": "assistant", "content": [{"type": "text", "text": private}]}
+        terminal = {"type": "agent_end", "isTerminal": True}
+        cases = {
+            "error": ([{"type": "message_end", "message": {**assistant, "stopReason": "error", "errorMessage": private}}, terminal], 0),
+            "aborted": ([{"type": "message_end", "message": {**assistant, "stopReason": "aborted", "errorMessage": private}}, terminal], 0),
+            "exit": ([{"type": "message_end", "message": assistant}, terminal], 7),
+            "rejected": ([{"type": "response", "success": False, "command": private, "error": private}], 0),
+            "closed": ([], 0),
+        }
+        popen = subprocess.Popen
+        rpc = runner.linear_rpc
+        for name, (frames, exit_code) in cases.items():
+            with self.subTest(name=name):
+                self.job["key"] = JOB["key"] + ":" + name
+                child = f"""import json, sys
+sys.stdin.readline()
+print({private!r}, file=sys.stderr, flush=True)
+for frame in {frames!r}:
+    print(json.dumps(frame), flush=True)
+if {bool(frames and frames[-1] == terminal)!r}:
+    sys.stdin.read()
+sys.exit({exit_code})
+"""
+
+                def launch(args, **kwargs):
+                    return popen([sys.executable, "-c", child], **kwargs)
+
+                with patch("runner.subprocess.Popen", side_effect=launch), \
+                     patch("runner.linear_intake.session_queue", return_value=queue.Queue()), \
+                     patch("runner.log") as log:
+                    with self.assertRaises(RuntimeError) as caught:
+                        self.invoke(rpc)
+                self.assertEqual(self.state.call_args.args[1], "error")
+                self.assertEqual(self.activity.call_args.args[1], "error")
+                reports = str((self.state.call_args, self.activity.call_args, log.call_args_list))
+                exception = "".join(traceback.format_exception(caught.exception))
+                for text in (reports, exception):
+                    for sensitive in ("private prompt", "/work/private/file", "synthetic-gh-token",
+                                      "synthetic-proxy-key", "synthetic-jarvis-token"):
+                        self.assertNotIn(sensitive, text)
+                record = self.claims.get("command:" + self.job["key"])
+                self.assertNotIn("linear_summary", record)
+                self.assertNotIn("published_head", record)
 
     def test_no_change_completion_is_durable_without_remote_branch(self):
         self.invoke((0, "Investigation only. No checks run."), final="base", remote="")
