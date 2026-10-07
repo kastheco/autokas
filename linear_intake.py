@@ -52,6 +52,73 @@ def verify_request(purpose: str, arguments: Any, signature: str) -> None:
         raise PermissionError("Unauthorized Linear service request")
 
 
+def execution_arguments(job: dict[str, Any]) -> dict[str, Any]:
+    """Bind the job, excluding only its proof and dispatcher receipt."""
+    return {**{key: value for key, value in job.items() if key != "modal_run_links"},
+            "linear": {key: value for key, value in job["linear"].items()
+                       if key != "execution_signature"}}
+
+
+def signed_execution(job: dict[str, Any], approved: bool = False) -> dict[str, Any]:
+    purpose = "approved_worker" if approved else "worker"
+    return {**job, "linear": {**job["linear"],
+                             "execution_signature": request_signature(purpose, execution_arguments(job))}}
+
+
+def gated_repository(repo: str) -> bool:
+    import runner
+    gated_repos = runner.CONFIG.get("linear", {}).get("gated_repos")
+    if not isinstance(gated_repos, list) or any(not isinstance(entry, str) for entry in gated_repos):
+        raise ValueError("Configure linear.gated_repos before starting Linear jobs")
+    return repo.lower() in {entry.lower() for entry in gated_repos}
+
+
+def authenticated_worker(job: dict[str, Any]) -> bool:
+    """Verify exact intake authority and enforce the current plan-first gate."""
+    arguments = execution_arguments(job)
+    signature = job["linear"].get("execution_signature", "")
+    approved = False
+    try:
+        verify_request("worker", arguments, signature)
+    except PermissionError:
+        verify_request("approved_worker", arguments, signature)
+        approved = True
+    plan_only = job["linear"].get("plan_only")
+    if job.get("mode") != "command" or not isinstance(plan_only, bool):
+        raise PermissionError("Invalid Linear execution job")
+    if gated_repository(job["repo"]) and not plan_only and not approved:
+        raise PermissionError("Linear execution requires an approved plan")
+    return plan_only
+
+
+def authorize_worker(job: dict[str, Any]) -> bool:
+    import runner
+    linear = job.get("linear")
+    if (not isinstance(linear, dict) or not isinstance(linear.get("execution_signature"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", linear["execution_signature"])):
+        raise PermissionError("Unauthorized Linear execution job")
+    return runner.linear_authorize.remote(job)
+
+
+def authenticated_steer(organization_id: str, session_id: str, key: str,
+                        envelope: Any) -> str:
+    """Authenticate a follow-up for one workspace, session and execution."""
+    if (not isinstance(envelope, dict) or set(envelope) != {"activity_id", "body", "signature"}
+            or any(not isinstance(value, str) or not value for value in envelope.values())):
+        raise PermissionError("Unauthorized Linear steering message")
+    verify_request("steer", [organization_id, session_id, key, envelope["activity_id"], envelope["body"]],
+                   envelope["signature"])
+    return envelope["body"]
+
+
+def steering_message(job: dict[str, Any], envelope: Any) -> str:
+    import runner
+    if not isinstance(envelope, dict):
+        raise PermissionError("Unauthorized Linear steering message")
+    linear = job["linear"]
+    return runner.linear_steer.remote(linear["organization_id"], linear["session_id"], job["key"], envelope)
+
+
 def oauth_token(organization_id: str, timeout: float) -> str:
     """Resolve tokens only through the credential-bearing serialized pool."""
     import runner
@@ -201,9 +268,9 @@ def get_state(session_id: str) -> dict[str, Any] | None:
 
 
 def stored_job(job: dict[str, Any]) -> dict[str, Any]:
-    """Do not expose session write-back authority through the shared claims dict."""
+    """Keep execution and write-back authority out of shared claims."""
     return {**job, "linear": {key: value for key, value in job["linear"].items()
-                             if key != "writeback_signature"}}
+                             if key not in {"writeback_signature", "execution_signature"}}}
 
 
 def set_state(job: dict[str, Any], state: str, **fields: Any) -> None:
@@ -315,7 +382,13 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
             if not isinstance(body, str) or not body.strip():
                 raise ValueError("Linear follow-up has no prompt text")
             if saved and saved["state"] in {"running", "planning", "resolving"}:
-                session_queue(job["linear"]["session_id"]).put(body)
+                live_job = saved["job"]
+                arguments = [job["linear"]["organization_id"], job["linear"]["session_id"],
+                             live_job["key"], incoming["id"], body]
+                session_queue(job["linear"]["session_id"]).put({
+                    "activity_id": incoming["id"], "body": body,
+                    "signature": request_signature("steer", arguments),
+                })
                 return
             if saved and saved["state"] == "awaiting_approval":
                 if not explicit_approval(body):
@@ -342,7 +415,7 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
                 approved = {**approved, "linear": {**approved["linear"],
                             "writeback_signature": request_signature("writeback", [
                                 job["linear"]["organization_id"], job["linear"]["session_id"]])}}
-                call = runner.worker.spawn(approved)
+                call = runner.worker.spawn(signed_execution(approved, approved=True))
                 runner.CLAIMS.put(approval_key, {**launch, "call_id": call.object_id})
                 return
             activity(job, "elicitation", "There is no live job for this session. Please delegate the issue to Autokas again.")
@@ -354,12 +427,9 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
                      + ("\nTop candidates:\n" + choices if choices else ""))
             set_state(job, "completed")
             return
-        gated_repos = runner.CONFIG.get("linear", {}).get("gated_repos")
-        if not isinstance(gated_repos, list) or any(not isinstance(repo, str) for repo in gated_repos):
-            raise ValueError("Configure linear.gated_repos before starting Linear jobs")
-        job = {**job, "repo": repo, "linear": {**job["linear"], "plan_only": repo.lower() in {entry.lower() for entry in gated_repos}}}
+        job = {**job, "repo": repo, "linear": {**job["linear"], "plan_only": gated_repository(repo)}}
         set_state(job, "planning" if job["linear"]["plan_only"] else "running")
-        runner.worker.spawn(job)
+        runner.worker.spawn(signed_execution(job))
     except Exception as exc:
         if payload.get("action") == "created":
             set_state(job, "error")
@@ -407,6 +477,14 @@ async def receive(request: Request) -> JSONResponse:
 
 def register(runner: Any) -> None:
     """Register intake and the credential service without a circular top-level import."""
+    runner.linear_authorize = runner.app.function(
+        image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET],
+        retries=0, timeout=30, name="linear_authorize",
+    )(authenticated_worker)
+    runner.linear_steer = runner.app.function(
+        image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET],
+        retries=0, timeout=30, name="linear_steer",
+    )(authenticated_steer)
     runner.linear_graphql = runner.app.function(
         image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET],
         retries=0, timeout=30, name="linear_graphql",

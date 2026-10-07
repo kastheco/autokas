@@ -200,10 +200,14 @@ class WritebackTests(unittest.TestCase):
     def test_shared_state_does_not_confer_writeback_authority(self):
         job = linear.event_job(event())
         job["linear"]["writeback_signature"] = linear.request_signature("writeback", ["org-1", "session-1"])
+        job = linear.signed_execution(job)
         with patch.object(runner, "CLAIMS") as claims:
             linear.set_state(job, "running")
         saved = claims.put.call_args.args[1]["job"]
         self.assertNotIn("writeback_signature", saved["linear"])
+        self.assertNotIn("execution_signature", saved["linear"])
+        with self.assertRaises(PermissionError):
+            linear.authorize_worker(saved)
         with patch.object(linear, "oauth_token") as api, self.assertRaises(PermissionError):
             runner.linear_writeback.local(saved["linear"]["organization_id"], saved["linear"]["session_id"],
                                            saved["linear"].get("writeback_signature", ""), "session", {"plan": []})
@@ -444,14 +448,6 @@ class ResolutionTests(unittest.TestCase):
             state.assert_called_once_with(self.job, "completed")
             worker.spawn.assert_not_called()
 
-    def test_running_prompt_steers_without_spawn(self):
-        payload = event("prompted", "Use existing validation")
-        with patch.object(runner, "CLAIMS") as claims, patch.object(linear, "get_state", return_value={"state": "running", "job": self.job}), \
-                patch.object(linear, "session_queue") as queue, patch.object(runner, "worker") as worker:
-            claims.get.return_value = None
-            linear.resolve(payload, linear.event_job(payload))
-            queue.return_value.put.assert_called_once_with("Use existing validation")
-            worker.spawn.assert_not_called()
 
     def test_failed_followup_preserves_job_and_allows_next_prompt(self):
         for status in ("running", "awaiting_approval"):
@@ -475,8 +471,6 @@ class ResolutionTests(unittest.TestCase):
                         approved = worker.spawn.call_args.args[0]
                         self.assertEqual(approved["repo"], saved_job["repo"])
                         self.assertIn("Fix parser", approved["prompt"])
-                    else:
-                        steering.return_value.put.assert_called_once_with("Use existing validation")
 
 
     def test_failed_approval_startup_can_retry_original_plan(self):

@@ -1831,6 +1831,8 @@ class LinearOAuthRefresher:
               timeout=180, cpu=0.125, memory=256)
 def worker(job: dict[str, Any]) -> None:
     """Keep the durable intake queue while routing work to one pool per PR."""
+    if job.get("linear"):
+        linear_intake.authorize_worker(job)
     if not allowed_repository(job.get("repo")):
         if job.get("linear"):
             linear_intake.set_state(job, "error", reason="Repository is not allowed")
@@ -2011,6 +2013,7 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
     messages: list[str] = []
     rpc_queue = linear_intake.session_queue(job["linear"]["session_id"])
     next_poll = 0.0
+    seen_steers: set[str] = set()
     code = 0
 
     sent = 0
@@ -2034,7 +2037,15 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
                         break
                     if steering is None:
                         break
-                    send("steer", steering)
+                    try:
+                        message = linear_intake.steering_message(job, steering)
+                    except PermissionError:
+                        log("linear_steer_unauthorized", key=job["key"])
+                        continue
+                    if steering["activity_id"] in seen_steers:
+                        continue
+                    seen_steers.add(steering["activity_id"])
+                    send("steer", message)
                 next_poll = time.monotonic() + 1
             try:
                 name, line = events.get(timeout=min(0.2, max(0.01, deadline - time.monotonic())))
@@ -2141,6 +2152,7 @@ class PRWorker:
     @modal.method()
     def run(self, job: dict[str, Any]) -> None:
         """Prepare one fresh worktree and let omp perform the entire fix workflow."""
+        plan_only = linear_intake.authorize_worker(job) if job.get("linear") else False
         if not allowed_repository(job.get("repo")):
             if job.get("linear"):
                 linear_intake.set_state(job, "error", reason="Repository is not allowed")
@@ -2152,7 +2164,6 @@ class PRWorker:
         first_start = CLAIMS.put("started:" + job["key"], start_value, skip_if_exists=True)
         if not first_start:
             log("preempted_retry", repo=job["repo"], pr=job["pr"], key=job["key"])
-        plan_only = bool(job.get("linear", {}).get("plan_only"))
         if plan_only and not first_start:
             state = linear_intake.get_state(job["linear"]["session_id"]) or {}
             if (state.get("state") == "awaiting_approval"
@@ -2322,9 +2333,8 @@ class PRWorker:
                         "--approval-mode", "yolo", "--append-system-prompt", str(policy),
                         "--max-time", str(max(1, int(deadline - time.monotonic()) - 10))]
                 if job.get("linear"):
-                    plan_only = job["linear"].get("plan_only", False)
                     context.update(linear={key: value for key, value in job["linear"].items()
-                                           if key != "writeback_signature"}, branch=job["branch"])
+                                           if key not in {"writeback_signature", "execution_signature"}}, branch=job["branch"])
                     policy.write_text(COMMAND_POLICY + POLICY + "\n" + LINEAR_POLICY
                                       + (LINEAR_PLAN_POLICY if plan_only else "")
                                       + (LINEAR_RETRY_POLICY if command_resume is not None else "")
