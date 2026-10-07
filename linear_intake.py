@@ -107,7 +107,14 @@ def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) ->
 
 
 def graphql(organization_id: str, query: str, variables: dict[str, Any], timeout: float = 3.0) -> dict[str, Any]:
-    """Use only the OAuth token belonging to this event's organization."""
+    """Keep OAuth credentials and HTTP authorization outside coding containers."""
+    import runner
+    return runner.linear_graphql.remote(organization_id, query, variables, timeout)
+
+
+def authenticated_graphql(organization_id: str, query: str, variables: dict[str, Any],
+                          timeout: float = 3.0) -> dict[str, Any]:
+    """Execute a workspace API request only inside the credential-bearing service."""
     token = oauth_token(organization_id, timeout)
     request = urllib.request.Request(
         "https://api.linear.app/graphql", data=json.dumps({"query": query, "variables": variables}).encode(),
@@ -336,7 +343,11 @@ async def receive(request: Request) -> JSONResponse:
 
 
 def register(runner: Any) -> None:
-    """Register both functions on the existing app without a circular top-level import."""
+    """Register intake and the credential service without a circular top-level import."""
+    runner.linear_graphql = runner.app.function(
+        image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET],
+        retries=0, timeout=30, name="linear_graphql",
+    )(authenticated_graphql)
     receive.__name__ = "linear_webhook"
     resolve.__name__ = "linear_resolve"
     receiver = modal.fastapi_endpoint(method="POST")(receive)

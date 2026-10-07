@@ -38,6 +38,8 @@ out, for later specs:
 
 linear intake and OAuth exchange code live in `linear_intake.py`. `runner.py` registers the per-workspace OAuth refresh class and owns the worker changes in items 5 and 6.
 
+the dispatcher and coding containers do not mount `omp-runner-linear`. `linear_graphql` handles authenticated API requests in a separate Modal container and returns only GraphQL data to its callers. the webhook receiver, resolver and OAuth refresher retain their secret mounts. this preserves progress and write-back without exposing the Linear credential bundle through the coding worker's parent environment.
+
 1. **new endpoint `linear_webhook`.** separate from the github `webhook`, with its own secret `omp-runner-linear`: the webhook signing secret, OAuth client credentials and each workspace's access token, refresh token and expiry, keyed by `organizationId`. renew expiring tokens through normal OAuth refresh and commit rotations to the `<app>-linear-oauth` Modal Volume before updating the `CLAIMS` cache. refreshes run in a single-container, single-input Modal class pool keyed by client id and organization id. the pool reloads persisted credentials before exchanging a refresh token, so concurrent callers reuse the completed rotation and idle workspaces survive cache expiry. valid cached access tokens don't need a remote refresh call. check `Linear-Signature` on the raw bytes and `webhookTimestamp` within 60 seconds, `401` otherwise.
 2. **ack.** before returning, the receiver posts one `thought` ("picked up, finding the repo").
 3. **dedupe.** in the existing `CLAIMS` dict, `created` claims `linear:session:<agentSession.id>` and `prompted` claims `linear:prompt:<agentActivity.id>`.

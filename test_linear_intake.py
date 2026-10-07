@@ -130,11 +130,11 @@ class WritebackTests(unittest.TestCase):
                 patch.object(runner, "CLAIMS") as claims, patch.object(linear.urllib.request, "urlopen") as urlopen:
             claims.get.return_value = None
             urlopen.return_value.__enter__.return_value = io.BytesIO(b'{"data":{"agentActivityCreate":{"success":true}}}')
-            linear.graphql("org-1", "mutation", {})
+            runner.linear_graphql.local("org-1", "mutation", {})
             self.assertEqual(urlopen.call_args.args[0].headers["Authorization"], "Bearer token-1")
             self.assertLess(urlopen.call_args.kwargs["timeout"], 5)
             with self.assertRaises(ValueError):
-                linear.graphql("missing", "mutation", {})
+                runner.linear_graphql.local("missing", "mutation", {})
             self.assertEqual(urlopen.call_count, 1)
 
     def test_graphql_failure_not_success(self):
@@ -143,7 +143,7 @@ class WritebackTests(unittest.TestCase):
                     patch.object(linear.urllib.request, "urlopen") as urlopen:
                 urlopen.return_value.__enter__.return_value = io.BytesIO(json.dumps(result).encode())
                 with self.assertRaises(RuntimeError):
-                    linear.graphql("org-1", "query", {})
+                    runner.linear_graphql.local("org-1", "query", {})
 
     def test_refresh_uses_rotated_credentials_after_next_expiry(self):
         initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}

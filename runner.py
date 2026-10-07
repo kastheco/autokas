@@ -1826,7 +1826,7 @@ class LinearOAuthRefresher:
         return linear_intake.refresh_oauth_token(self.organization_id, self.client_id, timeout)
 
 
-@app.function(image=IMAGE, secrets=[WORKER_SECRET, LINEAR_SECRET], max_containers=1, retries=0,
+@app.function(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
               timeout=180, cpu=0.125, memory=256)
 def worker(job: dict[str, Any]) -> None:
     """Keep the durable intake queue while routing work to one pool per PR."""
@@ -2132,7 +2132,7 @@ def linear_finish(job: dict[str, Any], summary: str, publication: dict[str, Any]
 
 
 
-@app.cls(image=IMAGE, secrets=[WORKER_SECRET, LINEAR_SECRET], max_containers=1, retries=0,
+@app.cls(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
          single_use_containers=True, timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192)
 class PRWorker:
     pr_key: str = modal.parameter()
