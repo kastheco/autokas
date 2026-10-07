@@ -40,11 +40,24 @@ SUGGESTIONS_QUERY = """query($issueId: String!, $sessionId: String!, $repos: [Ca
 }"""
 
 
+def request_signature(purpose: str, arguments: Any) -> str:
+    """Sign exact, domain-separated arguments only in Linear credential containers."""
+    message = json.dumps([purpose, arguments], sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(os.environ["LINEAR_WEBHOOK_SECRET"].encode(), message, hashlib.sha256).hexdigest()
+
+
+def verify_request(purpose: str, arguments: Any, signature: str) -> None:
+    if (not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{64}", signature)
+            or not hmac.compare_digest(signature, request_signature(purpose, arguments))):
+        raise PermissionError("Unauthorized Linear service request")
+
+
 def oauth_token(organization_id: str, timeout: float) -> str:
     """Resolve tokens only through the credential-bearing serialized pool."""
     import runner
     client_id = os.environ["LINEAR_CLIENT_ID"]
-    return runner.LinearOAuthRefresher(client_id=client_id, organization_id=organization_id).refresh.remote(timeout)
+    signature = request_signature("oauth", [client_id, organization_id, timeout])
+    return runner.LinearOAuthRefresher(client_id=client_id, organization_id=organization_id).refresh.remote(timeout, signature)
 
 
 def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) -> str:
@@ -103,14 +116,16 @@ def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) ->
 
 
 def graphql(organization_id: str, query: str, variables: dict[str, Any], timeout: float = 3.0) -> dict[str, Any]:
-    """Keep OAuth credentials and HTTP authorization outside coding containers."""
+    """Authorize an exact API request from a Linear credential-bearing caller."""
     import runner
-    return runner.linear_graphql.remote(organization_id, query, variables, timeout)
+    signature = request_signature("graphql", [organization_id, query, variables, timeout])
+    return runner.linear_graphql.remote(organization_id, query, variables, timeout, signature)
 
 
 def authenticated_graphql(organization_id: str, query: str, variables: dict[str, Any],
-                          timeout: float = 3.0) -> dict[str, Any]:
-    """Execute a workspace API request only inside the credential-bearing service."""
+                          timeout: float = 3.0, signature: str = "") -> dict[str, Any]:
+    """Reject same-app peers without proof from a Linear credential container."""
+    verify_request("graphql", [organization_id, query, variables, timeout], signature)
     token = oauth_token(organization_id, timeout)
     request = urllib.request.Request(
         "https://api.linear.app/graphql", data=json.dumps({"query": query, "variables": variables}).encode(),
@@ -126,6 +141,34 @@ def authenticated_graphql(organization_id: str, query: str, variables: dict[str,
     return data
 
 
+def session_writeback(organization_id: str, session_id: str, signature: str,
+                      operation: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """A delegated job may write only its session's activities, plan and PR links."""
+    verify_request("writeback", [organization_id, session_id], signature)
+    if not isinstance(fields, dict):
+        raise ValueError("Invalid Linear write-back fields")
+    if operation == "activity":
+        kind = fields.get("type")
+        allowed = {"type", "action", "parameter"} if kind == "action" else {"type", "body"}
+        if (kind not in {"thought", "action", "elicitation", "response", "error"}
+                or set(fields) != allowed or any(not isinstance(value, str) for value in fields.values())):
+            raise ValueError("Invalid Linear activity content")
+        query, variables = ACTIVITY_MUTATION, {"input": {"agentSessionId": session_id, "content": fields}}
+    elif operation == "session" and fields and set(fields) <= {"plan", "externalUrls"}:
+        query, variables = SESSION_MUTATION, {"id": session_id, "input": fields}
+    else:
+        raise ValueError("Unsupported Linear write-back operation or fields")
+    signature = request_signature("graphql", [organization_id, query, variables, 3.0])
+    return authenticated_graphql(organization_id, query, variables, signature=signature)
+
+
+def writeback(job: dict[str, Any], operation: str, fields: dict[str, Any]) -> dict[str, Any]:
+    import runner
+    linear = job["linear"]
+    return runner.linear_writeback.remote(linear["organization_id"], linear["session_id"],
+                                          linear["writeback_signature"], operation, fields)
+
+
 def activity(job: dict[str, Any], type: str, body: str | dict[str, Any]) -> dict[str, Any]:
     """Emit an activity; action content uses action/parameter, not body."""
     if type not in {"thought", "action", "elicitation", "response", "error"}:
@@ -137,18 +180,12 @@ def activity(job: dict[str, Any], type: str, body: str | dict[str, Any]) -> dict
         })
     else:
         content["body"] = body
-    linear = job["linear"]
-    return graphql(linear["organization_id"], ACTIVITY_MUTATION, {
-        "input": {"agentSessionId": linear["session_id"], "content": content},
-    })
+    return writeback(job, "activity", content)
 
 
 def update_session(job: dict[str, Any], **fields: Any) -> dict[str, Any]:
     """Replace a plan or set external URLs using the official update input."""
-    linear = job["linear"]
-    return graphql(linear["organization_id"], SESSION_MUTATION, {
-        "id": linear["session_id"], "input": fields,
-    })
+    return writeback(job, "session", fields)
 
 
 def session_queue(session_id: str) -> modal.Queue:
@@ -163,13 +200,19 @@ def get_state(session_id: str) -> dict[str, Any] | None:
     return runner.CLAIMS.get(f"linear:state:{session_id}", None)
 
 
+def stored_job(job: dict[str, Any]) -> dict[str, Any]:
+    """Do not expose session write-back authority through the shared claims dict."""
+    return {**job, "linear": {key: value for key, value in job["linear"].items()
+                             if key != "writeback_signature"}}
+
+
 def set_state(job: dict[str, Any], state: str, **fields: Any) -> None:
     """Persist the resolved job so a subsequent explicit approval can start it."""
     import runner
     if state not in STATES:
         raise ValueError("Unsupported Linear intake state")
     runner.CLAIMS.put(f'linear:state:{job["linear"]["session_id"]}', {
-        "state": state, "job": job, **fields,
+        "state": state, "job": stored_job(job), **fields,
     })
 
 
@@ -283,7 +326,7 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
                 if not runner.allowed_repository(approved["repo"]):
                     raise ValueError("Linear repository is outside allowed owners")
                 approval_key = f'linear:approval:{job["linear"]["session_id"]}'
-                launch = {"job": approved}
+                launch = {"job": stored_job(approved)}
                 if not runner.CLAIMS.put(approval_key, launch, skip_if_exists=True):
                     launch = runner.CLAIMS.get(approval_key, None)
                     if not isinstance(launch, dict):
@@ -296,6 +339,9 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
                 # A lost spawn response may still enqueue work. Reuse the original
                 # command key so the serialized coding pool reconciles execution.
                 # Only the coding worker may replace the saved plan with running.
+                approved = {**approved, "linear": {**approved["linear"],
+                            "writeback_signature": request_signature("writeback", [
+                                job["linear"]["organization_id"], job["linear"]["session_id"]])}}
                 call = runner.worker.spawn(approved)
                 runner.CLAIMS.put(approval_key, {**launch, "call_id": call.object_id})
                 return
@@ -322,6 +368,12 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
         raise
 
 
+def authenticated_resolve(payload: dict[str, Any], job: dict[str, Any], signature: str = "") -> None:
+    """Do not let a coding peer forge intake to reach privileged repository queries."""
+    verify_request("resolve", [payload, job], signature)
+    resolve(payload, job)
+
+
 async def receive(request: Request) -> JSONResponse:
     """Authenticate, claim once, acknowledge synchronously and spawn resolution."""
     import runner
@@ -332,6 +384,8 @@ async def receive(request: Request) -> JSONResponse:
     job = event_job(payload)
     if job is None:
         return JSONResponse({"status": "ignored"})
+    job["linear"]["writeback_signature"] = request_signature(
+        "writeback", [job["linear"]["organization_id"], job["linear"]["session_id"]])
     if not await runner.CLAIMS.put.aio(job["key"], "claimed", skip_if_exists=True):
         return JSONResponse({"status": "duplicate"})
     try:
@@ -342,7 +396,8 @@ async def receive(request: Request) -> JSONResponse:
         await runner.CLAIMS.pop.aio(job["key"], None)
         return JSONResponse({"error": "Linear acknowledgment unavailable"}, status_code=503)
     try:
-        await runner.linear_resolve.spawn.aio(payload, job)
+        signature = request_signature("resolve", [payload, job])
+        await runner.linear_resolve.spawn.aio(payload, job, signature)
     except Exception:
         # A failed spawn response may still have started the resolver. Never replay.
         runner.log("linear_spawn_uncertain", key=job["key"])
@@ -356,12 +411,16 @@ def register(runner: Any) -> None:
         image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET],
         retries=0, timeout=30, name="linear_graphql",
     )(authenticated_graphql)
+    runner.linear_writeback = runner.app.function(
+        image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET],
+        retries=0, timeout=30, name="linear_writeback",
+    )(session_writeback)
     receive.__name__ = "linear_webhook"
-    resolve.__name__ = "linear_resolve"
+    authenticated_resolve.__name__ = "linear_resolve"
     receiver = modal.fastapi_endpoint(method="POST")(receive)
     runner.linear_webhook = runner.app.function(
         image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET], timeout=30, name="linear_webhook",
     )(receiver)
     runner.linear_resolve = runner.app.function(
         image=runner.IMAGE, secrets=[runner.WORKER_SECRET, LINEAR_SECRET], timeout=300, name="linear_resolve",
-    )(resolve)
+    )(authenticated_resolve)

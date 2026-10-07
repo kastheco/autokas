@@ -74,6 +74,9 @@ class SignatureTests(unittest.TestCase):
 class WritebackTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
+        patcher = patch.dict(os.environ, LINEAR_WEBHOOK_SECRET="synthetic-signing-secret")
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.addCleanup(directory.cleanup)
         for patcher in (patch.object(linear, "OAUTH_STORAGE", Path(directory.name)),
                         patch.object(runner, "LINEAR_OAUTH_VOLUME", Mock())):
@@ -81,6 +84,7 @@ class WritebackTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         # Emulate Modal's per-parameter single-input pools without remote calls.
         refresher = runner.LinearOAuthRefresher
+        self.refresher = refresher
         pools = {}
         guard = threading.Lock()
 
@@ -91,9 +95,9 @@ class WritebackTests(unittest.TestCase):
                     pools[key] = (threading.Lock(), refresher(client_id=client_id, organization_id=organization_id))
                 lock, worker = pools[key]
 
-            def refresh(timeout):
+            def refresh(timeout, signature):
                 with lock:
-                    return worker.refresh.local(timeout)
+                    return worker.refresh.local(timeout, signature)
 
             proxy = Mock()
             proxy.refresh.remote.side_effect = refresh
@@ -103,25 +107,107 @@ class WritebackTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_activity_shapes(self):
-        job = {**linear.event_job(event()), "repo": "example-org/app"}
-        with patch.object(linear, "graphql") as api:
-            for kind in ("thought", "elicitation", "response", "error"):
-                linear.activity(job, kind, "message")
-                self.assertEqual(api.call_args.args[2], {"input": {
-                    "agentSessionId": "session-1", "content": {"type": kind, "body": "message"}}})
-            linear.activity(job, "action", "Cloning")
-            self.assertEqual(api.call_args.args[2]["input"]["content"], {
-                "type": "action", "action": "Cloning", "parameter": "example-org/app"})
-            self.assertIn("AgentActivityCreateInput!", api.call_args.args[1])
+    def test_peer_cannot_run_unsigned_graphql(self):
+        with patch.object(linear, "oauth_token", return_value="synthetic-token") as token, \
+                patch.object(linear.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = io.BytesIO(b'{"data":{"viewer":{"id":"private"}}}')
+            with self.assertRaises(PermissionError):
+                runner.linear_graphql.local("org-2", "query { viewer { id } }", {})
+            token.assert_not_called()
+            urlopen.assert_not_called()
 
-    def test_plan_and_external_urls_input(self):
-        plan = [{"content": "Change code", "status": "pending"}]
-        urls = [{"label": "Pull request", "url": "https://github.com/example-org/app/pull/1"}]
-        with patch.object(linear, "graphql") as api:
-            linear.update_session(linear.event_job(event()), plan=plan, externalUrls=urls)
-            self.assertEqual(api.call_args.args[2], {"id": "session-1", "input": {"plan": plan, "externalUrls": urls}})
-            self.assertIn("agentSessionUpdate(id: $id, input: $input)", api.call_args.args[1])
+    def test_graphql_proof_binds_workspace_document_variables_and_timeout(self):
+        arguments = ["org-1", "query($id: String!) { issue(id: $id) { id } }", {"id": "issue-1"}, 3.0]
+        signature = linear.request_signature("graphql", arguments)
+        altered = [
+            ["org-2", *arguments[1:]],
+            [arguments[0], "mutation { issueDelete(id: \"issue-1\") { success } }", *arguments[2:]],
+            [*arguments[:2], {"id": "issue-2"}, arguments[3]],
+            [*arguments[:3], 30.0],
+        ]
+        with patch.object(linear, "oauth_token") as token:
+            for request in altered:
+                with self.subTest(request=request), self.assertRaises(PermissionError):
+                    runner.linear_graphql.local(*request, signature)
+            token.assert_not_called()
+
+    def test_peer_cannot_extract_tokens_from_refresher(self):
+        # Exercise the actual exported Modal method, not the emulated pool.
+        refresher = self.refresher(client_id="client", organization_id="org-1")
+        with patch.object(linear, "refresh_oauth_token") as refresh:
+            for signature in ("", "0" * 64, linear.request_signature("writeback", ["org-1", "session-1"]),
+                              linear.request_signature("oauth", ["client", "org-2", 3.0])):
+                with self.subTest(signature=signature), self.assertRaises(PermissionError):
+                    refresher.refresh.local(3.0, signature)
+            refresh.assert_not_called()
+
+    def test_peer_cannot_forge_resolver_intake(self):
+        payload = event()
+        job = linear.event_job(payload)
+        signature = linear.request_signature("resolve", [payload, job])
+        with patch.object(linear, "resolve") as resolve:
+            for proof in ("", "0" * 64, linear.request_signature("writeback", ["org-1", "session-1"])):
+                with self.assertRaises(PermissionError):
+                    runner.linear_resolve.local(payload, job, proof)
+            with self.assertRaises(PermissionError):
+                runner.linear_resolve.local({**payload, "organizationId": "org-2"}, job, signature)
+            with self.assertRaises(PermissionError):
+                runner.linear_resolve.local(payload, {**job, "prompt": "forged task"}, signature)
+            resolve.assert_not_called()
+
+    def test_writeback_cannot_change_scope_or_gain_service_authority(self):
+        signature = linear.request_signature("writeback", ["org-1", "session-1"])
+        fields = {"type": "thought", "body": "progress"}
+        with patch.object(linear, "oauth_token") as token, patch.object(linear, "graphql") as api:
+            for org, session, proof in (("org-2", "session-1", signature), ("org-1", "session-2", signature),
+                                        ("org-1", "session-1", "0" * 64)):
+                with self.assertRaises(PermissionError):
+                    runner.linear_writeback.local(org, session, proof, "activity", fields)
+            with self.assertRaises(PermissionError):
+                runner.linear_graphql.local("org-1", "query { viewer { id } }", {}, signature=signature)
+            api.assert_not_called()
+            token.assert_not_called()
+
+    def test_writeback_rejects_arbitrary_operations_and_session_fields(self):
+        signature = linear.request_signature("writeback", ["org-1", "session-1"])
+        requests = [("query", {"query": "query { viewer { id } }"}),
+                    ("session", {"id": "session-2", "plan": []}),
+                    ("session", {"status": "complete"}),
+                    ("activity", {"type": "thought", "body": "progress", "agentSessionId": "session-2"})]
+        with patch.object(linear, "oauth_token") as api:
+            for operation, fields in requests:
+                with self.subTest(operation=operation, fields=fields), self.assertRaises(ValueError):
+                    runner.linear_writeback.local("org-1", "session-1", signature, operation, fields)
+            api.assert_not_called()
+
+    def test_delegated_writeback_uses_only_bound_session(self):
+        job = linear.event_job(event())
+        signature = linear.request_signature("writeback", ["org-1", "session-1"])
+        job["linear"]["writeback_signature"] = signature
+        with patch.object(runner.linear_writeback, "remote", side_effect=runner.linear_writeback.local), \
+                patch.object(linear, "oauth_token", return_value="synthetic-token"), \
+                patch.object(linear.urllib.request, "urlopen") as http:
+            http.return_value.__enter__.side_effect = lambda: io.BytesIO(b'{"data":{"result":{"success":true}}}')
+            linear.activity(job, "response", "finished")
+            linear.update_session(job, plan=[{"content": "fix", "status": "pending"}],
+                                  externalUrls=[{"label": "PR", "url": "https://github.com/example/app/pull/1"}])
+            requests = [json.loads(call.args[0].data) for call in http.call_args_list]
+        self.assertEqual(requests[0]["variables"], {"input": {
+            "agentSessionId": "session-1", "content": {"type": "response", "body": "finished"}}})
+        self.assertEqual(requests[1]["variables"]["id"], "session-1")
+        self.assertEqual(set(requests[1]["variables"]["input"]), {"plan", "externalUrls"})
+
+    def test_shared_state_does_not_confer_writeback_authority(self):
+        job = linear.event_job(event())
+        job["linear"]["writeback_signature"] = linear.request_signature("writeback", ["org-1", "session-1"])
+        with patch.object(runner, "CLAIMS") as claims:
+            linear.set_state(job, "running")
+        saved = claims.put.call_args.args[1]["job"]
+        self.assertNotIn("writeback_signature", saved["linear"])
+        with patch.object(linear, "oauth_token") as api, self.assertRaises(PermissionError):
+            runner.linear_writeback.local(saved["linear"]["organization_id"], saved["linear"]["session_id"],
+                                           saved["linear"].get("writeback_signature", ""), "session", {"plan": []})
+        api.assert_not_called()
 
     def test_org_token_and_timeout(self):
         tokens = {org: {"access_token": token, "refresh_token": "refresh", "expires_at": 99999999999}
@@ -130,11 +216,13 @@ class WritebackTests(unittest.TestCase):
                 patch.object(runner, "CLAIMS") as claims, patch.object(linear.urllib.request, "urlopen") as urlopen:
             claims.get.return_value = None
             urlopen.return_value.__enter__.return_value = io.BytesIO(b'{"data":{"agentActivityCreate":{"success":true}}}')
-            runner.linear_graphql.local("org-1", "mutation", {})
+            signature = linear.request_signature("graphql", ["org-1", "mutation", {}, 3.0])
+            runner.linear_graphql.local("org-1", "mutation", {}, signature=signature)
             self.assertEqual(urlopen.call_args.args[0].headers["Authorization"], "Bearer token-1")
             self.assertLess(urlopen.call_args.kwargs["timeout"], 5)
             with self.assertRaises(ValueError):
-                runner.linear_graphql.local("missing", "mutation", {})
+                signature = linear.request_signature("graphql", ["missing", "mutation", {}, 3.0])
+                runner.linear_graphql.local("missing", "mutation", {}, signature=signature)
             self.assertEqual(urlopen.call_count, 1)
 
     def test_graphql_failure_not_success(self):
@@ -143,7 +231,8 @@ class WritebackTests(unittest.TestCase):
                     patch.object(linear.urllib.request, "urlopen") as urlopen:
                 urlopen.return_value.__enter__.return_value = io.BytesIO(json.dumps(result).encode())
                 with self.assertRaises(RuntimeError):
-                    runner.linear_graphql.local("org-1", "query", {})
+                    signature = linear.request_signature("graphql", ["org-1", "query", {}, 3.0])
+                    runner.linear_graphql.local("org-1", "query", {}, signature=signature)
 
     def test_rotated_credentials_never_enter_shared_claims(self):
         initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
@@ -277,6 +366,9 @@ class ResolutionTests(unittest.TestCase):
     def setUp(self):
         self.payload = event()
         self.job = linear.event_job(self.payload)
+        patcher = patch.dict(os.environ, LINEAR_WEBHOOK_SECRET="synthetic-signing-secret")
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.config = patch.dict(runner.CONFIG, {"allowed_owners": ["example-org", "untapped-media", "kastheco"],
                                                 "linear": {"repo_map": {"projects": {}, "teams": {}}, "confidence_threshold": .8,
                                                            "gated_repos": ["example-org/gated"]}})

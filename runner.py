@@ -1821,8 +1821,9 @@ class LinearOAuthRefresher:
     organization_id: str = modal.parameter()
 
     @modal.method()
-    def refresh(self, timeout: float) -> str:
-        """Serialize refreshes across webhook, resolver and coding containers."""
+    def refresh(self, timeout: float, signature: str = "") -> str:
+        """Serialize credential-container refreshes, never return tokens to peers."""
+        linear_intake.verify_request("oauth", [self.client_id, self.organization_id, timeout], signature)
         return linear_intake.refresh_oauth_token(self.organization_id, self.client_id, timeout)
 
 
@@ -2322,7 +2323,8 @@ class PRWorker:
                         "--max-time", str(max(1, int(deadline - time.monotonic()) - 10))]
                 if job.get("linear"):
                     plan_only = job["linear"].get("plan_only", False)
-                    context.update(linear=job["linear"], branch=job["branch"])
+                    context.update(linear={key: value for key, value in job["linear"].items()
+                                           if key != "writeback_signature"}, branch=job["branch"])
                     policy.write_text(COMMAND_POLICY + POLICY + "\n" + LINEAR_POLICY
                                       + (LINEAR_PLAN_POLICY if plan_only else "")
                                       + (LINEAR_RETRY_POLICY if command_resume is not None else "")
