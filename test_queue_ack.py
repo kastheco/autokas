@@ -8,6 +8,12 @@ from unittest.mock import Mock, patch
 import runner
 
 
+def setUpModule():
+    owners = patch.dict(runner.CONFIG, allowed_owners=["example-org", "example"])
+    owners.start()
+    unittest.addModuleCleanup(owners.stop)
+
+
 REPO = "example-org/example-app"
 
 

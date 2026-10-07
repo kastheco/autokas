@@ -28,6 +28,7 @@ jobs:
         id: private_config
         env:
           AUTOKAS_CONFIG_JSON: ${{ secrets.AUTOKAS_CONFIG_JSON }}
+          AUTOKAS_ALLOWED_OWNERS_JSON: ${{ secrets.AUTOKAS_ALLOWED_OWNERS_JSON }}
         run: |
           python - <<'PY'
           import json, os, sys
@@ -40,6 +41,7 @@ jobs:
               with open("config.example.json") as f:
                   config = json.load(f)
               config.update({key: private[key] for key in PRIVATE_KEYS if key in private})
+              config["allowed_owners"] = json.loads(os.environ.get("AUTOKAS_ALLOWED_OWNERS_JSON") or "[]")
               url = urlparse(config["docs_update"]["webhook_url"])
               if url.scheme != "https" or not url.hostname or url.hostname.endswith(".invalid"):
                   raise ValueError

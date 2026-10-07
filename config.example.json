@@ -1,5 +1,6 @@
 {
   "app": "omp-runner",
+  "allowed_owners": [],
   "docs_update": {
     "model": "railway-codex/gpt-6-luna",
     "thinking": "medium",
