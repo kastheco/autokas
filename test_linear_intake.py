@@ -5,9 +5,11 @@ import hashlib
 import hmac
 import json
 import os
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import linear_intake as linear
@@ -71,6 +73,12 @@ class SignatureTests(unittest.TestCase):
 
 class WritebackTests(unittest.TestCase):
     def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for patcher in (patch.object(linear, "OAUTH_STORAGE", Path(directory.name)),
+                        patch.object(runner, "LINEAR_OAUTH_VOLUME", Mock())):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         # Emulate Modal's per-parameter single-input pools without remote calls.
         refresher = runner.LinearOAuthRefresher
         pools = {}
@@ -163,8 +171,44 @@ class WritebackTests(unittest.TestCase):
             self.assertEqual(len(requests), 1)
             clock.return_value = 5000
             self.assertEqual(linear.oauth_token("org", 3), "access-2")
-        self.assertEqual([request["refresh_token"] for request in requests], [["refresh-0"], ["refresh-1"]])
-        self.assertEqual(cache["linear:oauth:client:org"]["refresh_token"], "refresh-2")
+            cache.clear()  # Modal Dict entries disappear after a workspace is idle for seven days.
+            clock.return_value = 1000 + 8 * 86400
+            self.assertEqual(linear.oauth_token("org", 3), "access-3")
+        self.assertEqual([request["refresh_token"] for request in requests], [["refresh-0"], ["refresh-1"], ["refresh-2"]])
+        self.assertEqual(cache["linear:oauth:client:org"]["refresh_token"], "refresh-3")
+
+    def test_valid_legacy_rotation_is_migrated_before_idle_cache_expiry(self):
+        initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
+        cache = {"linear:oauth:client:org": {"access_token": "current", "refresh_token": "refresh-1", "expires_at": 4600}}
+        claims = Mock()
+        claims.get.side_effect = lambda key, default=None: cache.get(key, default)
+        claims.put.side_effect = lambda key, value: cache.update({key: value})
+        with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}),
+                        LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
+                patch.object(runner, "CLAIMS", claims), patch.object(linear.urllib.request, "urlopen") as exchange, \
+                patch.object(linear.time, "time", return_value=1000) as clock:
+            self.assertEqual(linear.oauth_token("org", 3), "current")
+            exchange.assert_not_called()
+            cache.clear()
+            clock.return_value = 1000 + 8 * 86400
+            exchange.return_value.__enter__.return_value = io.BytesIO(json.dumps({
+                "access_token": "next", "refresh_token": "refresh-2", "expires_in": 3600}).encode())
+            self.assertEqual(linear.oauth_token("org", 3), "next")
+            self.assertEqual(linear.urllib.parse.parse_qs(exchange.call_args.args[0].data.decode())["refresh_token"], ["refresh-1"])
+
+    def test_uncommitted_rotation_is_not_returned_or_cached(self):
+        initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
+        with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}),
+                        LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
+                patch.object(runner, "CLAIMS") as claims, patch.object(linear.urllib.request, "urlopen") as exchange:
+            claims.get.return_value = None
+            exchange.return_value.__enter__.return_value = io.BytesIO(json.dumps({
+                "access_token": "next", "refresh_token": "refresh-1", "expires_in": 3600}).encode())
+            runner.LINEAR_OAUTH_VOLUME.commit.side_effect = RuntimeError("storage unavailable")
+            with self.assertRaisesRegex(RuntimeError, "storage unavailable"):
+                linear.oauth_token("org", 3)
+            claims.put.assert_not_called()
+
 
     def test_concurrent_calls_share_one_refresh_and_retain_rotation(self):
         initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
@@ -209,7 +253,8 @@ class ResolutionTests(unittest.TestCase):
         self.payload = event()
         self.job = linear.event_job(self.payload)
         self.config = patch.dict(runner.CONFIG, {"allowed_owners": ["example-org", "untapped-media", "kastheco"],
-                                                "linear": {"repo_map": {"projects": {}, "teams": {}}, "confidence_threshold": .8}})
+                                                "linear": {"repo_map": {"projects": {}, "teams": {}}, "confidence_threshold": .8,
+                                                           "gated_repos": ["example-org/gated"]}})
         self.config.start()
         self.addCleanup(self.config.stop)
 
@@ -255,13 +300,22 @@ class ResolutionTests(unittest.TestCase):
                 patch.object(linear, "set_state") as state, patch.object(runner, "worker") as worker, \
                 patch.object(runner, "dispatch") as dispatch:
             claims.get.return_value = None
-            for repo in sorted(linear.GATED_REPOS) + ["example-org/app"]:
+            for repo, gated in (("example-org/gated", True), ("Example-Org/Gated", True), ("example-org/app", False)):
                 repository.return_value = (repo, [])
                 linear.resolve(self.payload, self.job)
                 job = worker.spawn.call_args.args[0]
-                self.assertEqual(job["linear"]["plan_only"], repo in linear.GATED_REPOS)
-                self.assertEqual(state.call_args.args[1], "planning" if repo in linear.GATED_REPOS else "running")
+                self.assertEqual(job["linear"]["plan_only"], gated)
+                self.assertEqual(state.call_args.args[1], "planning" if gated else "running")
             dispatch.assert_not_called()
+
+    def test_missing_gate_configuration_cannot_start_ungated_work(self):
+        del runner.CONFIG["linear"]["gated_repos"]
+        with patch.object(linear, "resolve_repository", return_value=("example-org/app", [])), \
+                patch.object(linear, "activity"), patch.object(linear, "set_state"), patch.object(runner, "worker") as worker:
+            with self.assertRaisesRegex(ValueError, "Configure linear.gated_repos"):
+                linear.resolve(self.payload, self.job)
+            worker.spawn.assert_not_called()
+
 
     def test_unknown_repo_elicits_and_stops(self):
         with patch.object(runner, "CLAIMS") as claims, patch.object(linear, "resolve_repository", return_value=(None, [])), \
@@ -281,6 +335,32 @@ class ResolutionTests(unittest.TestCase):
             linear.resolve(payload, linear.event_job(payload))
             queue.return_value.put.assert_called_once_with("Use existing validation")
             worker.spawn.assert_not_called()
+
+    def test_failed_followup_preserves_job_and_allows_next_prompt(self):
+        for status in ("running", "awaiting_approval"):
+            with self.subTest(status=status):
+                saved_job = {**self.job, "repo": "example-org/app"}
+                saved = {"state": status, "job": saved_job, "plan": [{"content": "Fix parser", "status": "pending"}]}
+                storage = {"linear:state:session-1": saved}
+                claims = Mock()
+                claims.get.side_effect = lambda key, default=None: storage.get(key, default)
+                claims.put.side_effect = lambda key, value, **kwargs: storage.update({key: value}) or True
+                with patch.object(runner, "CLAIMS", claims), patch.object(linear, "activity") as activity, \
+                        patch.object(linear, "session_queue") as steering, patch.object(runner, "worker") as worker:
+                    payload = event("prompted", "")
+                    with self.assertRaisesRegex(ValueError, "no prompt text"):
+                        linear.resolve(payload, linear.event_job(payload))
+                    self.assertEqual(storage["linear:state:session-1"], saved)
+                    self.assertEqual(activity.call_args.args[1], "error")
+                    payload = event("prompted", "approve" if status == "awaiting_approval" else "Use existing validation")
+                    linear.resolve(payload, linear.event_job(payload))
+                    if status == "awaiting_approval":
+                        approved = worker.spawn.call_args.args[0]
+                        self.assertEqual(approved["repo"], saved_job["repo"])
+                        self.assertIn("Fix parser", approved["prompt"])
+                    else:
+                        steering.return_value.put.assert_called_once_with("Use existing validation")
+
 
     def test_approval_required_and_once_only(self):
         saved_job = {**self.job, "repo": "untapped-media/tower", "linear": {**self.job["linear"], "plan_only": True}}

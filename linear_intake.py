@@ -11,9 +11,11 @@ import json
 import math
 import os
 import re
+import tempfile
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 import modal
@@ -24,10 +26,7 @@ LINEAR_SECRET = modal.Secret.from_name(
     "omp-runner-linear", required_keys=["LINEAR_WEBHOOK_SECRET", "LINEAR_OAUTH_TOKENS",
                                        "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET"]
 )
-GATED_REPOS = frozenset({
-    "untapped-media/tower", "untapped-media/wallet-pass-server",
-    "untapped-media/rewards-vault-server", "untapped-media/radar", "kastheco/autokas",
-})
+OAUTH_STORAGE = Path("/linear-oauth")
 STATES = frozenset({"resolving", "running", "planning", "finishing", "awaiting_approval", "completed", "error"})
 ACTIVITY_MUTATION = """mutation($input: AgentActivityCreateInput!) {
   agentActivityCreate(input: $input) { success }
@@ -42,14 +41,14 @@ SUGGESTIONS_QUERY = """query($issueId: String!, $sessionId: String!, $repos: [Ca
 
 
 def oauth_credentials(organization_id: str, client_id: str) -> dict[str, Any]:
-    """Read the latest credentials for one client and workspace."""
+    """Read bootstrap credentials or the access-token cache for one workspace."""
     import runner
     tokens = json.loads(os.environ["LINEAR_OAUTH_TOKENS"])
     initial = tokens.get(organization_id) if isinstance(tokens, dict) else None
     if not isinstance(initial, dict):
         raise ValueError("No Linear OAuth token for this organization")
     cached = runner.CLAIMS.get(f"linear:oauth:{client_id}:{organization_id}", None)
-    return cached if cached and cached["expires_at"] > initial["expires_at"] else initial
+    return cached if cached and cached["expires_at"] >= initial["expires_at"] else initial
 
 
 def oauth_token(organization_id: str, timeout: float) -> str:
@@ -57,7 +56,7 @@ def oauth_token(organization_id: str, timeout: float) -> str:
     import runner
     client_id = os.environ["LINEAR_CLIENT_ID"]
     token = oauth_credentials(organization_id, client_id)
-    if token["expires_at"] > time.time() + 60:
+    if token.get("persisted") and token["expires_at"] > time.time() + 60:
         return token["access_token"]
     return runner.LinearOAuthRefresher(client_id=client_id, organization_id=organization_id).refresh.remote(timeout)
 
@@ -68,6 +67,12 @@ def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) ->
     if client_id != os.environ["LINEAR_CLIENT_ID"]:
         raise ValueError("Linear OAuth client mismatch")
     token = oauth_credentials(organization_id, client_id)
+    runner.LINEAR_OAUTH_VOLUME.reload()
+    filename = hashlib.sha256(json.dumps([client_id, organization_id]).encode()).hexdigest() + ".json"
+    path = OAUTH_STORAGE / filename
+    persisted = json.loads(path.read_text()) if path.exists() else None
+    if persisted and persisted["expires_at"] >= token["expires_at"]:
+        token = persisted
     if token["expires_at"] <= time.time() + 60:
         request = urllib.request.Request(
             "https://api.linear.app/oauth/token",
@@ -82,7 +87,22 @@ def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) ->
         token = {"access_token": refreshed["access_token"],
                  "refresh_token": refreshed["refresh_token"],
                  "expires_at": time.time() + refreshed["expires_in"]}
-        runner.CLAIMS.put(f"linear:oauth:{client_id}:{organization_id}", token)
+    token = {**token, "persisted": True}
+    if token != persisted:
+        # One writer per client/workspace. Close files before committing the shared volume.
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=OAUTH_STORAGE, delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(token, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            runner.LINEAR_OAUTH_VOLUME.commit()
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    runner.CLAIMS.put(f"linear:oauth:{client_id}:{organization_id}", token)
     return token["access_token"]
 
 
@@ -273,11 +293,15 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
                      + ("\nTop candidates:\n" + choices if choices else ""))
             set_state(job, "completed")
             return
-        job = {**job, "repo": repo, "linear": {**job["linear"], "plan_only": repo.lower() in GATED_REPOS}}
+        gated_repos = runner.CONFIG.get("linear", {}).get("gated_repos")
+        if not isinstance(gated_repos, list) or any(not isinstance(repo, str) for repo in gated_repos):
+            raise ValueError("Configure linear.gated_repos before starting Linear jobs")
+        job = {**job, "repo": repo, "linear": {**job["linear"], "plan_only": repo.lower() in {entry.lower() for entry in gated_repos}}}
         set_state(job, "planning" if job["linear"]["plan_only"] else "running")
         runner.worker.spawn(job)
     except Exception as exc:
-        set_state(job, "error")
+        if payload.get("action") == "created":
+            set_state(job, "error")
         safe_reason = str(exc) if isinstance(exc, ValueError) else "Repository resolution or job startup failed; inspect the runner logs."
         activity(job, "error", safe_reason)
         raise
@@ -317,8 +341,8 @@ def register(runner: Any) -> None:
     resolve.__name__ = "linear_resolve"
     receiver = modal.fastapi_endpoint(method="POST")(receive)
     runner.linear_webhook = runner.app.function(
-        image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET], timeout=30,
+        image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET], timeout=30, name="linear_webhook",
     )(receiver)
     runner.linear_resolve = runner.app.function(
-        image=runner.IMAGE, secrets=[runner.WORKER_SECRET, LINEAR_SECRET], timeout=300,
+        image=runner.IMAGE, secrets=[runner.WORKER_SECRET, LINEAR_SECRET], timeout=300, name="linear_resolve",
     )(resolve)

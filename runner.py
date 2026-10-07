@@ -37,6 +37,7 @@ REVISION = hashlib.sha256(b"".join(
 )).hexdigest()
 app = modal.App(CONFIG["app"])
 CLAIMS = modal.Dict.from_name(f'{CONFIG["app"]}-comments', create_if_missing=True)
+LINEAR_OAUTH_VOLUME = modal.Volume.from_name(f'{CONFIG["app"]}-linear-oauth', create_if_missing=True)
 WEBHOOK_SECRET = modal.Secret.from_name("omp-runner-webhook", required_keys=["GITHUB_WEBHOOK_SECRET"])
 WORKER_SECRET = modal.Secret.from_name(
     "omp-runner-worker", required_keys=["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN"]
@@ -1813,7 +1814,7 @@ def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict
 
 
 @app.cls(image=with_runner_files(BASE_IMAGE), secrets=[LINEAR_SECRET], max_containers=1,
-         retries=0, timeout=30)
+         volumes={str(linear_intake.OAUTH_STORAGE): LINEAR_OAUTH_VOLUME}, retries=0, timeout=30)
 @modal.concurrent(max_inputs=1)
 class LinearOAuthRefresher:
     client_id: str = modal.parameter()
@@ -1979,6 +1980,14 @@ what cannot be recovered; never invent checks or re-answer the original task.
 """
 
 
+def linear_progress(job: dict[str, Any], action: str) -> None:
+    """Keep progress delivery failures out of execution and publication bookkeeping."""
+    try:
+        linear_intake.activity(job, "action", action)
+    except Exception as error:
+        log("linear_activity_uncertain", key=job["key"], reason=type(error).__name__)
+
+
 def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[str, Any],
                prompt: str, deadline: float) -> tuple[int, str]:
     """Drive omp JSON-lines RPC and forward session steering until its agent ends."""
@@ -2060,9 +2069,9 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
                 arguments = event.get("args", {})
                 command = arguments.get("command", "") if isinstance(arguments, dict) else ""
                 if tool == "bash" and re.search(r"\b(?:test|pytest|vitest|jest|lint|typecheck|tsgo)\b", command):
-                    linear_intake.activity(job, "action", "Running checks: " + command[:500])
+                    linear_progress(job, "Running checks: " + command[:500])
                 elif tool == "bash" and re.search(r"\bgit\s+push\b", command):
-                    linear_intake.activity(job, "action", "Pushing the task branch")
+                    linear_progress(job, "Pushing the task branch")
             if event.get("type") == "agent_end" and event.get("isTerminal", True):
                 linear_intake.set_state(job, "finishing")
                 break
@@ -2240,7 +2249,7 @@ class PRWorker:
                     head = run(["git", "rev-parse", "HEAD"], worktree)
                     branch = run(["git", "branch", "--show-current"], worktree)
                     if job.get("linear"):
-                        linear_intake.activity(job, "action", "Cloned " + repo + " at " + head)
+                        linear_progress(job, "Cloned " + repo + " at " + head)
                 else:
                     pr = github(f"repos/{repo}/pulls/{number}")
                     if generated_docs_pr(pr) and job.get("mode") != "command":
@@ -2355,7 +2364,7 @@ class PRWorker:
                         record = CLAIMS.get("command:" + job["key"])
                         if final_head != head and remote_head == final_head:
                             record["published_head"] = final_head
-                            linear_intake.activity(job, "action", "Confirmed task branch push: " + final_head)
+                            linear_progress(job, "Confirmed task branch push: " + final_head)
                             publication = {"status": "published", "commit": final_head}
                         elif final_head == head and (not remote_head or remote_head == head):
                             record["state"] = "completed"
@@ -2366,7 +2375,7 @@ class PRWorker:
                         CLAIMS.put("command:" + job["key"], record)
                     else:
                         publication = command_resume
-                    linear_intake.activity(job, "action", "Collecting omp's reported check results and pull request metadata")
+                    linear_progress(job, "Collecting omp's reported check results and pull request metadata")
                     linear_finish(job, summary, publication)
                     return
 

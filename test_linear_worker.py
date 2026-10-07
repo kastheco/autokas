@@ -114,6 +114,28 @@ class LinearWorkerTests(unittest.TestCase):
         finish.assert_called_once()
         self.assertEqual(self.claims.get("command:" + self.job["key"])["published_head"], "new")
 
+    def test_progress_failure_does_not_lose_publication_receipt(self):
+        def activity(job, kind, body):
+            if kind == "action":
+                raise TimeoutError("activity unavailable")
+        self.activity.side_effect = activity
+        summary = "Changed validation. Checks passed."
+        with patch("runner.linear_finish") as finish:
+            self.invoke((0, summary))
+        record = self.claims.get("command:" + self.job["key"])
+        self.assertEqual(record["published_head"], "new")
+        self.assertEqual(record["linear_summary"], summary)
+        finish.assert_called_once_with(self.job, summary, {"status": "published", "commit": "new"})
+
+    def test_final_response_failure_remains_strict(self):
+        self.activity.side_effect = TimeoutError("response unavailable")
+        with patch("runner.github", return_value=[]), self.assertRaisesRegex(TimeoutError, "response unavailable"):
+            runner.linear_finish(self.job, "Investigation complete", {"status": "completed"})
+        record = self.claims.get("command:" + self.job["key"])
+        self.assertTrue(record["linear_report_started"])
+        self.assertFalse(record["linear_reported"])
+
+
     def test_unconfirmed_push_stops_with_linear_error(self):
         with self.assertRaisesRegex(RuntimeError, "could not be confirmed"):
             self.invoke((0, "Attempted changes"), remote="other")
@@ -177,6 +199,23 @@ class LinearWorkerTests(unittest.TestCase):
                                               self.job, "Task", time.monotonic() + 5)
         self.assertEqual(code, 0)
         modal_queue.get.assert_called_once_with(block=False)
+
+    def test_rpc_progress_failure_does_not_kill_agent(self):
+        child = """import json, sys
+sys.stdin.readline()
+for command in ('python -m pytest', 'git push origin task'):
+    print(json.dumps({'type': 'tool_execution_start', 'toolName': 'bash', 'args': {'command': command}}), flush=True)
+print(json.dumps({'type': 'message_end', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': 'Checks completed'}]}}), flush=True)
+print(json.dumps({'type': 'agent_end', 'isTerminal': True}), flush=True)
+sys.stdin.read()
+"""
+        self.activity.side_effect = TimeoutError("activity unavailable")
+        with tempfile.TemporaryDirectory() as tmp, patch("runner.linear_intake.session_queue", return_value=queue.Queue()):
+            code, summary = runner.linear_rpc([sys.executable, "-c", child], Path(tmp), dict(os.environ),
+                                              self.job, "Task", time.monotonic() + 5)
+        self.assertEqual((code, summary), (0, "Checks completed"))
+        self.assertEqual(self.state.call_args.args[1], "finishing")
+
 
 
     def test_rpc_deadline_terminates_process(self):
