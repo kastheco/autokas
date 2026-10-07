@@ -33,9 +33,12 @@ class DeploymentTests(unittest.TestCase):
 
     def test_cutover_purges_idle_oauth_entries_without_reading_values(self):
         with self.patches():
-            self.claims.keys.return_value = ["linear:oauth:client:org", "linear:state:session", "job-key"]
+            keys = ["linear:oauth:client:org", "linear:oauth:client:idle-org",
+                    "linear:state:session", "job-key", "linear:oauthish:keep", 42]
+            self.claims.keys.return_value = iter(keys)
+            self.claims.pop.side_effect = lambda key, default: keys.remove(key)
             deploy.main()
-        self.claims.pop.assert_called_once_with("linear:oauth:client:org", None)
+        self.assertEqual(keys, ["linear:state:session", "job-key", "linear:oauthish:keep", 42])
         self.assertTrue(self.persisted["complete"])
 
     def test_failures_at_each_cutover_stage_still_reconcile(self):

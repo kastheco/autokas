@@ -63,6 +63,10 @@ approval startup keeps the saved job and plan in `awaiting_approval` until the c
 
 the worker records the task branch's remote head before launch. a run is published only when that head changes and matches the final local head. an unchanged remote branch completes with the agent's summary, without attaching a pre-existing PR as that run's output. reporting retries stop commit searches at the recorded remote head or checkout head, so earlier branch work isn't counted as a new publication.
 
+terminal state writes delete the session's named steering queue and any pending messages. this covers worker completion, resolver completion and every error path that saves `error`, through the existing authenticated state service. missing queues are allowed, so repeated terminal writes don't create a queue or fail because it is already gone. nonterminal states, including `awaiting_approval`, retain their queue. cleanup failures propagate to the caller rather than being hidden.
+
+the deployment purge snapshots shared claim keys before deleting legacy `linear:oauth:` entries. deleting a key cannot skip the next idle workspace, and unrelated claims remain untouched.
+
 ## acceptance
 
 - delegating a test issue in a sandbox linear team to autokas produces, without other input: an ack within 10 seconds, progress activities, a PR on `autokas/<workspace-sha256>/<identifier>` linked in the linear session, and a final `response`.

@@ -266,11 +266,16 @@ def update_session(job: dict[str, Any], **fields: Any) -> dict[str, Any]:
     return writeback(job, "session", fields)
 
 
-def session_queue(session_id: str) -> modal.Queue:
-    """One durable steering queue per session, with a safe bounded name."""
+def session_queue_name(session_id: str) -> str:
+    """Share the bounded queue name between steering and terminal cleanup."""
     import runner
     suffix = hashlib.sha256(session_id.encode()).hexdigest()[:32]
-    return modal.Queue.from_name(f'{runner.CONFIG["app"]}-linear-{suffix}', create_if_missing=True)
+    return f'{runner.CONFIG["app"]}-linear-{suffix}'
+
+
+def session_queue(session_id: str) -> modal.Queue:
+    """One durable steering queue per session, with a safe bounded name."""
+    return modal.Queue.from_name(session_queue_name(session_id), create_if_missing=True)
 
 
 def signed_record(purpose: str, session_id: str, record: dict[str, Any]) -> dict[str, Any]:
@@ -313,6 +318,8 @@ def set_state(job: dict[str, Any], state: str, **fields: Any) -> None:
     runner.CLAIMS.put(f"linear:state:{session_id}", signed_record("state", session_id, {
         "state": state, "job": stored_job(job), **fields,
     }))
+    if state in {"completed", "error"}:
+        modal.Queue.objects.delete(session_queue_name(session_id), allow_missing=True)
 
 
 def authenticated_set_state(job: dict[str, Any], state: str, fields: dict[str, Any]) -> None:
@@ -323,7 +330,7 @@ def authenticated_set_state(job: dict[str, Any], state: str, fields: dict[str, A
 def purge_legacy_oauth_claims() -> None:
     """Remove idle credential exposure at cutover without reading token values."""
     import runner
-    for key in runner.CLAIMS.keys():
+    for key in list(runner.CLAIMS.keys()):
         if isinstance(key, str) and key.startswith("linear:oauth:"):
             runner.CLAIMS.pop(key, None)
 

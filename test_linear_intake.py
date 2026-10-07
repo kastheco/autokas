@@ -421,6 +421,48 @@ class WritebackTests(unittest.TestCase):
         self.assertEqual(json.loads((linear.OAUTH_STORAGE / filename).read_text())["refresh_token"], "refresh-1")
 
 
+class QueueLifecycleTests(unittest.TestCase):
+    def test_terminal_states_remove_pending_messages_and_only_their_queue(self):
+        job = linear.event_job(event())
+        other = "other-session"
+        for state in linear.STATES:
+            with self.subTest(state=state):
+                queues = {}
+                claims = {}
+
+                def from_name(name, *, create_if_missing=False):
+                    if create_if_missing:
+                        queues.setdefault(name, [])
+                    queue = Mock()
+                    queue.put.side_effect = queues[name].append
+                    return queue
+
+                def delete(name, *, allow_missing=False):
+                    if not allow_missing and name not in queues:
+                        raise KeyError(name)
+                    queues.pop(name, None)
+
+                with patch.dict(os.environ, LINEAR_WEBHOOK_SECRET="synthetic-signing-secret"), \
+                        patch.object(runner, "CLAIMS") as store, \
+                        patch.object(linear.modal.Queue, "from_name", side_effect=from_name), \
+                        patch.object(linear.modal.Queue, "objects", Mock(delete=delete)):
+                    store.put.side_effect = claims.__setitem__
+                    store.get.side_effect = claims.get
+                    linear.session_queue(job["linear"]["session_id"]).put("pending follow-up")
+                    linear.session_queue(other).put("other follow-up")
+                    linear.set_state(job, state)
+                    saved = linear.get_state(job["linear"]["session_id"])
+                    self.assertEqual(saved["state"], state)
+                    messages = list(queues.values())
+                    if state in {"completed", "error"}:
+                        self.assertEqual(messages, [["other follow-up"]])
+                        # Replayed terminal writes and sessions without a queue remain valid.
+                        linear.set_state(job, state)
+                        self.assertEqual(list(queues.values()), [["other follow-up"]])
+                    else:
+                        self.assertEqual(messages, [["pending follow-up"], ["other follow-up"]])
+
+
 class ResolutionTests(unittest.TestCase):
     def setUp(self):
         self.payload = event()
