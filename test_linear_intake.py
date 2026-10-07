@@ -95,9 +95,9 @@ class WritebackTests(unittest.TestCase):
                     pools[key] = (threading.Lock(), refresher(client_id=client_id, organization_id=organization_id))
                 lock, worker = pools[key]
 
-            def refresh(timeout, signature):
+            def refresh(deadline, signature):
                 with lock:
-                    return worker.refresh.local(timeout, signature)
+                    return worker.refresh.local(deadline, signature)
 
             proxy = Mock()
             proxy.refresh.remote.side_effect = refresh
@@ -112,18 +112,18 @@ class WritebackTests(unittest.TestCase):
                 patch.object(linear.urllib.request, "urlopen") as urlopen:
             urlopen.return_value.__enter__.return_value = io.BytesIO(b'{"data":{"viewer":{"id":"private"}}}')
             with self.assertRaises(PermissionError):
-                runner.linear_graphql.local("org-2", "query { viewer { id } }", {})
+                runner.linear_graphql.local("org-2", "query { viewer { id } }", {}, linear.time.time() + 3)
             token.assert_not_called()
             urlopen.assert_not_called()
 
-    def test_graphql_proof_binds_workspace_document_variables_and_timeout(self):
-        arguments = ["org-1", "query($id: String!) { issue(id: $id) { id } }", {"id": "issue-1"}, 3.0]
+    def test_graphql_proof_binds_workspace_document_variables_and_deadline(self):
+        arguments = ["org-1", "query($id: String!) { issue(id: $id) { id } }", {"id": "issue-1"}, linear.time.time() + 3]
         signature = linear.request_signature("graphql", arguments)
         altered = [
             ["org-2", *arguments[1:]],
             [arguments[0], "mutation { issueDelete(id: \"issue-1\") { success } }", *arguments[2:]],
             [*arguments[:2], {"id": "issue-2"}, arguments[3]],
-            [*arguments[:3], 30.0],
+            [*arguments[:3], arguments[3] + 30],
         ]
         with patch.object(linear, "oauth_token") as token:
             for request in altered:
@@ -162,9 +162,9 @@ class WritebackTests(unittest.TestCase):
             for org, session, proof in (("org-2", "session-1", signature), ("org-1", "session-2", signature),
                                         ("org-1", "session-1", "0" * 64)):
                 with self.assertRaises(PermissionError):
-                    runner.linear_writeback.local(org, session, proof, "activity", fields)
+                    runner.linear_writeback.local(org, session, proof, "activity", fields, linear.time.time() + 3)
             with self.assertRaises(PermissionError):
-                runner.linear_graphql.local("org-1", "query { viewer { id } }", {}, signature=signature)
+                runner.linear_graphql.local("org-1", "query { viewer { id } }", {}, linear.time.time() + 3, signature=signature)
             api.assert_not_called()
             token.assert_not_called()
 
@@ -177,7 +177,7 @@ class WritebackTests(unittest.TestCase):
         with patch.object(linear, "oauth_token") as api:
             for operation, fields in requests:
                 with self.subTest(operation=operation, fields=fields), self.assertRaises(ValueError):
-                    runner.linear_writeback.local("org-1", "session-1", signature, operation, fields)
+                    runner.linear_writeback.local("org-1", "session-1", signature, operation, fields, linear.time.time() + 3)
             api.assert_not_called()
 
     def test_delegated_writeback_uses_only_bound_session(self):
@@ -210,8 +210,68 @@ class WritebackTests(unittest.TestCase):
             linear.authorize_worker(saved)
         with patch.object(linear, "oauth_token") as api, self.assertRaises(PermissionError):
             runner.linear_writeback.local(saved["linear"]["organization_id"], saved["linear"]["session_id"],
-                                           saved["linear"].get("writeback_signature", ""), "session", {"plan": []})
+                                           saved["linear"].get("writeback_signature", ""), "session", {"plan": []}, linear.time.time() + 3)
         api.assert_not_called()
+
+    def test_ack_writeback_does_not_reset_budget_after_refresh(self):
+        now = [1000.0]
+        calls = []
+        job = linear.event_job(event())
+        job["linear"]["writeback_signature"] = linear.request_signature("writeback", ["org-1", "session-1"])
+        tokens = {"org-1": {"access_token": "old", "refresh_token": "refresh", "expires_at": 900}}
+
+        def exchange(request, timeout):
+            calls.append(request.full_url)
+            if timeout < 2:
+                now[0] += timeout
+                raise TimeoutError("shared request budget exhausted")
+            now[0] += 2
+            result = ({"access_token": "new", "refresh_token": "rotated", "expires_in": 3600}
+                      if request.full_url.endswith("/oauth/token") else {"data": {"result": {"success": True}}})
+            return io.BytesIO(json.dumps(result).encode())
+
+        with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps(tokens),
+                        LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="synthetic-secret"), \
+                patch.object(linear.time, "time", side_effect=lambda: now[0]), \
+                patch.object(runner, "CLAIMS") as claims, \
+                patch.object(runner.linear_writeback, "remote", side_effect=runner.linear_writeback.local), \
+                patch.object(linear.urllib.request, "urlopen", side_effect=exchange):
+            claims.get.return_value = None
+            with self.assertRaises(TimeoutError):
+                linear.activity(job, "thought", "picked up, finding the repo")
+        self.assertEqual(calls, ["https://api.linear.app/oauth/token", "https://api.linear.app/graphql"])
+        self.assertLessEqual(now[0] - 1000, 3)
+
+    def test_expired_refresher_queue_does_not_consume_refresh_token(self):
+        deadline = 1003.0
+        signature = linear.request_signature("oauth", ["client", "org-1", deadline])
+        refresher = self.refresher(client_id="client", organization_id="org-1")
+        with patch.object(linear.time, "time", return_value=deadline), \
+                patch.object(linear.urllib.request, "urlopen") as http, \
+                self.assertRaises(TimeoutError):
+            refresher.refresh.local(deadline, signature)
+        http.assert_not_called()
+
+    def test_expired_persistence_keeps_rotation_and_skips_graphql(self):
+        now = [1000.0]
+        job = linear.event_job(event())
+        job["linear"]["writeback_signature"] = linear.request_signature("writeback", ["org-1", "session-1"])
+        tokens = {"org-1": {"access_token": "old", "refresh_token": "refresh", "expires_at": 900}}
+        with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps(tokens),
+                        LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="synthetic-secret"), \
+                patch.object(linear.time, "time", side_effect=lambda: now[0]), \
+                patch.object(runner, "CLAIMS") as claims, \
+                patch.object(runner.linear_writeback, "remote", side_effect=runner.linear_writeback.local), \
+                patch.object(linear.urllib.request, "urlopen") as http:
+            claims.get.return_value = None
+            http.return_value.__enter__.return_value = io.BytesIO(json.dumps({
+                "access_token": "new", "refresh_token": "rotated", "expires_in": 3600}).encode())
+            runner.LINEAR_OAUTH_VOLUME.commit.side_effect = lambda: now.__setitem__(0, 1003.0)
+            with self.assertRaises(TimeoutError):
+                linear.activity(job, "thought", "picked up, finding the repo")
+        self.assertEqual([call.args[0].full_url for call in http.call_args_list], ["https://api.linear.app/oauth/token"])
+        filename = hashlib.sha256(json.dumps(["client", "org-1"]).encode()).hexdigest() + ".json"
+        self.assertEqual(json.loads((linear.OAUTH_STORAGE / filename).read_text())["refresh_token"], "rotated")
 
     def test_org_token_and_timeout(self):
         tokens = {org: {"access_token": token, "refresh_token": "refresh", "expires_at": 99999999999}
@@ -220,13 +280,14 @@ class WritebackTests(unittest.TestCase):
                 patch.object(runner, "CLAIMS") as claims, patch.object(linear.urllib.request, "urlopen") as urlopen:
             claims.get.return_value = None
             urlopen.return_value.__enter__.return_value = io.BytesIO(b'{"data":{"agentActivityCreate":{"success":true}}}')
-            signature = linear.request_signature("graphql", ["org-1", "mutation", {}, 3.0])
-            runner.linear_graphql.local("org-1", "mutation", {}, signature=signature)
+            deadline = linear.time.time() + 3
+            signature = linear.request_signature("graphql", ["org-1", "mutation", {}, deadline])
+            runner.linear_graphql.local("org-1", "mutation", {}, deadline, signature=signature)
             self.assertEqual(urlopen.call_args.args[0].headers["Authorization"], "Bearer token-1")
             self.assertLess(urlopen.call_args.kwargs["timeout"], 5)
             with self.assertRaises(ValueError):
-                signature = linear.request_signature("graphql", ["missing", "mutation", {}, 3.0])
-                runner.linear_graphql.local("missing", "mutation", {}, signature=signature)
+                signature = linear.request_signature("graphql", ["missing", "mutation", {}, deadline])
+                runner.linear_graphql.local("missing", "mutation", {}, deadline, signature=signature)
             self.assertEqual(urlopen.call_count, 1)
 
     def test_graphql_failure_not_success(self):
@@ -235,8 +296,9 @@ class WritebackTests(unittest.TestCase):
                     patch.object(linear.urllib.request, "urlopen") as urlopen:
                 urlopen.return_value.__enter__.return_value = io.BytesIO(json.dumps(result).encode())
                 with self.assertRaises(RuntimeError):
-                    signature = linear.request_signature("graphql", ["org-1", "query", {}, 3.0])
-                    runner.linear_graphql.local("org-1", "query", {}, signature=signature)
+                    deadline = linear.time.time() + 3
+                    signature = linear.request_signature("graphql", ["org-1", "query", {}, deadline])
+                    runner.linear_graphql.local("org-1", "query", {}, deadline, signature=signature)
 
     def test_rotated_credentials_never_enter_shared_claims(self):
         initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
@@ -251,9 +313,9 @@ class WritebackTests(unittest.TestCase):
                 patch.object(linear.time, "time", return_value=1000):
             exchange.return_value.__enter__.return_value = io.BytesIO(json.dumps({
                 "access_token": "next", "refresh_token": "refresh-1", "expires_in": 3600}).encode())
-            self.assertEqual(linear.oauth_token("org", 3), "next")
+            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "next")
             self.assertEqual(cache, {"unrelated-job": "claimed"})
-            self.assertEqual(linear.oauth_token("org", 3), "next")
+            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "next")
             self.assertEqual(exchange.call_count, 1)
             self.assertEqual(cache, {"unrelated-job": "claimed"})
         filename = hashlib.sha256(json.dumps(["client", "org"]).encode()).hexdigest() + ".json"
@@ -282,14 +344,14 @@ class WritebackTests(unittest.TestCase):
                         LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
                 patch.object(runner, "CLAIMS", claims), patch.object(linear.urllib.request, "urlopen", side_effect=exchange), \
                 patch.object(linear.time, "time", return_value=1000) as clock:
-            self.assertEqual(linear.oauth_token("org", 3), "access-1")
-            self.assertEqual(linear.oauth_token("org", 3), "access-1")
+            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "access-1")
+            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "access-1")
             self.assertEqual(len(requests), 1)
             clock.return_value = 5000
-            self.assertEqual(linear.oauth_token("org", 3), "access-2")
+            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "access-2")
             cache.clear()
             clock.return_value = 1000 + 8 * 86400
-            self.assertEqual(linear.oauth_token("org", 3), "access-3")
+            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "access-3")
         self.assertEqual([request["refresh_token"] for request in requests], [["refresh-0"], ["refresh-1"], ["refresh-2"]])
         self.assertEqual(cache, {})
         filename = hashlib.sha256(json.dumps(["client", "org"]).encode()).hexdigest() + ".json"
@@ -306,13 +368,13 @@ class WritebackTests(unittest.TestCase):
                         LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
                 patch.object(runner, "CLAIMS", claims), patch.object(linear.urllib.request, "urlopen") as exchange, \
                 patch.object(linear.time, "time", return_value=1000) as clock:
-            self.assertEqual(linear.oauth_token("org", 3), "current")
+            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "current")
             exchange.assert_not_called()
             self.assertEqual(cache, {})
             clock.return_value = 1000 + 8 * 86400
             exchange.return_value.__enter__.return_value = io.BytesIO(json.dumps({
                 "access_token": "next", "refresh_token": "refresh-2", "expires_in": 3600}).encode())
-            self.assertEqual(linear.oauth_token("org", 3), "next")
+            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "next")
             self.assertEqual(linear.urllib.parse.parse_qs(exchange.call_args.args[0].data.decode())["refresh_token"], ["refresh-1"])
 
     def test_uncommitted_rotation_does_not_return_or_delete_legacy_credentials(self):
@@ -325,7 +387,7 @@ class WritebackTests(unittest.TestCase):
                 "access_token": "next", "refresh_token": "refresh-1", "expires_in": 3600}).encode())
             runner.LINEAR_OAUTH_VOLUME.commit.side_effect = RuntimeError("storage unavailable")
             with self.assertRaisesRegex(RuntimeError, "storage unavailable"):
-                linear.oauth_token("org", 3)
+                linear.oauth_token("org", linear.time.time() + 3)
             claims.pop.assert_not_called()
 
 
@@ -338,7 +400,7 @@ class WritebackTests(unittest.TestCase):
 
         def request_token():
             start.wait(timeout=5)
-            return linear.oauth_token("org", 3)
+            return linear.oauth_token("org", linear.time.time() + 3)
 
         def exchange(request, **kwargs):
             refresh = linear.urllib.parse.parse_qs(request.data.decode())["refresh_token"][0]
@@ -602,7 +664,7 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
         async def spawn(*args):
             calls.append("spawn")
         with patch.dict(os.environ, LINEAR_WEBHOOK_SECRET="secret"), patch.object(linear.time, "time", return_value=1000), \
-                patch.object(runner, "CLAIMS") as claims, patch.object(linear, "activity", side_effect=lambda *args: calls.append("ack")) as activity, \
+                patch.object(runner, "CLAIMS") as claims, patch.object(linear, "activity", side_effect=lambda *args, **kwargs: calls.append("ack")) as activity, \
                 patch.object(linear, "set_state"), patch.object(runner, "linear_resolve") as resolver:
             claims.get.aio = AsyncMock(return_value=None)
             claims.put.aio = AsyncMock(side_effect=[True, False])

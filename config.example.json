@@ -3,7 +3,6 @@
   "allowed_owners": [],
   "linear": {
     "repo_map": {"projects": {}, "teams": {}},
-    "gated_repos": [],
     "confidence_threshold": 0.8
   },
   "docs_update": {

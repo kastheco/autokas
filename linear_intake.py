@@ -119,17 +119,26 @@ def steering_message(job: dict[str, Any], envelope: Any) -> str:
     return runner.linear_steer.remote(linear["organization_id"], linear["session_id"], job["key"], envelope)
 
 
-def oauth_token(organization_id: str, timeout: float) -> str:
+def remaining_timeout(deadline: float) -> float:
+    """Use a wall-clock deadline across Modal containers, never reset the budget."""
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise TimeoutError("Linear request deadline exceeded")
+    return remaining
+
+
+def oauth_token(organization_id: str, deadline: float) -> str:
     """Resolve tokens only through the credential-bearing serialized pool."""
     import runner
     client_id = os.environ["LINEAR_CLIENT_ID"]
-    signature = request_signature("oauth", [client_id, organization_id, timeout])
-    return runner.LinearOAuthRefresher(client_id=client_id, organization_id=organization_id).refresh.remote(timeout, signature)
+    signature = request_signature("oauth", [client_id, organization_id, deadline])
+    return runner.LinearOAuthRefresher(client_id=client_id, organization_id=organization_id).refresh.remote(deadline, signature)
 
 
-def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) -> str:
+def refresh_oauth_token(organization_id: str, client_id: str, deadline: float) -> str:
     """Reread and rotate credentials inside this workspace's single-input pool."""
     import runner
+    remaining_timeout(deadline)
     if client_id != os.environ["LINEAR_CLIENT_ID"]:
         raise ValueError("Linear OAuth client mismatch")
     tokens = json.loads(os.environ["LINEAR_OAUTH_TOKENS"])
@@ -156,7 +165,7 @@ def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) ->
                 "client_secret": os.environ["LINEAR_CLIENT_SECRET"],
             }).encode(),
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=remaining_timeout(deadline)) as response:
             refreshed = json.load(response)
         token = {"access_token": refreshed["access_token"],
                  "refresh_token": refreshed["refresh_token"],
@@ -179,27 +188,31 @@ def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) ->
     # Delete legacy exposure only after the durable copy has been committed.
     if cached is not None:
         runner.CLAIMS.pop(cache_key, None)
+    remaining_timeout(deadline)
     return token["access_token"]
 
 
 def graphql(organization_id: str, query: str, variables: dict[str, Any], timeout: float = 3.0) -> dict[str, Any]:
     """Authorize an exact API request from a Linear credential-bearing caller."""
     import runner
-    signature = request_signature("graphql", [organization_id, query, variables, timeout])
-    return runner.linear_graphql.remote(organization_id, query, variables, timeout, signature)
+    deadline = time.time() + timeout
+    signature = request_signature("graphql", [organization_id, query, variables, deadline])
+    return runner.linear_graphql.remote(organization_id, query, variables, deadline, signature)
 
 
 def authenticated_graphql(organization_id: str, query: str, variables: dict[str, Any],
-                          timeout: float = 3.0, signature: str = "") -> dict[str, Any]:
+                          deadline: float, signature: str = "") -> dict[str, Any]:
     """Reject same-app peers without proof from a Linear credential container."""
-    verify_request("graphql", [organization_id, query, variables, timeout], signature)
-    token = oauth_token(organization_id, timeout)
+    verify_request("graphql", [organization_id, query, variables, deadline], signature)
+    remaining_timeout(deadline)
+    token = oauth_token(organization_id, deadline)
     request = urllib.request.Request(
         "https://api.linear.app/graphql", data=json.dumps({"query": query, "variables": variables}).encode(),
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=remaining_timeout(deadline)) as response:
         result = json.load(response)
+    remaining_timeout(deadline)
     if result.get("errors") or not isinstance(result.get("data"), dict):
         raise RuntimeError("Linear GraphQL request failed")
     data = result["data"]
@@ -209,7 +222,7 @@ def authenticated_graphql(organization_id: str, query: str, variables: dict[str,
 
 
 def session_writeback(organization_id: str, session_id: str, signature: str,
-                      operation: str, fields: dict[str, Any]) -> dict[str, Any]:
+                      operation: str, fields: dict[str, Any], deadline: float) -> dict[str, Any]:
     """A delegated job may write only its session's activities, plan and PR links."""
     verify_request("writeback", [organization_id, session_id], signature)
     if not isinstance(fields, dict):
@@ -225,18 +238,22 @@ def session_writeback(organization_id: str, session_id: str, signature: str,
         query, variables = SESSION_MUTATION, {"id": session_id, "input": fields}
     else:
         raise ValueError("Unsupported Linear write-back operation or fields")
-    signature = request_signature("graphql", [organization_id, query, variables, 3.0])
-    return authenticated_graphql(organization_id, query, variables, signature=signature)
+    signature = request_signature("graphql", [organization_id, query, variables, deadline])
+    return authenticated_graphql(organization_id, query, variables, deadline, signature)
 
 
-def writeback(job: dict[str, Any], operation: str, fields: dict[str, Any]) -> dict[str, Any]:
+def writeback(job: dict[str, Any], operation: str, fields: dict[str, Any],
+              deadline: float | None = None) -> dict[str, Any]:
     import runner
     linear = job["linear"]
+    if deadline is None:
+        deadline = time.time() + 3.0
     return runner.linear_writeback.remote(linear["organization_id"], linear["session_id"],
-                                          linear["writeback_signature"], operation, fields)
+                                          linear["writeback_signature"], operation, fields, deadline)
 
 
-def activity(job: dict[str, Any], type: str, body: str | dict[str, Any]) -> dict[str, Any]:
+def activity(job: dict[str, Any], type: str, body: str | dict[str, Any],
+             deadline: float | None = None) -> dict[str, Any]:
     """Emit an activity; action content uses action/parameter, not body."""
     if type not in {"thought", "action", "elicitation", "response", "error"}:
         raise ValueError("Unsupported Linear activity type")
@@ -247,7 +264,7 @@ def activity(job: dict[str, Any], type: str, body: str | dict[str, Any]) -> dict
         })
     else:
         content["body"] = body
-    return writeback(job, "activity", content)
+    return writeback(job, "activity", content, deadline)
 
 
 def update_session(job: dict[str, Any], **fields: Any) -> dict[str, Any]:
@@ -460,7 +477,8 @@ async def receive(request: Request) -> JSONResponse:
         return JSONResponse({"status": "duplicate"})
     try:
         if payload["action"] == "created":
-            await asyncio.wait_for(asyncio.to_thread(activity, job, "thought", "picked up, finding the repo"), timeout=3.5)
+            await asyncio.wait_for(asyncio.to_thread(activity, job, "thought", "picked up, finding the repo",
+                                                    deadline=time.time() + 3.0), timeout=3.5)
             await asyncio.to_thread(set_state, job, "resolving")
     except Exception:
         await runner.CLAIMS.pop.aio(job["key"], None)

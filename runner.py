@@ -1821,10 +1821,10 @@ class LinearOAuthRefresher:
     organization_id: str = modal.parameter()
 
     @modal.method()
-    def refresh(self, timeout: float, signature: str = "") -> str:
+    def refresh(self, deadline: float, signature: str = "") -> str:
         """Serialize credential-container refreshes, never return tokens to peers."""
-        linear_intake.verify_request("oauth", [self.client_id, self.organization_id, timeout], signature)
-        return linear_intake.refresh_oauth_token(self.organization_id, self.client_id, timeout)
+        linear_intake.verify_request("oauth", [self.client_id, self.organization_id, deadline], signature)
+        return linear_intake.refresh_oauth_token(self.organization_id, self.client_id, deadline)
 
 
 @app.function(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
