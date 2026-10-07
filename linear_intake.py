@@ -41,22 +41,39 @@ SUGGESTIONS_QUERY = """query($issueId: String!, $sessionId: String!, $repos: [Ca
 }"""
 
 
-def oauth_token(organization_id: str, timeout: float) -> str:
-    """Renew expiring app credentials, retaining the rotated refresh token."""
+def oauth_credentials(organization_id: str, client_id: str) -> dict[str, Any]:
+    """Read the latest credentials for one client and workspace."""
     import runner
     tokens = json.loads(os.environ["LINEAR_OAUTH_TOKENS"])
     initial = tokens.get(organization_id) if isinstance(tokens, dict) else None
     if not isinstance(initial, dict):
         raise ValueError("No Linear OAuth token for this organization")
-    key = f'linear:oauth:{os.environ["LINEAR_CLIENT_ID"]}:{organization_id}'
-    cached = runner.CLAIMS.get(key, None)
-    token = cached if cached and cached["expires_at"] > initial["expires_at"] else initial
+    cached = runner.CLAIMS.get(f"linear:oauth:{client_id}:{organization_id}", None)
+    return cached if cached and cached["expires_at"] > initial["expires_at"] else initial
+
+
+def oauth_token(organization_id: str, timeout: float) -> str:
+    """Use valid cached tokens, serializing rotations across all callers."""
+    import runner
+    client_id = os.environ["LINEAR_CLIENT_ID"]
+    token = oauth_credentials(organization_id, client_id)
+    if token["expires_at"] > time.time() + 60:
+        return token["access_token"]
+    return runner.LinearOAuthRefresher(client_id=client_id, organization_id=organization_id).refresh.remote(timeout)
+
+
+def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) -> str:
+    """Reread and rotate credentials inside this workspace's single-input pool."""
+    import runner
+    if client_id != os.environ["LINEAR_CLIENT_ID"]:
+        raise ValueError("Linear OAuth client mismatch")
+    token = oauth_credentials(organization_id, client_id)
     if token["expires_at"] <= time.time() + 60:
         request = urllib.request.Request(
             "https://api.linear.app/oauth/token",
             data=urllib.parse.urlencode({
                 "grant_type": "refresh_token", "refresh_token": token["refresh_token"],
-                "client_id": os.environ["LINEAR_CLIENT_ID"],
+                "client_id": client_id,
                 "client_secret": os.environ["LINEAR_CLIENT_SECRET"],
             }).encode(),
         )
@@ -65,7 +82,7 @@ def oauth_token(organization_id: str, timeout: float) -> str:
         token = {"access_token": refreshed["access_token"],
                  "refresh_token": refreshed["refresh_token"],
                  "expires_at": time.time() + refreshed["expires_in"]}
-        runner.CLAIMS.put(key, token)
+        runner.CLAIMS.put(f"linear:oauth:{client_id}:{organization_id}", token)
     return token["access_token"]
 
 
@@ -169,9 +186,10 @@ def event_job(payload: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(activity_id, str) or not activity_id:
             return None
         key = f"linear:prompt:{activity_id}"
+    workspace = hashlib.sha256(organization.encode()).hexdigest()
     return {"mode": "command", "target": "issue", "kind": "linear", "pr": identifier,
             "comment": 0, "author": "linear", "source_url": issue["url"],
-            "branch": f"autokas/{identifier}", "prompt": payload.get("promptContext") or "", "key": key,
+            "branch": f"autokas/{workspace}/{identifier}", "prompt": payload.get("promptContext") or "", "key": key,
             "linear": {"session_id": session_id, "organization_id": organization,
                        "identifier": identifier, "issue_url": issue["url"], "plan_only": False}}
 

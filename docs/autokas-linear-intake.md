@@ -36,14 +36,14 @@ out, for later specs:
 
 ## autokas changes
 
-linear code lives in a new `linear_intake.py`. `runner.py` gets only the worker changes in items 5 and 6.
+linear intake and OAuth exchange code live in `linear_intake.py`. `runner.py` registers the per-workspace OAuth refresh class and owns the worker changes in items 5 and 6.
 
-1. **new endpoint `linear_webhook`.** separate from the github `webhook`, with its own secret `omp-runner-linear`: the webhook signing secret, OAuth client credentials and each workspace's access token, refresh token and expiry, keyed by `organizationId`. renew expiring tokens through normal OAuth refresh and retain rotations in the existing `CLAIMS` dict. check `Linear-Signature` on the raw bytes and `webhookTimestamp` within 60 seconds, `401` otherwise.
+1. **new endpoint `linear_webhook`.** separate from the github `webhook`, with its own secret `omp-runner-linear`: the webhook signing secret, OAuth client credentials and each workspace's access token, refresh token and expiry, keyed by `organizationId`. renew expiring tokens through normal OAuth refresh and retain rotations in the existing `CLAIMS` dict. refreshes run in a single-container, single-input Modal class pool keyed by client id and organization id. the pool rereads cached credentials before exchanging a refresh token, so concurrent callers reuse the completed rotation. valid cached access tokens don't need a remote refresh call. check `Linear-Signature` on the raw bytes and `webhookTimestamp` within 60 seconds, `401` otherwise.
 2. **ack.** before returning, the receiver posts one `thought` ("picked up, finding the repo").
 3. **dedupe.** in the existing `CLAIMS` dict, `created` claims `linear:session:<agentSession.id>` and `prompted` claims `linear:prompt:<agentActivity.id>`.
 4. **repo resolution, in order.** a repo map in private config from linear team or project to `owner/repo`. then `issueRepositorySuggestions` over `installed_repos()`, accepted only above a confidence threshold. otherwise an `elicitation` listing the top candidates and stop. a repo that fails `allowed_repository()` gets an `error` activity and no job.
 5. **issue command flow without a github issue.** linear jobs run as `mode: "command"`, `target: "issue"` with the linear session id, organization id, identifier and issue url. where the flow assumes a github issue number:
-   - the branch is `autokas/<linear-identifier>` (e.g. `autokas/ENG-123`) so linear auto-links the PR. the worker's hardcoded `autokas/issue-{number}` takes the branch from the job instead.
+   - new jobs use `autokas/<workspace-sha256>/<linear-identifier>`. the workspace component is the full SHA-256 hex digest of `organizationId`, so matching identifiers in different workspaces don't share a branch or reconcile to each other's PR. the identifier remains in the branch for linear linking. the worker takes the branch from the job instead of using its github issue branch format.
    - the command prompt gets a linear variant: task text is `promptContext`, PR title includes the identifier, the PR body links the linear issue instead of `Closes #<number>`, and there's no `gh issue comment` outcome.
    - no queued reply or acknowledgment comment on github.
 6. **steering.** linear jobs run omp with `--mode rpc` instead of `--print`, same flags otherwise. the worker sends the task as a `prompt` command and reads events until it finishes. meanwhile it forwards each message from a `modal.Queue` named for the session to omp as a `steer` command. on `prompted`, the receiver puts `agentActivity.content.body` on that queue if the session has a live job. otherwise it answers with an `elicitation` saying to delegate again. github-started jobs keep `--print`.
@@ -53,10 +53,12 @@ linear code lives in a new `linear_intake.py`. `runner.py` gets only the worker 
 
 ## acceptance
 
-- delegating a test issue in a sandbox linear team to autokas produces, without other input: an ack within 10 seconds, progress activities, a PR on `autokas/<identifier>` linked in the linear session, and a final `response`.
+- delegating a test issue in a sandbox linear team to autokas produces, without other input: an ack within 10 seconds, progress activities, a PR on `autokas/<workspace-sha256>/<identifier>` linked in the linear session, and a final `response`.
 - a follow-up message sent in the session during that run steers it.
 - the PR then gets the normal `autokas review` check and fix loop.
 - redelivering the same webhook does not start a second job.
+- concurrent API calls for one client and workspace consume an expiring refresh token once and retain the rotated token for the next expiry.
+- matching issue identifiers in different workspaces use distinct branches, even when both resolve to the same github repo.
 - an issue with no resolvable repo ends in an elicitation, not a guess.
 - delegating an issue for a gated repo posts a plan and waits. approving in the session starts the run.
 - a bad signature gets `401`. a repo outside `allowed_owners` ends in an `error` activity and no job.

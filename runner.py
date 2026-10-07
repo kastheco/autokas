@@ -1812,6 +1812,19 @@ def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict
             "key": f"{repo}:pr_review:{number}:{head}"}
 
 
+@app.cls(image=with_runner_files(BASE_IMAGE), secrets=[LINEAR_SECRET], max_containers=1,
+         retries=0, timeout=30)
+@modal.concurrent(max_inputs=1)
+class LinearOAuthRefresher:
+    client_id: str = modal.parameter()
+    organization_id: str = modal.parameter()
+
+    @modal.method()
+    def refresh(self, timeout: float) -> str:
+        """Serialize refreshes across webhook, resolver and coding containers."""
+        return linear_intake.refresh_oauth_token(self.organization_id, self.client_id, timeout)
+
+
 @app.function(image=IMAGE, secrets=[WORKER_SECRET, LINEAR_SECRET], max_containers=1, retries=0,
               timeout=180, cpu=0.125, memory=256)
 def worker(job: dict[str, Any]) -> None:

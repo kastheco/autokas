@@ -27,11 +27,13 @@ class Claims:
         return copy.deepcopy(self.data.get(key, default))
 
 
-JOB = {"mode": "command", "target": "issue", "kind": "linear", "repo": "example/app",
-       "pr": "ENG-12", "comment": 0, "author": "linear", "branch": "autokas/ENG-12",
-       "key": "linear:session:s", "source_url": "https://linear.app/team/issue/ENG-12",
-       "prompt": "Implement the issue", "linear": {"session_id": "s", "organization_id": "o",
-       "identifier": "ENG-12", "issue_url": "https://linear.app/team/issue/ENG-12", "plan_only": False}}
+JOB = {**runner.linear_intake.event_job({
+    "type": "AgentSessionEvent", "action": "created", "organizationId": "o",
+    "promptContext": "Implement the issue",
+    "agentSession": {"id": "s", "issue": {
+        "id": "issue-id", "identifier": "ENG-12", "url": "https://linear.app/team/issue/ENG-12",
+    }},
+}), "repo": "example/app"}
 
 
 class LinearWorkerTests(unittest.TestCase):
@@ -75,7 +77,7 @@ class LinearWorkerTests(unittest.TestCase):
                 output = "main"
             if args[:2] == ["git", "ls-remote"]:
                 seen["remote_args"] = args
-                output = remote + "\trefs/heads/autokas/ENG-12" if remote else ""
+                output = remote + "\trefs/heads/" + self.job["branch"] if remote else ""
             return subprocess.CompletedProcess(args, 0, output, "")
 
         def rpc(args, worktree, env, job, prompt, deadline):
@@ -106,9 +108,9 @@ class LinearWorkerTests(unittest.TestCase):
     def test_normal_rpc_records_identifier_branch_before_execution(self):
         with patch("runner.linear_finish") as finish:
             seen = self.invoke((0, "Changed validation. Checks: unit tests passed."))
-        self.assertEqual(seen["record_at_launch"]["branch"], "autokas/ENG-12")
+        self.assertEqual(seen["record_at_launch"]["branch"], self.job["branch"])
         self.assertEqual(seen["record_at_launch"]["state"], "executing")
-        self.assertEqual(seen["remote_args"][-1], "refs/heads/autokas/ENG-12")
+        self.assertEqual(seen["remote_args"][-1], "refs/heads/" + self.job["branch"])
         finish.assert_called_once()
         self.assertEqual(self.claims.get("command:" + self.job["key"])["published_head"], "new")
 
@@ -127,7 +129,7 @@ class LinearWorkerTests(unittest.TestCase):
 
     def test_finish_links_verified_pr_and_draft(self):
         pr = {"html_url": "https://github.com/example/app/pull/4", "draft": True, "number": 4,
-              "head": {"ref": "autokas/ENG-12", "repo": {"full_name": "example/app"}}}
+              "head": {"ref": self.job["branch"], "repo": {"full_name": "example/app"}}}
         with patch("runner.github", return_value=[pr]):
             runner.linear_finish(self.job, "Tests failed", {"status": "published"})
         self.update.assert_called_once_with(self.job, externalUrls=[{"label": "Pull request", "url": pr["html_url"]}])

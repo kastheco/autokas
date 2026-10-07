@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -46,7 +48,6 @@ class SignatureTests(unittest.TestCase):
         job = linear.event_job(event())
         self.assertEqual(job["key"], "linear:session:session-1")
         self.assertEqual(job["pr"], "UTM-331")
-        self.assertEqual(job["branch"], "autokas/UTM-331")
         self.assertEqual((job["mode"], job["target"], job["kind"], job["author"], job["comment"]),
                          ("command", "issue", "linear", "linear", 0))
         self.assertEqual(linear.event_job(event("prompted"))["key"], "linear:prompt:activity-1")
@@ -55,8 +56,45 @@ class SignatureTests(unittest.TestCase):
             payload["agentSession"]["issue"]["identifier"] = bad
             self.assertIsNone(linear.event_job(payload))
 
+    def test_same_identifier_has_distinct_workspace_branches(self):
+        first = event()
+        second = event()
+        second["organizationId"] = "org-2"
+        first_job, second_job = linear.event_job(first), linear.event_job(second)
+        self.assertNotEqual(first_job["branch"], second_job["branch"])
+        prompted = event("prompted")
+        prompted["agentSession"]["id"] = "another-session"
+        self.assertEqual(linear.event_job(prompted)["branch"], first_job["branch"])
+        for job in (first_job, second_job):
+            self.assertTrue(job["branch"].endswith("/UTM-331"))
+
 
 class WritebackTests(unittest.TestCase):
+    def setUp(self):
+        # Emulate Modal's per-parameter single-input pools without remote calls.
+        refresher = runner.LinearOAuthRefresher
+        pools = {}
+        guard = threading.Lock()
+
+        def pool(client_id, organization_id):
+            key = (client_id, organization_id)
+            with guard:
+                if key not in pools:
+                    pools[key] = (threading.Lock(), refresher(client_id=client_id, organization_id=organization_id))
+                lock, worker = pools[key]
+
+            def refresh(timeout):
+                with lock:
+                    return worker.refresh.local(timeout)
+
+            proxy = Mock()
+            proxy.refresh.remote.side_effect = refresh
+            return proxy
+
+        patcher = patch.object(runner, "LinearOAuthRefresher", side_effect=pool)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_activity_shapes(self):
         job = {**linear.event_job(event()), "repo": "example-org/app"}
         with patch.object(linear, "graphql") as api:
@@ -127,6 +165,43 @@ class WritebackTests(unittest.TestCase):
             self.assertEqual(linear.oauth_token("org", 3), "access-2")
         self.assertEqual([request["refresh_token"] for request in requests], [["refresh-0"], ["refresh-1"]])
         self.assertEqual(cache["linear:oauth:client:org"]["refresh_token"], "refresh-2")
+
+    def test_concurrent_calls_share_one_refresh_and_retain_rotation(self):
+        initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
+        cache = {}
+        start = threading.Barrier(2)
+        reads = threading.local()
+        exchange_lock = threading.Lock()
+        used = []
+
+        def get(key, default=None):
+            token = cache.get(key, default)
+            if not getattr(reads, "started", False):
+                reads.started = True
+                start.wait(timeout=5)
+            return token
+
+        def exchange(request, **kwargs):
+            refresh = linear.urllib.parse.parse_qs(request.data.decode())["refresh_token"][0]
+            with exchange_lock:
+                if refresh in used:
+                    raise RuntimeError("refresh token already consumed")
+                used.append(refresh)
+            response = {"access_token": "new", "refresh_token": "refresh-1", "expires_in": 3600}
+            return io.BytesIO(json.dumps(response).encode())
+
+        claims = Mock()
+        claims.get.side_effect = get
+        claims.put.side_effect = lambda key, value: cache.update({key: value})
+        with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}),
+                        LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
+                patch.object(runner, "CLAIMS", claims), \
+                patch.object(linear.urllib.request, "urlopen", side_effect=exchange), \
+                patch.object(linear.time, "time", return_value=1000), ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(linear.oauth_token, "org", 3) for _ in range(2)]
+            self.assertEqual([future.result(timeout=5) for future in futures], ["new", "new"])
+        self.assertEqual(used, ["refresh-0"])
+        self.assertEqual(cache["linear:oauth:client:org"]["refresh_token"], "refresh-1")
 
 
 class ResolutionTests(unittest.TestCase):
