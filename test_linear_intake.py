@@ -145,12 +145,35 @@ class WritebackTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     runner.linear_graphql.local("org-1", "query", {})
 
+    def test_rotated_credentials_never_enter_shared_claims(self):
+        initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
+        cache = {"unrelated-job": "claimed"}
+        claims = Mock()
+        claims.get.side_effect = lambda key, default=None: cache.get(key, default)
+        claims.put.side_effect = lambda key, value: cache.update({key: value})
+        claims.pop.side_effect = lambda key, default=None: cache.pop(key, default)
+        with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}),
+                        LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
+                patch.object(runner, "CLAIMS", claims), patch.object(linear.urllib.request, "urlopen") as exchange, \
+                patch.object(linear.time, "time", return_value=1000):
+            exchange.return_value.__enter__.return_value = io.BytesIO(json.dumps({
+                "access_token": "next", "refresh_token": "refresh-1", "expires_in": 3600}).encode())
+            self.assertEqual(linear.oauth_token("org", 3), "next")
+            self.assertEqual(cache, {"unrelated-job": "claimed"})
+            self.assertEqual(linear.oauth_token("org", 3), "next")
+            self.assertEqual(exchange.call_count, 1)
+            self.assertEqual(cache, {"unrelated-job": "claimed"})
+        filename = hashlib.sha256(json.dumps(["client", "org"]).encode()).hexdigest() + ".json"
+        persisted = json.loads((linear.OAUTH_STORAGE / filename).read_text())
+        self.assertEqual(persisted["refresh_token"], "refresh-1")
+
     def test_refresh_uses_rotated_credentials_after_next_expiry(self):
         initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
         cache = {}
         claims = Mock()
         claims.get.side_effect = lambda key, default=None: cache.get(key, default)
         claims.put.side_effect = lambda key, value: cache.update({key: value})
+        claims.pop.side_effect = lambda key, default=None: cache.pop(key, default)
         requests = []
 
         def exchange(request, **kwargs):
@@ -171,11 +194,13 @@ class WritebackTests(unittest.TestCase):
             self.assertEqual(len(requests), 1)
             clock.return_value = 5000
             self.assertEqual(linear.oauth_token("org", 3), "access-2")
-            cache.clear()  # Modal Dict entries disappear after a workspace is idle for seven days.
+            cache.clear()
             clock.return_value = 1000 + 8 * 86400
             self.assertEqual(linear.oauth_token("org", 3), "access-3")
         self.assertEqual([request["refresh_token"] for request in requests], [["refresh-0"], ["refresh-1"], ["refresh-2"]])
-        self.assertEqual(cache["linear:oauth:client:org"]["refresh_token"], "refresh-3")
+        self.assertEqual(cache, {})
+        filename = hashlib.sha256(json.dumps(["client", "org"]).encode()).hexdigest() + ".json"
+        self.assertEqual(json.loads((linear.OAUTH_STORAGE / filename).read_text())["refresh_token"], "refresh-3")
 
     def test_valid_legacy_rotation_is_migrated_before_idle_cache_expiry(self):
         initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
@@ -183,47 +208,44 @@ class WritebackTests(unittest.TestCase):
         claims = Mock()
         claims.get.side_effect = lambda key, default=None: cache.get(key, default)
         claims.put.side_effect = lambda key, value: cache.update({key: value})
+        claims.pop.side_effect = lambda key, default=None: cache.pop(key, default)
         with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}),
                         LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
                 patch.object(runner, "CLAIMS", claims), patch.object(linear.urllib.request, "urlopen") as exchange, \
                 patch.object(linear.time, "time", return_value=1000) as clock:
             self.assertEqual(linear.oauth_token("org", 3), "current")
             exchange.assert_not_called()
-            cache.clear()
+            self.assertEqual(cache, {})
             clock.return_value = 1000 + 8 * 86400
             exchange.return_value.__enter__.return_value = io.BytesIO(json.dumps({
                 "access_token": "next", "refresh_token": "refresh-2", "expires_in": 3600}).encode())
             self.assertEqual(linear.oauth_token("org", 3), "next")
             self.assertEqual(linear.urllib.parse.parse_qs(exchange.call_args.args[0].data.decode())["refresh_token"], ["refresh-1"])
 
-    def test_uncommitted_rotation_is_not_returned_or_cached(self):
+    def test_uncommitted_rotation_does_not_return_or_delete_legacy_credentials(self):
         initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
         with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}),
                         LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
                 patch.object(runner, "CLAIMS") as claims, patch.object(linear.urllib.request, "urlopen") as exchange:
-            claims.get.return_value = None
+            claims.get.return_value = initial
             exchange.return_value.__enter__.return_value = io.BytesIO(json.dumps({
                 "access_token": "next", "refresh_token": "refresh-1", "expires_in": 3600}).encode())
             runner.LINEAR_OAUTH_VOLUME.commit.side_effect = RuntimeError("storage unavailable")
             with self.assertRaisesRegex(RuntimeError, "storage unavailable"):
                 linear.oauth_token("org", 3)
-            claims.put.assert_not_called()
+            claims.pop.assert_not_called()
 
 
     def test_concurrent_calls_share_one_refresh_and_retain_rotation(self):
         initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
         cache = {}
         start = threading.Barrier(2)
-        reads = threading.local()
         exchange_lock = threading.Lock()
         used = []
 
-        def get(key, default=None):
-            token = cache.get(key, default)
-            if not getattr(reads, "started", False):
-                reads.started = True
-                start.wait(timeout=5)
-            return token
+        def request_token():
+            start.wait(timeout=5)
+            return linear.oauth_token("org", 3)
 
         def exchange(request, **kwargs):
             refresh = linear.urllib.parse.parse_qs(request.data.decode())["refresh_token"][0]
@@ -235,17 +257,20 @@ class WritebackTests(unittest.TestCase):
             return io.BytesIO(json.dumps(response).encode())
 
         claims = Mock()
-        claims.get.side_effect = get
+        claims.get.side_effect = lambda key, default=None: cache.get(key, default)
         claims.put.side_effect = lambda key, value: cache.update({key: value})
+        claims.pop.side_effect = lambda key, default=None: cache.pop(key, default)
         with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}),
                         LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
                 patch.object(runner, "CLAIMS", claims), \
                 patch.object(linear.urllib.request, "urlopen", side_effect=exchange), \
                 patch.object(linear.time, "time", return_value=1000), ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(linear.oauth_token, "org", 3) for _ in range(2)]
+            futures = [pool.submit(request_token) for _ in range(2)]
             self.assertEqual([future.result(timeout=5) for future in futures], ["new", "new"])
         self.assertEqual(used, ["refresh-0"])
-        self.assertEqual(cache["linear:oauth:client:org"]["refresh_token"], "refresh-1")
+        self.assertEqual(cache, {})
+        filename = hashlib.sha256(json.dumps(["client", "org"]).encode()).hexdigest() + ".json"
+        self.assertEqual(json.loads((linear.OAUTH_STORAGE / filename).read_text())["refresh_token"], "refresh-1")
 
 
 class ResolutionTests(unittest.TestCase):

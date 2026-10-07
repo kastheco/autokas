@@ -40,24 +40,10 @@ SUGGESTIONS_QUERY = """query($issueId: String!, $sessionId: String!, $repos: [Ca
 }"""
 
 
-def oauth_credentials(organization_id: str, client_id: str) -> dict[str, Any]:
-    """Read bootstrap credentials or the access-token cache for one workspace."""
-    import runner
-    tokens = json.loads(os.environ["LINEAR_OAUTH_TOKENS"])
-    initial = tokens.get(organization_id) if isinstance(tokens, dict) else None
-    if not isinstance(initial, dict):
-        raise ValueError("No Linear OAuth token for this organization")
-    cached = runner.CLAIMS.get(f"linear:oauth:{client_id}:{organization_id}", None)
-    return cached if cached and cached["expires_at"] >= initial["expires_at"] else initial
-
-
 def oauth_token(organization_id: str, timeout: float) -> str:
-    """Use valid cached tokens, serializing rotations across all callers."""
+    """Resolve tokens only through the credential-bearing serialized pool."""
     import runner
     client_id = os.environ["LINEAR_CLIENT_ID"]
-    token = oauth_credentials(organization_id, client_id)
-    if token.get("persisted") and token["expires_at"] > time.time() + 60:
-        return token["access_token"]
     return runner.LinearOAuthRefresher(client_id=client_id, organization_id=organization_id).refresh.remote(timeout)
 
 
@@ -66,7 +52,15 @@ def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) ->
     import runner
     if client_id != os.environ["LINEAR_CLIENT_ID"]:
         raise ValueError("Linear OAuth client mismatch")
-    token = oauth_credentials(organization_id, client_id)
+    tokens = json.loads(os.environ["LINEAR_OAUTH_TOKENS"])
+    token = tokens.get(organization_id) if isinstance(tokens, dict) else None
+    if not isinstance(token, dict):
+        raise ValueError("No Linear OAuth token for this organization")
+    # Migrate existing shared entries without losing their rotated refresh tokens.
+    cache_key = f"linear:oauth:{client_id}:{organization_id}"
+    cached = runner.CLAIMS.get(cache_key, None)
+    if cached and cached["expires_at"] >= token["expires_at"]:
+        token = cached
     runner.LINEAR_OAUTH_VOLUME.reload()
     filename = hashlib.sha256(json.dumps([client_id, organization_id]).encode()).hexdigest() + ".json"
     path = OAUTH_STORAGE / filename
@@ -87,7 +81,7 @@ def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) ->
         token = {"access_token": refreshed["access_token"],
                  "refresh_token": refreshed["refresh_token"],
                  "expires_at": time.time() + refreshed["expires_in"]}
-    token = {**token, "persisted": True}
+    token = {key: token[key] for key in ("access_token", "refresh_token", "expires_at")}
     if token != persisted:
         # One writer per client/workspace. Close files before committing the shared volume.
         temporary = None
@@ -102,7 +96,9 @@ def refresh_oauth_token(organization_id: str, client_id: str, timeout: float) ->
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-    runner.CLAIMS.put(f"linear:oauth:{client_id}:{organization_id}", token)
+    # Delete legacy exposure only after the durable copy has been committed.
+    if cached is not None:
+        runner.CLAIMS.pop(cache_key, None)
     return token["access_token"]
 
 
