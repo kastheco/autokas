@@ -155,6 +155,7 @@ def main() -> None:
     try:
         drain()
         subprocess.run(['modal', 'deploy', '--strategy', 'recreate', 'runner.py'], check=True)
+        runner.linear_intake.purge_legacy_oauth_claims()
         verify()
         print(f'deployed revision: {runner.REVISION}', flush=True)
     finally:

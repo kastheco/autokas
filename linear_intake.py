@@ -145,11 +145,8 @@ def refresh_oauth_token(organization_id: str, client_id: str, deadline: float) -
     token = tokens.get(organization_id) if isinstance(tokens, dict) else None
     if not isinstance(token, dict):
         raise ValueError("No Linear OAuth token for this organization")
-    # Migrate existing shared entries without losing their rotated refresh tokens.
-    cache_key = f"linear:oauth:{client_id}:{organization_id}"
-    cached = runner.CLAIMS.get(cache_key, None)
-    if cached and cached["expires_at"] >= token["expires_at"]:
-        token = cached
+    # Shared claims are not a credential source, even for legacy rotations.
+    runner.CLAIMS.pop(f"linear:oauth:{client_id}:{organization_id}", None)
     runner.LINEAR_OAUTH_VOLUME.reload()
     filename = hashlib.sha256(json.dumps([client_id, organization_id]).encode()).hexdigest() + ".json"
     path = OAUTH_STORAGE / filename
@@ -185,9 +182,6 @@ def refresh_oauth_token(organization_id: str, client_id: str, deadline: float) -
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-    # Delete legacy exposure only after the durable copy has been committed.
-    if cached is not None:
-        runner.CLAIMS.pop(cache_key, None)
     remaining_timeout(deadline)
     return token["access_token"]
 
@@ -279,9 +273,24 @@ def session_queue(session_id: str) -> modal.Queue:
     return modal.Queue.from_name(f'{runner.CONFIG["app"]}-linear-{suffix}', create_if_missing=True)
 
 
+def signed_record(purpose: str, session_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    return {**record, "signature": request_signature(purpose, [session_id, record])}
+
+
+def verified_record(purpose: str, session_id: str, record: Any) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise PermissionError("Unauthorized Linear stored record")
+    arguments = {key: value for key, value in record.items() if key != "signature"}
+    verify_request(purpose, [session_id, arguments], record.get("signature", ""))
+    return arguments
+
+
 def get_state(session_id: str) -> dict[str, Any] | None:
     import runner
-    return runner.CLAIMS.get(f"linear:state:{session_id}", None)
+    if "LINEAR_WEBHOOK_SECRET" not in os.environ:
+        return runner.linear_get_state.remote(session_id)
+    record = runner.CLAIMS.get(f"linear:state:{session_id}", None)
+    return None if record is None else verified_record("state", session_id, record)
 
 
 def stored_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -295,9 +304,28 @@ def set_state(job: dict[str, Any], state: str, **fields: Any) -> None:
     import runner
     if state not in STATES:
         raise ValueError("Unsupported Linear intake state")
-    runner.CLAIMS.put(f'linear:state:{job["linear"]["session_id"]}', {
+    if {"state", "job", "signature"} & fields.keys():
+        raise ValueError("Invalid Linear state fields")
+    if "LINEAR_WEBHOOK_SECRET" not in os.environ:
+        runner.linear_set_state.remote(job, state, fields)
+        return
+    session_id = job["linear"]["session_id"]
+    runner.CLAIMS.put(f"linear:state:{session_id}", signed_record("state", session_id, {
         "state": state, "job": stored_job(job), **fields,
-    })
+    }))
+
+
+def authenticated_set_state(job: dict[str, Any], state: str, fields: dict[str, Any]) -> None:
+    authenticated_worker(job)
+    set_state(job, state, **fields)
+
+
+def purge_legacy_oauth_claims() -> None:
+    """Remove idle credential exposure at cutover without reading token values."""
+    import runner
+    for key in runner.CLAIMS.keys():
+        if isinstance(key, str) and key.startswith("linear:oauth:"):
+            runner.CLAIMS.pop(key, None)
 
 
 def authenticated_payload(raw: bytes, signature: str, secret: str, now: float | None = None) -> dict[str, Any] | None:
@@ -416,11 +444,13 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
                 if not runner.allowed_repository(approved["repo"]):
                     raise ValueError("Linear repository is outside allowed owners")
                 approval_key = f'linear:approval:{job["linear"]["session_id"]}'
+                session_id = job["linear"]["session_id"]
                 launch = {"job": stored_job(approved)}
-                if not runner.CLAIMS.put(approval_key, launch, skip_if_exists=True):
-                    launch = runner.CLAIMS.get(approval_key, None)
-                    if not isinstance(launch, dict):
-                        raise RuntimeError("Linear approval launch record unavailable")
+                if not runner.CLAIMS.put(approval_key, signed_record("approval", session_id, launch), skip_if_exists=True):
+                    launch = verified_record("approval", session_id, runner.CLAIMS.get(approval_key, None))
+                    if (launch["job"]["linear"]["session_id"] != session_id
+                            or launch["job"]["linear"]["organization_id"] != job["linear"]["organization_id"]):
+                        raise PermissionError("Linear approval scope mismatch")
                     if launch.get("call_id"):
                         return
                     approved = launch["job"]
@@ -433,7 +463,7 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
                             "writeback_signature": request_signature("writeback", [
                                 job["linear"]["organization_id"], job["linear"]["session_id"]])}}
                 call = runner.worker.spawn(signed_execution(approved, approved=True))
-                runner.CLAIMS.put(approval_key, {**launch, "call_id": call.object_id})
+                runner.CLAIMS.put(approval_key, signed_record("approval", session_id, {**launch, "call_id": call.object_id}))
                 return
             activity(job, "elicitation", "There is no live job for this session. Please delegate the issue to Autokas again.")
             return
@@ -495,6 +525,14 @@ async def receive(request: Request) -> JSONResponse:
 
 def register(runner: Any) -> None:
     """Register intake and the credential service without a circular top-level import."""
+    runner.linear_get_state = runner.app.function(
+        image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET],
+        retries=0, timeout=30, name="linear_get_state",
+    )(get_state)
+    runner.linear_set_state = runner.app.function(
+        image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET],
+        retries=0, timeout=30, name="linear_set_state",
+    )(authenticated_set_state)
     runner.linear_authorize = runner.app.function(
         image=runner.with_runner_files(runner.BASE_IMAGE), secrets=[LINEAR_SECRET],
         retries=0, timeout=30, name="linear_authorize",

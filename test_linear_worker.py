@@ -1,5 +1,7 @@
 """Linear command routing, read-only planning and JSON-lines RPC regressions."""
 import copy
+import io
+import tarfile
 import os
 import queue
 import json
@@ -181,16 +183,28 @@ with open('frames.json', 'w') as stream:
                 output = remote + "\trefs/heads/" + self.job["branch"] if remote else ""
             return subprocess.CompletedProcess(args, 0, output, "")
 
-        def rpc(args, worktree, env, job, prompt, deadline):
+        def rpc(args, worktree, env, job, prompt, deadline, **kwargs):
             seen["args"] = args
+            seen["env"] = env
             seen["record_at_launch"] = self.claims.get("command:" + self.job["key"])
             if callable(rpc_result):
                 return rpc_result(args, worktree, env, job, prompt, deadline)
             return rpc_result
 
+        checkout = io.BytesIO()
+        with tarfile.open(fileobj=checkout, mode="w") as archive:
+            content = b"tracked repository content"
+            entry = tarfile.TarInfo("source.txt")
+            entry.size = len(content)
+            archive.addfile(entry, io.BytesIO(content))
+
+        def planner(job, archive, proxy_key, expires_at):
+            return runner.linear_planner.local(job, checkout.getvalue(), proxy_key, expires_at)
+
         with patch.dict(os.environ, PATH=os.environ["PATH"], BUN_INSTALL="/tmp", CLI_PROXY_API_KEY="test"), \
              patch("runner.github_token", return_value="token"), patch("runner.check_proxy_model"), \
              patch("runner.subprocess.run", side_effect=run), patch("runner.linear_rpc", side_effect=rpc), \
+             patch.object(runner.linear_planner, "remote", side_effect=planner), \
              patch("runner.modal.current_function_call_id", return_value=None), patch("runner.github", return_value=[]):
             runner.PRWorker(pr_key="example/app#ENG-12").run.local(self.job)
         return seen
@@ -204,10 +218,44 @@ with open('frames.json', 'w') as stream:
         self.assertNotIn("--print", args)
         self.assertNotIn("remote_args", seen)
         self.assertIsNone(seen["record_at_launch"])
+        self.assertNotIn("GH_TOKEN", seen["env"])
+        self.assertNotIn("JARVIS_RUNNER_TOKEN", seen["env"])
+
         self.update.assert_called_once_with(self.job, plan=[{"content": "Inspect callers", "status": "pending"},
                                                           {"content": "Implement and test", "status": "pending"}])
         self.assertEqual(self.state.call_args.args[1], "awaiting_approval")
         self.assertEqual(self.activity.call_args.args[1], "elicitation")
+
+    def test_planner_child_reads_checkout_but_not_worker_credentials(self):
+        checkout = io.BytesIO()
+        with tarfile.open(fileobj=checkout, mode="w") as archive:
+            content = b"repository fixture"
+            entry = tarfile.TarInfo("source.txt")
+            entry.size = len(content)
+            archive.addfile(entry, io.BytesIO(content))
+        child = """import json, os, pathlib, sys
+frame = json.loads(sys.stdin.readline())
+assert pathlib.Path('source.txt').read_text() == 'repository fixture'
+for key in ('GH_TOKEN', 'GITHUB_APP_PRIVATE_KEY', 'JARVIS_RUNNER_TOKEN', 'LINEAR_WEBHOOK_SECRET'):
+    assert key not in os.environ, key
+text = json.dumps(['inspect repository fixture', 'implement after approval'])
+print(json.dumps({'type':'message_end','message':{'role':'assistant','content':[{'type':'text','text':text}]}}), flush=True)
+print(json.dumps({'type':'agent_end','isTerminal':True}), flush=True)
+"""
+        actual_rpc = runner.linear_rpc
+
+        def rpc(args, worktree, env, job, prompt, deadline, **kwargs):
+            return actual_rpc([sys.executable, "-u", "-c", child], worktree, env, job, prompt, deadline, **kwargs)
+
+        with patch.dict(os.environ, BUN_INSTALL="/tmp", GH_TOKEN="synthetic-gh", \
+                        GITHUB_APP_PRIVATE_KEY="synthetic-app", JARVIS_RUNNER_TOKEN="synthetic-advisor"), \
+                patch("runner.linear_rpc", side_effect=rpc), patch("runner.linear_intake.session_queue") as queue:
+            queue.return_value.get.return_value = None
+            code, summary = runner.linear_planner.local(
+                runner.linear_intake.stored_job(self.job), checkout.getvalue(), "synthetic-proxy", time.time() + 5)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(summary), ['inspect repository fixture', 'implement after approval'])
+        self.state.assert_not_called()
 
     def test_normal_rpc_records_identifier_branch_before_execution(self):
         with patch("runner.linear_finish") as finish:

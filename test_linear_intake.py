@@ -357,27 +357,21 @@ class WritebackTests(unittest.TestCase):
         filename = hashlib.sha256(json.dumps(["client", "org"]).encode()).hexdigest() + ".json"
         self.assertEqual(json.loads((linear.OAUTH_STORAGE / filename).read_text())["refresh_token"], "refresh-3")
 
-    def test_valid_legacy_rotation_is_migrated_before_idle_cache_expiry(self):
-        initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
-        cache = {"linear:oauth:client:org": {"access_token": "current", "refresh_token": "refresh-1", "expires_at": 4600}}
+    def test_shared_oauth_poison_cannot_replace_durable_credentials(self):
+        initial = {"access_token": "trusted", "refresh_token": "trusted-refresh", "expires_at": 4600}
+        cache = {"linear:oauth:client:org": {
+            "access_token": "poison", "refresh_token": "poison-refresh", "expires_at": 99999999999}}
         claims = Mock()
         claims.get.side_effect = lambda key, default=None: cache.get(key, default)
-        claims.put.side_effect = lambda key, value: cache.update({key: value})
         claims.pop.side_effect = lambda key, default=None: cache.pop(key, default)
-        with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}),
-                        LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
-                patch.object(runner, "CLAIMS", claims), patch.object(linear.urllib.request, "urlopen") as exchange, \
-                patch.object(linear.time, "time", return_value=1000) as clock:
-            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "current")
-            exchange.assert_not_called()
-            self.assertEqual(cache, {})
-            clock.return_value = 1000 + 8 * 86400
-            exchange.return_value.__enter__.return_value = io.BytesIO(json.dumps({
-                "access_token": "next", "refresh_token": "refresh-2", "expires_in": 3600}).encode())
-            self.assertEqual(linear.oauth_token("org", linear.time.time() + 3), "next")
-            self.assertEqual(linear.urllib.parse.parse_qs(exchange.call_args.args[0].data.decode())["refresh_token"], ["refresh-1"])
+        with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}), LINEAR_CLIENT_ID="client"), \
+                patch.object(runner, "CLAIMS", claims), patch.object(linear.time, "time", return_value=1000):
+            self.assertEqual(linear.oauth_token("org", 1003), "trusted")
+        filename = hashlib.sha256(json.dumps(["client", "org"]).encode()).hexdigest() + ".json"
+        self.assertEqual(json.loads((linear.OAUTH_STORAGE / filename).read_text()), initial)
+        self.assertEqual(cache, {})
 
-    def test_uncommitted_rotation_does_not_return_or_delete_legacy_credentials(self):
+    def test_uncommitted_rotation_does_not_return_credentials(self):
         initial = {"access_token": "old", "refresh_token": "refresh-0", "expires_at": 900}
         with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps({"org": initial}),
                         LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="secret"), \
@@ -388,7 +382,6 @@ class WritebackTests(unittest.TestCase):
             runner.LINEAR_OAUTH_VOLUME.commit.side_effect = RuntimeError("storage unavailable")
             with self.assertRaisesRegex(RuntimeError, "storage unavailable"):
                 linear.oauth_token("org", linear.time.time() + 3)
-            claims.pop.assert_not_called()
 
 
     def test_concurrent_calls_share_one_refresh_and_retain_rotation(self):
@@ -516,6 +509,7 @@ class ResolutionTests(unittest.TestCase):
             with self.subTest(status=status):
                 saved_job = {**self.job, "repo": "example-org/app"}
                 saved = {"state": status, "job": saved_job, "plan": [{"content": "Fix parser", "status": "pending"}]}
+                saved = linear.signed_record("state", "session-1", saved)
                 storage = {"linear:state:session-1": saved}
                 claims = Mock()
                 claims.get.side_effect = lambda key, default=None: storage.get(key, default)
@@ -523,6 +517,7 @@ class ResolutionTests(unittest.TestCase):
                 with patch.object(runner, "CLAIMS", claims), patch.object(linear, "activity") as activity, \
                         patch.object(linear, "session_queue") as steering, patch.object(runner, "worker") as worker:
                     payload = event("prompted", "")
+                    worker.spawn.return_value = Mock(object_id="fc-approved")
                     with self.assertRaisesRegex(ValueError, "no prompt text"):
                         linear.resolve(payload, linear.event_job(payload))
                     self.assertEqual(storage["linear:state:session-1"], saved)
@@ -535,10 +530,61 @@ class ResolutionTests(unittest.TestCase):
                         self.assertIn("Fix parser", approved["prompt"])
 
 
+    def test_tampered_state_cannot_authorize_a_different_task(self):
+        record = {"state": "awaiting_approval", "job": {**self.job, "repo": "example-org/gated"},
+                  "plan": [{"content": "fix parser", "status": "pending"}]}
+        signed = linear.signed_record("state", "session-1", record)
+        variants = [{**signed, "state": "running"},
+                    {**signed, "job": {**record["job"], "prompt": "attacker task"}},
+                    {**signed, "plan": [{"content": "attacker plan", "status": "pending"}]},
+                    linear.signed_record("state", "other-session", record),
+                    linear.signed_record("approval", "session-1", record)]
+        for forged in variants:
+            with self.subTest(forged=forged), patch.object(runner, "CLAIMS") as claims, \
+                    patch.object(linear, "activity"), patch.object(runner, "worker") as worker:
+                claims.get.return_value = forged
+                payload = event("prompted", "approve")
+                with self.assertRaises(PermissionError):
+                    linear.resolve(payload, linear.event_job(payload))
+                worker.spawn.assert_not_called()
+
+    def test_worker_cannot_get_forged_job_sealed_as_state(self):
+        job = linear.signed_execution({**self.job, "repo": "example-org/app"})
+        forged = {**job, "repo": "example-org/other", "prompt": "attacker task"}
+        with patch.object(runner, "CLAIMS") as claims, self.assertRaises(PermissionError):
+            runner.linear_set_state.local(forged, "awaiting_approval", {"plan": []})
+        claims.put.assert_not_called()
+
+    def test_unsigned_saved_plan_cannot_be_approved(self):
+        saved = {"state": "awaiting_approval", "job": {**self.job, "repo": "example-org/gated"},
+                 "plan": [{"content": "attacker task", "status": "pending"}]}
+        with patch.object(runner, "CLAIMS") as claims, patch.object(linear, "activity"), \
+                patch.object(runner, "worker") as worker:
+            claims.get.return_value = saved
+            payload = event("prompted", "approve")
+            with self.assertRaises(PermissionError):
+                linear.resolve(payload, linear.event_job(payload))
+            worker.spawn.assert_not_called()
+
+    def test_preseeded_approval_cannot_substitute_job(self):
+        saved_job = {**self.job, "repo": "example-org/gated",
+                     "linear": {**self.job["linear"], "plan_only": True}}
+        with patch.object(runner, "CLAIMS") as claims, patch.object(linear, "activity"), \
+                patch.object(runner, "worker") as worker:
+            linear.set_state(saved_job, "awaiting_approval", plan=[{"content": "fix parser", "status": "pending"}])
+            saved = claims.put.call_args.args[1]
+            claims.get.side_effect = [saved, {"job": {**self.job, "repo": "example-org/app", "prompt": "attacker task"}}]
+            claims.put.return_value = False
+            payload = event("prompted", "approve")
+            with self.assertRaises(PermissionError):
+                linear.resolve(payload, linear.event_job(payload))
+            worker.spawn.assert_not_called()
+
     def test_failed_approval_startup_can_retry_original_plan(self):
         saved_job = {**self.job, "repo": "example-org/gated", "linear": {**self.job["linear"], "plan_only": True}}
         saved = {"state": "awaiting_approval", "job": saved_job,
                  "plan": [{"content": "Fix parser", "status": "pending"}]}
+        saved = linear.signed_record("state", "session-1", saved)
         storage = {"linear:state:session-1": saved}
         claims = Mock()
 
@@ -587,6 +633,7 @@ class ResolutionTests(unittest.TestCase):
         claims.get.side_effect = lambda key, default=None: storage.get(key, default)
         with patch.object(runner, "CLAIMS", claims), patch.object(linear, "get_state", return_value=saved), \
                 patch.object(linear, "activity") as activity, patch.object(runner, "worker") as worker:
+            worker.spawn.return_value = Mock(object_id="fc-approved")
             for body in ("What about tests?", "do not approve", "yes but wait", "", "looks good maybe"):
                 if not body:
                     continue
@@ -617,17 +664,11 @@ class ResolutionTests(unittest.TestCase):
         saved = {"state": "finishing", "job": self.job}
         with patch.object(runner, "CLAIMS") as claims, patch.object(linear, "get_state", return_value=saved), \
                 patch.object(linear, "activity") as activity, patch.object(linear, "session_queue") as queue:
-            linear.set_state(self.job, "finishing")
-            claims.put.assert_called_once_with("linear:state:session-1", saved)
             payload = event("prompted", "more work")
             linear.resolve(payload, linear.event_job(payload))
             self.assertEqual(activity.call_args.args[1], "elicitation")
             queue.assert_not_called()
 
-    def test_state_stores_resolved_job(self):
-        with patch.object(runner, "CLAIMS") as claims:
-            linear.set_state(self.job, "awaiting_approval", plan=[])
-            claims.put.assert_called_once_with("linear:state:session-1", {"state": "awaiting_approval", "job": self.job, "plan": []})
 
     def test_disallowed_repo_emits_concrete_error_and_no_job(self):
         runner.CONFIG["linear"]["repo_map"]["teams"]["team-1"] = "evil/repo"
