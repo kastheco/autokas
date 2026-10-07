@@ -102,6 +102,29 @@ class PRReviewIntakeTests(unittest.TestCase):
             self.assertIsNone(runner.event_job("pull_request", pr_event("opened")))
             self.assertIsNone(runner.event_job(*comment_event("@autokas review")))
 
+    def test_kas_alias_routes_reviews_commands_and_depth_bypasses(self):
+        for event in ("issue_comment", "pull_request_review_comment"):
+            with self.subTest(event=event):
+                review = runner.event_job(*comment_event("  !KAS review: focus on auth", event=event))
+                self.assertEqual((review["mode"], review["instructions"]), ("pr_review", "focus on auth"))
+                command = runner.event_job(*comment_event("!kas fix the parser", event=event))
+                self.assertEqual((command["mode"], command["prompt"]), ("command", "fix the parser"))
+                bypass = runner.event_job(*comment_event("!kas fix review 777", event=event))
+                self.assertEqual((bypass["mode"], bypass["comment"]), ("review_fix_request", 777))
+        issue = runner.event_job(*comment_event("!kas review", on_issue=True))
+        self.assertEqual((issue["mode"], issue["target"], issue["prompt"]), ("command", "issue", "review"))
+        with enabled(False):
+            self.assertIsNone(runner.event_job(*comment_event("!kas review")))
+
+    def test_kas_alias_requires_a_complete_leading_human_command(self):
+        for body in ("!kas", "!kasper review", "!kas-other review", "!kas_review", "quoted !kas review", "> !kas review"):
+            with self.subTest(body=body):
+                self.assertIsNone(runner.event_job(*comment_event(body)))
+        self.assertIsNone(runner.event_job(*comment_event("!kas review", user_type="Bot")))
+        event, payload = comment_event("!kas fix the parser")
+        payload["action"] = "edited"
+        self.assertIsNone(runner.event_job(event, payload))
+
     def test_review_prefix_routes_to_pr_agent_with_the_rest_as_instructions(self):
         with enabled():
             for event in ("issue_comment", "pull_request_review_comment"):
@@ -431,7 +454,15 @@ class PRReviewRunTests(unittest.TestCase):
                 self.logs.clear()
                 self.run_review({**self.auto_job(), **{k: v for k, v in change.items() if k == "round"}}, issues=issues)
                 self.assertEqual(self.dispatched, [])
-                self.assertEqual(len(self.posts), 1)
+                if name == "last round":
+                    notice = self.posts[1][2]["body"]
+                    command = next(line for line in notice.splitlines() if line.startswith("@autokas "))
+                    event, payload = comment_event(command)
+                    request = runner.event_job(event, payload)
+                    self.assertEqual((request["mode"], request["comment"]), ("review_fix_request", 777))
+                    self.assertEqual(self.checks[-1][2]["actions"][0]["identifier"], "fix:777")
+                else:
+                    self.assertNotIn("actions", self.checks[-1][2])
                 self.assertEqual(self.events()[-1], "pr_review_no_fix")
         with patch.dict(runner.CONFIG["pr_review"], fix_severity="P3"):
             self.run_review(self.auto_job(), issues=[ISSUES[1]])
@@ -857,6 +888,17 @@ class FixPublicationTests(unittest.TestCase):
               patch.object(runner, "log", side_effect=lambda event, **fields: self.logs.append((event, fields)))):
             runner.PRWorker(pr_key=f"{REPO}#42").run.local(self.job)
 
+    def test_explicit_depth_bypass_revalidates_and_publishes_one_fix(self):
+        self.body = runner.pr_agent_marker(self.starting_head, 7, runner.pr_agent_findings(
+            {"review": {"key_issues_to_review": ISSUES}}))
+        self.job.update(bypass_depth=True, author="kas",
+                        prompt=runner.pr_agent_prompt(self.body, bypass_depth=True))
+        self.run_fix("exact")
+        self.assertEqual(self.labels, ["fixing", "fixed"])
+        self.assertEqual(self.git(["show", f"{self.remote_head}:parser.py"], self.origin), "result = 'fixed'")
+        self.assertEqual([job["round"] for job in self.dispatched], [8])
+        self.assertEqual(runner.pr_agent_prompt(self.body), "")
+
     def test_parent_restack_preserves_fix_publication_and_reviews_merged_head(self):
         self.run_fix()
         self.assertEqual(self.labels, ["fixing", "fixed"])
@@ -1026,6 +1068,98 @@ class FixPublicationTests(unittest.TestCase):
         self.run_fix("handled", prior_outcome=outcome)
         self.assertEqual(self.labels, ["fixing", "blocked"])
         self.assertEqual(self.dispatched, [])
+
+
+class ReviewFixBypassTests(unittest.TestCase):
+    def setUp(self):
+        self.pr = copy.deepcopy(PR)
+        self.comment = {"id": 777, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
+                        "body": runner.pr_agent_marker(HEAD, 7, runner.pr_agent_findings(
+                            {"review": {"key_issues_to_review": ISSUES}})),
+                        "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
+                        "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+        self.check = {"id": 88, "name": runner.REVIEW_CHECK, "app": {"slug": runner.CONFIG["github_app"]["name"]},
+                      "head_sha": HEAD, "details_url": self.comment["html_url"],
+                      "status": "completed", "conclusion": "failure"}
+        self.permission = "write"
+        self.event = {"action": "requested_action", "requested_action": {"identifier": "fix:777"},
+                      "repository": {"full_name": REPO}, "sender": {"login": "kas", "type": "User"},
+                      "check_run": self.check}
+        self.reads = []
+
+    def github(self, path):
+        self.reads.append(path)
+        if path.endswith("/permission"):
+            return {"permission": self.permission}
+        return {f"repos/{REPO}/pulls/42": self.pr,
+                f"repos/{REPO}/issues/comments/777": self.comment,
+                f"repos/{REPO}/check-runs/88": self.check}[path]
+
+    def resolve(self):
+        job = runner.event_job("check_run", self.event)
+        self.assertIsNotNone(job)
+        with patch.object(runner, "github", side_effect=self.github), patch.object(runner, "log"):
+            return runner.requested_review_fix(job)
+
+    def test_button_and_comment_bypass_share_one_fixer_claim(self):
+        button = self.resolve()
+        event, payload = comment_event("@autokas fix review 777")
+        command = runner.event_job(event, payload)
+        with patch.object(runner, "github", side_effect=self.github):
+            fallback = runner.requested_review_fix(command)
+        self.assertEqual(button["key"], fallback["key"])
+        self.assertIn("[P1] Wrong lookup", button["prompt"])
+        self.assertNotIn("[P3]", button["prompt"])
+        self.assertEqual(button["head"], HEAD)
+        claims = set()
+        def claim(key, value, **kwargs):
+            if key in claims:
+                return False
+            claims.add(key)
+            return True
+        with (patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim))),
+              patch.object(runner, "worker") as worker, patch.object(runner, "log")):
+            worker.spawn.return_value = Mock(object_id="call")
+            runner.dispatch(button)
+            runner.dispatch(fallback)
+        self.assertEqual(worker.spawn.call_count, 1)
+        self.assertEqual(runner.pr_agent_prompt(self.comment["body"]), "")
+
+    def test_read_only_requester_cannot_bypass(self):
+        self.permission = "read"
+        self.assertIsNone(self.resolve())
+        self.assertEqual(self.reads, [f"repos/{REPO}/collaborators/kas/permission"])
+
+    def test_bypass_rejects_moved_head_forged_review_and_wrong_pr(self):
+        for field, replacement in (("head", "c" * 40), ("user", {"login": "outsider", "type": "User"}),
+                                   ("issue_url", f"https://api.github.com/repos/{REPO}/issues/43")):
+            with self.subTest(field=field):
+                old_pr, old_comment = copy.deepcopy(self.pr), copy.deepcopy(self.comment)
+                if field == "head":
+                    self.pr["head"]["sha"] = replacement
+                else:
+                    self.comment[field] = replacement
+                self.assertIsNone(self.resolve())
+                self.pr, self.comment = old_pr, old_comment
+
+    def test_button_rejects_other_apps_heads_and_review_links(self):
+        for changes in ({"app": {"slug": "other-app"}}, {"head_sha": "c" * 40},
+                        {"details_url": f"https://github.com/{REPO}/pull/42#issuecomment-778"},
+                        {"conclusion": "success"}):
+            with self.subTest(changes=changes):
+                original = copy.deepcopy(self.check)
+                self.check.update(changes)
+                # Keep the delivered target valid, then verify the freshly fetched check.
+                self.event["check_run"] = original
+                self.assertIsNone(self.resolve())
+                self.check = original
+                self.event["check_run"] = self.check
+
+    def test_bypass_never_enables_disabled_fixes_or_below_threshold_findings(self):
+        with patch.dict(runner.CONFIG["pr_review"], fix_severity=None):
+            self.assertIsNone(self.resolve())
+        self.comment["body"] = runner.pr_agent_marker(HEAD, 7, [{"severity": "P3"}])
+        self.assertIsNone(self.resolve())
 
 
 if __name__ == "__main__":

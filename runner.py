@@ -413,11 +413,11 @@ def autokas_ignored(pr: dict[str, Any]) -> bool:
     return isinstance(body, str) and ("autokas:ignore" in body.lower() or "@autokas ignore" in body.lower())
 
 
-COMMAND = re.compile(r"@autokas(?![\w-])", re.IGNORECASE)
+COMMAND = re.compile(r"(?:@autokas|!kas)(?![\w-])", re.IGNORECASE)
 REVIEW_COMMAND = re.compile(r"review(?![\w-])[\s:,.;!-]*", re.IGNORECASE)
 
 def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Accept a new human comment that starts with @autokas; the dispatcher checks access."""
+    """Accept a new human comment starting with @autokas or !kas; the dispatcher checks access."""
     if event not in {"issue_comment", "pull_request_review_comment"} or payload.get("action") != "created":
         return None
     comment = payload["comment"]
@@ -430,6 +430,11 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     target = payload["issue"] if event == "issue_comment" else payload["pull_request"]
     target_kind = "issue" if event == "issue_comment" and "pull_request" not in target else "pr"
     review = REVIEW_COMMAND.match(instruction) if target_kind == "pr" else None
+    fix_review = re.fullmatch(r"fix review ([1-9][0-9]*)", instruction, re.IGNORECASE) if target_kind == "pr" else None
+    if fix_review:
+        return {"mode": "review_fix_request", "repo": repo, "pr": target["number"],
+                "comment": int(fix_review[1]), "author": comment["user"]["login"],
+                "key": f"{repo}:review_fix:command:{comment['id']}"}
     if review:
         # `@autokas review …` on a PR asks for a PR-Agent review, never an omp coding job.
         # any text after `review` goes to PR-Agent as extra review instructions.
@@ -680,14 +685,14 @@ def pr_agent_round(repo: str, number: int) -> int:
     return pr_agent_history(repo, number)[0]
 
 
-def pr_agent_prompt(body: str) -> str:
-    """Turn a PR-Agent review into one fix prompt: findings at or above `fix_severity`, while rounds remain."""
+def pr_agent_prompt(body: str, *, bypass_depth: bool = False) -> str:
+    """Select findings at the fix threshold, enforcing depth unless a human explicitly bypassed it."""
     settings = CONFIG["pr_review"]
     state = pr_agent_review_state(body)
     if not state or settings.get("fix_severity") not in SEVERITIES:
         return ""
     round_ = int(state.get("round", 1)) + int(bool(state.get("restack")))
-    if round_ > settings["max_fix_rounds"]:
+    if not bypass_depth and round_ > settings["max_fix_rounds"]:
         return ""
     threshold = SEVERITIES.index(settings["fix_severity"])
     selected = [finding for finding in state["findings"]
@@ -746,10 +751,62 @@ def reviewer_of(user: dict[str, Any]) -> str | None:
                  if all(user.get(key) == value for key, value in CONFIG[name].items())), None)
 
 
+def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
+    """Authorize one depth bypass against the current PR and the bot's exact source review."""
+    repo, number = job["repo"], job["pr"]
+    access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
+    if access.get("permission") not in {"admin", "write"}:
+        log("command_unauthorized", key=job["key"])
+        return None
+    comment = github(f"repos/{repo}/issues/comments/{job['comment']}")
+    pr = github(f"repos/{repo}/pulls/{number}")
+    body = comment.get("body") or ""
+    state = pr_agent_review_state(body)
+    if (reviewer_of(comment.get("user", {})) != "pr_agent"
+            or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
+            or not state or state.get("head") != pr["head"]["sha"]
+            or pr["state"] != "open" or generated_docs_pr(pr) or autokas_ignored(pr)
+            or pr["head"]["repo"]["full_name"] != repo or pr["base"]["repo"]["full_name"] != repo):
+        log("review_fix_outdated", key=job["key"])
+        return None
+    prompt = pr_agent_prompt(body, bypass_depth=True)
+    if not prompt or pr_agent_prompt(body):
+        log("review_fix_not_exhausted", key=job["key"])
+        return None
+    if job.get("check") is not None:
+        check = github(f"repos/{repo}/check-runs/{job['check']}")
+        if (check.get("name") != REVIEW_CHECK or check.get("app", {}).get("slug") != CONFIG["github_app"]["name"]
+                or check.get("head_sha") != state["head"] or check.get("details_url") != comment.get("html_url")
+                or check.get("status") != "completed" or check.get("conclusion") != "failure"):
+            log("review_fix_invalid_check", key=job["key"])
+            return None
+    fingerprint = hashlib.sha256(prompt.encode()).hexdigest()
+    return {"repo": repo, "pr": number, "comment": job["comment"], "kind": "issue_comment",
+            "reviewer": "pr_agent", "head": state["head"], "prompt": prompt,
+            "bypass_depth": True, "author": job["author"],
+            "key": f"{repo}:issue_comment:{job['comment']}:{fingerprint}"}
+
+
 def event_job(event: str, payload: dict[str, Any], posted_review: bool = False) -> dict[str, Any] | None:
     """Dispatch docs merges separately while preserving review-bot intake. `posted_review` is set only by `pr_review`
     for the comment it just posted: coding jobs also comment as autokas[bot], so a delivered or reconciled
     autokas[bot] comment never starts a PR-Agent fix."""
+    if event == "check_run":
+        check = payload.get("check_run", {})
+        repo = payload.get("repository", {}).get("full_name")
+        sender = payload.get("sender", {})
+        if not isinstance(repo, str):
+            return None
+        action = re.fullmatch(r"fix:([1-9][0-9]*)", payload.get("requested_action", {}).get("identifier", ""))
+        target = re.fullmatch(rf"https://github.com/{re.escape(repo)}/pull/([1-9][0-9]*)#issuecomment-([1-9][0-9]*)",
+                              check.get("details_url") or "")
+        if (payload.get("action") != "requested_action" or not action or not target
+                or target[2] != action[1] or sender.get("type") != "User" or not sender.get("login")
+                or type(check.get("id")) is not int):
+            return None
+        return {"mode": "review_fix_request", "repo": repo, "pr": int(target[1]),
+                "comment": int(action[1]), "check": check["id"], "author": sender["login"],
+                "key": f"{repo}:review_fix:check:{check['id']}:{sender['login']}"}
     if event == "pull_request":
         return docs_event_job(payload) or review_event_job(payload)
     command = command_job(event, payload)
@@ -924,13 +981,16 @@ def start_review_check(repo: str, head: str, key: str) -> int | None:
 
 
 def finish_review_check(repo: str, check: int | None, key: str, conclusion: str, title: str,
-                        details_url: str | None = None) -> None:
+                        details_url: str | None = None, fix_comment: int | None = None) -> None:
     if check is None:
         return
     payload: dict[str, Any] = {"status": "completed", "conclusion": conclusion,
                                "output": {"title": title, "summary": title}}
     if details_url:
         payload["details_url"] = details_url
+    if fix_comment is not None:
+        payload["actions"] = [{"label": "fix anyway", "description": "Run one fixer beyond the depth limit",
+                               "identifier": f"fix:{fix_comment}"}]
     try:
         github_request("PATCH", f"repos/{repo}/check-runs/{check}", payload)
     except Exception as error:
@@ -1689,10 +1749,20 @@ def pr_review(job: dict[str, Any]) -> None:
     except Exception:
         finish_review_check(repo, check, job["key"], "neutral", "the review didn't finish")
         raise
-    finish_review_check(repo, check, job["key"], *review_conclusion(findings), details_url=comment.get("html_url"))
+    exhausted = bool(pr_agent_prompt(comment["body"], bypass_depth=True)) and not pr_agent_prompt(comment["body"])
+    finish_review_check(repo, check, job["key"], *review_conclusion(findings), details_url=comment.get("html_url"),
+                        fix_comment=comment["id"] if exhausted else None)
+    if exhausted:
+        check_link = (f"[fix anyway in the review check](https://github.com/{repo}/pull/{number}/checks?check_run_id={check})"
+                      if check is not None else "the comment command below")
+        github_request("POST", f"repos/{repo}/issues/{number}/comments", {
+            "body": f"maximum review/fix depth reached (round {round_}, limit {CONFIG['pr_review']['max_fix_rounds']}). "
+                    f"no fixer was queued for [this review]({comment['html_url']}).\n\n"
+                    f"use {check_link} to authorize one fixer for these findings on this head, without resetting the cap. "
+                    f"you can also post:\n\n```text\n@autokas fix review {comment['id']}\n```"})
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
-    # the only PR-Agent fix intake: webhook and reconcile deliveries of autokas[bot] comments never start one.
+    # automatic intake only: delivered bot comments never start a fix without an authorized human bypass.
     fix = event_job("issue_comment", {
         "action": "created", "repository": {"full_name": repo}, "sender": comment["user"], "comment": comment,
         "issue": {**current, "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/{number}"}},
@@ -1725,6 +1795,16 @@ def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict
               timeout=180, cpu=0.125, memory=256)
 def worker(job: dict[str, Any]) -> None:
     """Keep the durable intake queue while routing work to one pool per PR."""
+    if job.get("mode") == "review_fix_request":
+        fix = requested_review_fix(job)
+        if fix is not None:
+            dispatch(fix)
+        return
+    if job.get("bypass_depth"):
+        access = github(f"repos/{job['repo']}/collaborators/{job['author']}/permission")
+        if access.get("permission") not in {"admin", "write"}:
+            log("command_unauthorized", key=job["key"])
+            return
     if job.get("mode") == "pr_review":
         # reviews post one comment from their own small image; they never start a coding container.
         call = pr_review.spawn(job)
@@ -1916,7 +1996,9 @@ class PRWorker:
                     reviewer = job.get("reviewer", "coderabbit")
                     if (reviewer_of(comment["user"]) != reviewer
                             or relation != f"https://api.github.com/repos/{repo}/{relation_type}/{number}"
-                            or finding_prompt(reviewer, comment.get("body") or "") != job.get("review_prompt", job["prompt"])):
+                            or (pr_agent_prompt(comment.get("body") or "", bypass_depth=True)
+                                if job.get("bypass_depth") else finding_prompt(reviewer, comment.get("body") or ""))
+                            != job.get("review_prompt", job["prompt"])):
                         raise RuntimeError("comment changed or PR relationship is invalid")
                 worktree = root / "repo"
                 if command_resume is not None:
