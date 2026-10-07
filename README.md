@@ -21,6 +21,7 @@ the runner dispatches the job, not the agent's working process. omp owns investi
 - **reviews every PR.** a PR-Agent review posts as `autokas[bot]` when a PR is ready and again on each push, and shows as an `autokas review` check next to CI. findings are tagged `[P0]` to `[P3]`. see [reviews](#reviews).
 - **fixes review findings.** findings from CodeRabbit, Cursor Bugbot, Cursor Security Reviewer and autokas's own reviews go to an omp job that fixes what's still valid, runs the repo's checks and pushes to the PR branch. its own findings get up to three fix rounds, each re-reviewed. an `autokas:*` label shows the latest outcome. see [fixes](#fixes).
 - **takes instructions.** start a comment with `@autokas` on a PR or issue and it does the work, opening a PR for issues. see [commands](#autokas-commands).
+- **takes linear issues.** delegate an issue to the linear app, steer the live run from its session, and get progress and the resulting PR there. some repositories require plan approval before coding. see [linear intake](docs/operations.md#linear-intake).
 - **keeps docs current.** after a merge in a configured repo, it opens, validates and merges a follow-up docs PR. see [docs follow-ups](#docs-follow-ups).
 - **leaves stacks linear.** fixes never merge into or rewrite upstack branches, and a review after a restack spends no fix round.
 - **checks business intent.** a paired advisor answers intent questions before omp changes intended behavior. see [advisors](#advisors).

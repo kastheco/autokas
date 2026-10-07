@@ -1,0 +1,63 @@
+# autokas: linear intake
+
+status: implemented. app provisioning and OAuth refresh are verified. production deployment and end-to-end sandbox acceptance remain unverified.
+
+## goal
+
+delegating a linear issue to autokas starts the same coding job an `@autokas` comment on a github issue starts today, and the linear issue shows progress and the resulting PR. a follow-up message in the linear session while the job runs steers it. after the PR opens, the existing review and fix loop runs unchanged.
+
+## scope
+
+in:
+- a linear app installed as an agent (`actor=app`) in two configured workspaces.
+- a second webhook endpoint for linear agent session events.
+- mapping a linear session to a repo and a coding job.
+- steering a running job from the linear session.
+- progress, the PR link and the outcome written back to the linear session.
+- a plan-first gate for the installed repositories listed in `linear_intake.GATED_REPOS`.
+
+out, for later specs:
+- run log, spend caps, DMS status widget.
+- triage automation (auto-delegation without a human).
+- any change to PR-Agent review, finding fixes, docs follow-ups or stack handling.
+
+## linear side (from linear's developer docs, developer preview)
+
+- app created with webhooks on and the "agent session events" category enabled. scopes include `app:assignable` and `app:mentionable`. assigning the app sets it as the issue's delegate, a human stays assignee.
+- each workspace that installs the app gets its own OAuth access and refresh tokens. access tokens expire after 24 hours. renew them with the app credentials and retain rotated refresh tokens. payloads carry `organizationId`.
+- `AgentSessionEvent` webhooks with `action: created` (delegated or mentioned) or `prompted` (a user follow-up, text in `agentActivity.content.body`).
+- the receiver must return within 5 seconds. after `created`, the agent must emit an activity or set `externalUrls` within 10 seconds or the session is marked unresponsive.
+- `promptContext` on the payload is a ready-made string with the issue, parent, project, comment threads and team guidance. use it as the job prompt.
+- progress goes back through `agentActivityCreate` with types `thought`, `action`, `elicitation`, `response`, `error`. session state follows the last activity, no manual state.
+- `agentSessionUpdate` sets `externalUrls` (put the PR there, linear says this enables PR features) and an optional `plan` checklist.
+- `issueRepositorySuggestions` ranks candidate repos for an issue.
+- `Linear-Signature` is a hex HMAC-SHA256 of the raw body with the webhook signing secret. the body's `webhookTimestamp` is unix milliseconds, and linear recommends rejecting anything more than 60 seconds off. source: https://linear.app/developers/webhooks.
+- the API is developer preview and may change. pin the shapes in tests.
+
+## autokas changes
+
+linear code lives in a new `linear_intake.py`. `runner.py` gets only the worker changes in items 5 and 6.
+
+1. **new endpoint `linear_webhook`.** separate from the github `webhook`, with its own secret `omp-runner-linear`: the webhook signing secret, OAuth client credentials and each workspace's access token, refresh token and expiry, keyed by `organizationId`. renew expiring tokens through normal OAuth refresh and retain rotations in the existing `CLAIMS` dict. check `Linear-Signature` on the raw bytes and `webhookTimestamp` within 60 seconds, `401` otherwise.
+2. **ack.** before returning, the receiver posts one `thought` ("picked up, finding the repo").
+3. **dedupe.** in the existing `CLAIMS` dict, `created` claims `linear:session:<agentSession.id>` and `prompted` claims `linear:prompt:<agentActivity.id>`.
+4. **repo resolution, in order.** a repo map in private config from linear team or project to `owner/repo`. then `issueRepositorySuggestions` over `installed_repos()`, accepted only above a confidence threshold. otherwise an `elicitation` listing the top candidates and stop. a repo that fails `allowed_repository()` gets an `error` activity and no job.
+5. **issue command flow without a github issue.** linear jobs run as `mode: "command"`, `target: "issue"` with the linear session id, organization id, identifier and issue url. where the flow assumes a github issue number:
+   - the branch is `autokas/<linear-identifier>` (e.g. `autokas/ENG-123`) so linear auto-links the PR. the worker's hardcoded `autokas/issue-{number}` takes the branch from the job instead.
+   - the command prompt gets a linear variant: task text is `promptContext`, PR title includes the identifier, the PR body links the linear issue instead of `Closes #<number>`, and there's no `gh issue comment` outcome.
+   - no queued reply or acknowledgment comment on github.
+6. **steering.** linear jobs run omp with `--mode rpc` instead of `--print`, same flags otherwise. the worker sends the task as a `prompt` command and reads events until it finishes. meanwhile it forwards each message from a `modal.Queue` named for the session to omp as a `steer` command. on `prompted`, the receiver puts `agentActivity.content.body` on that queue if the session has a live job. otherwise it answers with an `elicitation` saying to delegate again. github-started jobs keep `--print`.
+7. **write-back.** `action` activities at clone, checks and push. on PR open, `agentSessionUpdate` adds the PR to `externalUrls`. finish with one `response` (what changed, checks run, PR link, draft or not) or `error` (why it stopped).
+8. **plan-first gate.** `linear_intake.GATED_REPOS` lists the installed repositories requiring a plan. for those, the first run only investigates with read-only tools and posts a `plan` plus an `elicitation` asking to proceed. an explicit approval in the next `prompted` message starts the coding run.
+9. **identity and access.** commits and PRs stay `autokas[bot]` through the existing github app. linear writes use the linear app token. anyone who can delegate to the app may use it.
+
+## acceptance
+
+- delegating a test issue in a sandbox linear team to autokas produces, without other input: an ack within 10 seconds, progress activities, a PR on `autokas/<identifier>` linked in the linear session, and a final `response`.
+- a follow-up message sent in the session during that run steers it.
+- the PR then gets the normal `autokas review` check and fix loop.
+- redelivering the same webhook does not start a second job.
+- an issue with no resolvable repo ends in an elicitation, not a guess.
+- delegating an issue for a gated repo posts a plan and waits. approving in the session starts the run.
+- a bad signature gets `401`. a repo outside `allowed_owners` ends in an `error` activity and no job.
+- existing tests pass, and new tests cover signature check, claim key, repo resolution order, gate and write-back payload shapes, all without external calls, matching the current test style.

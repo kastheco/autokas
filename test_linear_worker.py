@@ -1,0 +1,188 @@
+"""Linear command routing, read-only planning and JSON-lines RPC regressions."""
+import copy
+import os
+import queue
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import runner
+
+
+class Claims:
+    def __init__(self):
+        self.data = {}
+
+    def put(self, key, value, skip_if_exists=False):
+        if skip_if_exists and key in self.data:
+            return False
+        self.data[key] = copy.deepcopy(value)
+        return True
+
+    def get(self, key, default=None):
+        return copy.deepcopy(self.data.get(key, default))
+
+
+JOB = {"mode": "command", "target": "issue", "kind": "linear", "repo": "example/app",
+       "pr": "ENG-12", "comment": 0, "author": "linear", "branch": "autokas/ENG-12",
+       "key": "linear:session:s", "source_url": "https://linear.app/team/issue/ENG-12",
+       "prompt": "Implement the issue", "linear": {"session_id": "s", "organization_id": "o",
+       "identifier": "ENG-12", "issue_url": "https://linear.app/team/issue/ENG-12", "plan_only": False}}
+
+
+class LinearWorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.claims = Claims()
+        self.job = copy.deepcopy(JOB)
+        self.activity = Mock()
+        self.update = Mock()
+        self.state = Mock()
+        patches = [patch("runner.CLAIMS", self.claims),
+                   patch.dict(runner.CONFIG, allowed_owners=["example"]),
+                   patch("runner.linear_intake.activity", self.activity),
+                   patch("runner.linear_intake.update_session", self.update),
+                   patch("runner.linear_intake.set_state", self.state),
+                   patch("runner.log")]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_linear_dispatch_does_not_read_github_access_or_ack(self):
+        worker = Mock()
+        with patch("runner.github") as github, patch("runner.acknowledge_review") as ack, \
+             patch("runner.PRWorker", return_value=worker), patch("runner.modal.current_function_call_id", return_value=None):
+            runner.worker.local(self.job)
+        github.assert_not_called()
+        ack.assert_not_called()
+        worker.run.spawn.assert_called_once()
+
+    def invoke(self, rpc_result, plan=False, final="new", remote="new"):
+        self.job["linear"]["plan_only"] = plan
+        seen = {}
+
+        def run(args, **kwargs):
+            if args[:2] == ["git", "clone"]:
+                Path(args[-1]).mkdir()
+            output = ""
+            if args[:2] == ["git", "rev-parse"]:
+                output = "base" if "head_reads" not in seen else final
+                seen["head_reads"] = True
+            if args[:3] == ["git", "branch", "--show-current"]:
+                output = "main"
+            if args[:2] == ["git", "ls-remote"]:
+                seen["remote_args"] = args
+                output = remote + "\trefs/heads/autokas/ENG-12" if remote else ""
+            return subprocess.CompletedProcess(args, 0, output, "")
+
+        def rpc(args, worktree, env, job, prompt, deadline):
+            seen["args"] = args
+            seen["record_at_launch"] = self.claims.get("command:" + self.job["key"])
+            return rpc_result
+
+        with patch.dict(os.environ, PATH=os.environ["PATH"], BUN_INSTALL="/tmp", CLI_PROXY_API_KEY="test"), \
+             patch("runner.github_token", return_value="token"), patch("runner.check_proxy_model"), \
+             patch("runner.subprocess.run", side_effect=run), patch("runner.linear_rpc", side_effect=rpc), \
+             patch("runner.modal.current_function_call_id", return_value=None), patch("runner.github", return_value=[]):
+            runner.PRWorker(pr_key="example/app#ENG-12").run.local(self.job)
+        return seen
+
+    def test_plan_is_readonly_and_awaits_explicit_approval(self):
+        seen = self.invoke((0, '["Inspect callers", "Implement and test"]'), plan=True)
+        args = seen["args"]
+        self.assertEqual(args[args.index("--tools") + 1], "read,grep,glob")
+        self.assertIn("--no-lsp", args)
+        self.assertNotIn("--print", args)
+        self.assertNotIn("remote_args", seen)
+        self.assertIsNone(seen["record_at_launch"])
+        self.update.assert_called_once_with(self.job, plan=[{"content": "Inspect callers", "status": "pending"},
+                                                          {"content": "Implement and test", "status": "pending"}])
+        self.assertEqual(self.state.call_args.args[1], "awaiting_approval")
+        self.assertEqual(self.activity.call_args.args[1], "elicitation")
+
+    def test_normal_rpc_records_identifier_branch_before_execution(self):
+        with patch("runner.linear_finish") as finish:
+            seen = self.invoke((0, "Changed validation. Checks: unit tests passed."))
+        self.assertEqual(seen["record_at_launch"]["branch"], "autokas/ENG-12")
+        self.assertEqual(seen["record_at_launch"]["state"], "executing")
+        self.assertEqual(seen["remote_args"][-1], "refs/heads/autokas/ENG-12")
+        finish.assert_called_once()
+        self.assertEqual(self.claims.get("command:" + self.job["key"])["published_head"], "new")
+
+    def test_unconfirmed_push_stops_with_linear_error(self):
+        with self.assertRaisesRegex(RuntimeError, "could not be confirmed"):
+            self.invoke((0, "Attempted changes"), remote="other")
+        self.assertEqual(self.state.call_args.args[1], "error")
+        self.assertEqual(self.activity.call_args.args[1], "error")
+
+    def test_no_change_completion_is_durable_without_remote_branch(self):
+        self.invoke((0, "Investigation only. No checks run."), final="base", remote="")
+        with patch("runner.github") as github:
+            result = runner.command_publication(self.job)
+        self.assertEqual(result["status"], "completed")
+        github.assert_not_called()
+
+    def test_finish_links_verified_pr_and_draft(self):
+        pr = {"html_url": "https://github.com/example/app/pull/4", "draft": True, "number": 4,
+              "head": {"ref": "autokas/ENG-12", "repo": {"full_name": "example/app"}}}
+        with patch("runner.github", return_value=[pr]):
+            runner.linear_finish(self.job, "Tests failed", {"status": "published"})
+        self.update.assert_called_once_with(self.job, externalUrls=[{"label": "Pull request", "url": pr["html_url"]}])
+        self.assertIn("Tests failed", self.activity.call_args.args[2])
+        self.assertIn("(draft)", self.activity.call_args.args[2])
+        self.assertTrue(self.claims.get("command:" + self.job["key"])["linear_reported"])
+
+    def test_published_branch_without_pr_is_error(self):
+        with patch("runner.github", return_value=[]), self.assertRaisesRegex(RuntimeError, "no open pull request"):
+            runner.linear_finish(self.job, "Changed code", {"status": "published"})
+        self.activity.assert_not_called()
+
+    def test_plan_rejects_fake_or_empty_checklist(self):
+        for value in ("[]", '[" "]', '{"plan": ["do work"]}', "plain prose"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                runner.linear_plan(value)
+
+    def test_disallowed_linear_repository_reports_error_without_dispatch(self):
+        self.job["repo"] = "outside/app"
+        with patch("runner.PRWorker") as worker:
+            runner.worker.local(self.job)
+        worker.assert_not_called()
+        self.assertEqual(self.activity.call_args.args[1], "error")
+
+    def test_bootstrap_failure_is_reported_to_linear(self):
+        with patch.dict(os.environ, PATH=os.environ["PATH"], BUN_INSTALL="/tmp", CLI_PROXY_API_KEY="test"), \
+             patch("runner.github_token", side_effect=RuntimeError("installation unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "installation unavailable"):
+                runner.PRWorker(pr_key="example/app#ENG-12").run.local(self.job)
+        self.assertEqual(self.activity.call_args.args[1], "error")
+
+    def test_uncertain_response_is_not_duplicated(self):
+        self.claims.put("command:" + self.job["key"], {"linear_report_started": True})
+        with self.assertRaisesRegex(RuntimeError, "uncertain"), patch("runner.github") as github:
+            runner.linear_finish(self.job, "Earlier result", {"status": "completed"})
+        github.assert_not_called()
+        self.activity.assert_not_called()
+
+    def test_rpc_modal_empty_queue_returns_none(self):
+        child = "import json,sys; sys.stdin.readline(); print(json.dumps({'type':'agent_end','isTerminal':True}),flush=True); sys.stdin.read()"
+        modal_queue = Mock()
+        modal_queue.get.return_value = None
+        with tempfile.TemporaryDirectory() as tmp, patch("runner.linear_intake.session_queue", return_value=modal_queue):
+            code, summary = runner.linear_rpc([sys.executable, "-c", child], Path(tmp), dict(os.environ),
+                                              self.job, "Task", time.monotonic() + 5)
+        self.assertEqual(code, 0)
+        modal_queue.get.assert_called_once_with(block=False)
+
+
+    def test_rpc_deadline_terminates_process(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("runner.linear_intake.session_queue", return_value=queue.Queue()):
+            with self.assertRaises(TimeoutError):
+                runner.linear_rpc([sys.executable, "-c", "import time; time.sleep(30)"], Path(tmp),
+                                  dict(os.environ), self.job, "Task", time.monotonic() + 0.1)
+
+
+if __name__ == "__main__":
+    unittest.main()
