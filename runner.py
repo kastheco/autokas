@@ -787,10 +787,22 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
             "key": f"{repo}:issue_comment:{job['comment']}:{fingerprint}"}
 
 
+def allowed_repository(repo: Any) -> bool:
+    """Only configured repository owners may spend this deployment's resources."""
+    owners = CONFIG.get("allowed_owners", [])
+    if not isinstance(repo, str) or not isinstance(owners, list):
+        return False
+    owner, separator, name = repo.partition("/")
+    return bool(separator and owner and name and "/" not in name
+                and any(isinstance(allowed, str) and owner.lower() == allowed.lower() for allowed in owners))
+
+
 def event_job(event: str, payload: dict[str, Any], posted_review: bool = False) -> dict[str, Any] | None:
     """Dispatch docs merges separately while preserving review-bot intake. `posted_review` is set only by `pr_review`
     for the comment it just posted: coding jobs also comment as autokas[bot], so a delivered or reconciled
     autokas[bot] comment never starts a PR-Agent fix."""
+    if not allowed_repository(payload.get("repository", {}).get("full_name")):
+        return None
     if event == "check_run":
         check = payload.get("check_run", {})
         repo = payload.get("repository", {}).get("full_name")
@@ -1637,6 +1649,8 @@ def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> st
 @app.function(image=PR_AGENT_IMAGE, secrets=[WORKER_SECRET], retries=0, timeout=420, cpu=0.5, memory=1024)
 def pr_review(job: dict[str, Any]) -> None:
     """Post one PR-Agent review of one exact head as autokas[bot]. never pushes, commits or resolves threads."""
+    if not allowed_repository(job.get("repo")):
+        return
     repo, number = job["repo"], job["pr"]
     # automatic: a PR became ready (`pull_request`) or an autokas fix landed (`fix`). anything else is a command.
     automatic = job["kind"] in {"pull_request", "fix"}
@@ -1775,6 +1789,8 @@ def pr_review(job: dict[str, Any]) -> None:
 
 def dispatch(job: dict[str, Any]) -> None:
     """Queue a runner-made job exactly like a webhook delivery: claim its key once, then spawn the worker."""
+    if not allowed_repository(job.get("repo")):
+        return
     if not CLAIMS.put(job["key"], "claimed", skip_if_exists=True):
         log("duplicate", key=job["key"])
         return
@@ -1795,6 +1811,8 @@ def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict
               timeout=180, cpu=0.125, memory=256)
 def worker(job: dict[str, Any]) -> None:
     """Keep the durable intake queue while routing work to one pool per PR."""
+    if not allowed_repository(job.get("repo")):
+        return
     if job.get("mode") == "review_fix_request":
         fix = requested_review_fix(job)
         if fix is not None:
@@ -1919,6 +1937,8 @@ class PRWorker:
     @modal.method()
     def run(self, job: dict[str, Any]) -> None:
         """Prepare one fresh worktree and let omp perform the entire fix workflow."""
+        if not allowed_repository(job.get("repo")):
+            return
         # Modal can redeliver preempted inputs even with retries=0. Commands need
         # their own publication evidence before another agent may execute them.
         start_value = "command_started_v2" if job.get("mode") == "command" else "started"

@@ -103,9 +103,11 @@ autokas also opens follow-up docs PRs after merges. docs jobs targeting the same
 
 ## where it runs
 
-autokas is a GitHub App owned by `kastheco`. the repositories it's installed on are the only boundary, and the runner keeps no second allowlist. mint-per-repo installation tokens keep one owner's credentials away from another's.
+autokas is a GitHub App owned by `kastheco`. a repository must have the App installed and its owner must appear in `allowed_owners` before any review, fix, command or docs job can run. owner matching is exact and case-insensitive. an empty or missing list denies all owners. mint-per-repo installation tokens keep one owner's credentials away from another's.
 
 the installed set is managed in the App's GitHub installation settings. events arrive through one App-level webhook pointed at the receiver and subscribed to `issue_comment`, `pull_request`, `pull_request_review` and `pull_request_review_comment`, so installing the App on a repo is all it takes to start delivery. no per-repo hooks are needed.
+
+installation alone does not authorize spending the deployment's model quota or Modal balance. set `allowed_owners` in private `config.json`; the Actions deployment reads the JSON list from the `AUTOKAS_ALLOWED_OWNERS_JSON` repository secret. the public example denies all owners. queued jobs recheck the list before routing or execution.
 
 the Modal app is `omp-runner`. the repo was renamed to `autokas` on GitHub, but app, function and package names stay as they are so the App webhook and secrets keep working. models come from the Railway CLIProxyAPI service (its URL is `omp_models` in your config) through omp's native `models.yml`.
 

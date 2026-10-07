@@ -12,6 +12,12 @@ import runner
 from test_queue_ack import REPO
 
 
+def setUpModule():
+    owners = patch.dict(runner.CONFIG, allowed_owners=["example-org", "example"])
+    owners.start()
+    unittest.addModuleCleanup(owners.stop)
+
+
 HEAD = "b" * 40
 PR = {"number": 42, "state": "open", "draft": False, "body": "adds the parser",
       "base": {"ref": "main", "sha": "a" * 40, "repo": {"full_name": REPO}},

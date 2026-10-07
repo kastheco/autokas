@@ -9,6 +9,12 @@ from test_queue_ack import GitHubFake, REPO, Response
 from test_runner import section
 
 
+def setUpModule():
+    owners = patch.dict(runner.CONFIG, allowed_owners=["example-org", "example"])
+    owners.start()
+    unittest.addModuleCleanup(owners.stop)
+
+
 BOT = {**runner.CONFIG["coderabbit"], "type": "Bot"}
 PR = {"number": 42, "state": "open", "base": {"repo": {"full_name": REPO}},
       "head": {"sha": "a" * 40, "ref": "feature/review", "repo": {"full_name": REPO}}}

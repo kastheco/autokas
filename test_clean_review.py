@@ -7,6 +7,12 @@ import runner
 from test_queue_ack import GitHubFake, REPO, Response
 
 
+def setUpModule():
+    owners = patch.dict(runner.CONFIG, allowed_owners=["example-org", "example"])
+    owners.start()
+    unittest.addModuleCleanup(owners.stop)
+
+
 HEAD = "a" * 40
 BOT = {**runner.CONFIG["coderabbit"], "type": "Bot"}
 BODY = ("<!-- recent_review_start -->\n\n"

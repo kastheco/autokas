@@ -16,6 +16,12 @@ from unittest.mock import Mock, patch
 
 from runner import CONFIG, POLICY, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job, upstack
 
+def setUpModule():
+    owners = patch.dict(CONFIG, allowed_owners=["example-org", "example"])
+    owners.start()
+    unittest.addModuleCleanup(owners.stop)
+
+
 
 BOT = {"login": "coderabbitai[bot]", "id": 136622811, "type": "Bot"}
 REPO = "example-org/example-app"
@@ -239,14 +245,14 @@ class ReviewIntakeTests(unittest.TestCase):
         self.assertEqual(event_job("pull_request_review", edited), job)
 
 
-    def test_installed_repository_is_not_filtered_by_configured_allowlists(self) -> None:
+    def test_installed_repository_requires_an_approved_owner(self) -> None:
         event = review_event()
         event["repository"]["full_name"] = "unlisted-owner/unlisted-repository"
         event["pull_request"]["base"]["repo"]["full_name"] = "unlisted-owner/unlisted-repository"
         event["review"]["pull_request_url"] = "https://api.github.com/repos/unlisted-owner/unlisted-repository/pulls/142"
-        job = event_job("pull_request_review", event)
-        self.assertIsNotNone(job)
-        assert job is not None
+        self.assertIsNone(event_job("pull_request_review", event))
+        with patch.dict(CONFIG, allowed_owners=["unlisted-owner"]):
+            job = event_job("pull_request_review", event)
         self.assertEqual(job["repo"], "unlisted-owner/unlisted-repository")
 
     def test_pending_and_dismissed_reviews_do_not_run(self) -> None:
