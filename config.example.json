@@ -23,7 +23,7 @@
   "pr_review": {
     "enabled": true,
     "pr_agent_version": "0.47.0",
-    "model": "railway-codex/gpt-6-astra",
+    "model": "railway-codex/gpt-6.1-sol",
     "restack_model": "railway-codex/gpt-6-luna",
     "thinking": "medium",
     "max_model_tokens": 200000,
