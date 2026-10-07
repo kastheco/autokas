@@ -53,6 +53,8 @@ the dispatcher and coding containers do not mount `omp-runner-linear`. `linear_g
 8. **plan-first gate.** private `linear.gated_repos` lists the installed repositories requiring a plan, matched case-insensitively. configure the list in the `AUTOKAS_CONFIG_JSON` overlay before deployment, retaining the existing gated repositories. a missing or malformed list stops job startup rather than silently removing approval gates. for listed repositories, the first run only investigates with read-only tools and posts a `plan` plus an `elicitation` asking to proceed. an explicit approval in the next `prompted` message starts the coding run.
 9. **identity and access.** commits and PRs stay `autokas[bot]` through the existing github app. linear writes use the linear app token. anyone who can delegate to the app may use it.
 
+approval startup keeps the saved job and plan in `awaiting_approval` until the coding worker starts. the approval claim stores the original approved job, and a successful spawn adds its Modal call id. if the spawn response fails, a later explicit approval retries that same job and command key. the serialized coding pool uses its existing execution and publication records to reconcile duplicate deliveries instead of executing the task again. a confirmed spawn receipt prevents another approval from enqueueing more work.
+
 ## acceptance
 
 - delegating a test issue in a sandbox linear team to autokas produces, without other input: an ack within 10 seconds, progress activities, a PR on `autokas/<workspace-sha256>/<identifier>` linked in the linear session, and a final `response`.

@@ -362,13 +362,58 @@ class ResolutionTests(unittest.TestCase):
                         steering.return_value.put.assert_called_once_with("Use existing validation")
 
 
+    def test_failed_approval_startup_can_retry_original_plan(self):
+        saved_job = {**self.job, "repo": "example-org/gated", "linear": {**self.job["linear"], "plan_only": True}}
+        saved = {"state": "awaiting_approval", "job": saved_job,
+                 "plan": [{"content": "Fix parser", "status": "pending"}]}
+        storage = {"linear:state:session-1": saved}
+        claims = Mock()
+
+        def put(key, value, skip_if_exists=False):
+            if skip_if_exists and key in storage:
+                return False
+            storage[key] = value
+            return True
+
+        claims.put.side_effect = put
+        claims.get.side_effect = lambda key, default=None: storage.get(key, default)
+        with patch.object(runner, "CLAIMS", claims), patch.object(linear, "activity"), \
+                patch.object(runner, "worker") as worker, patch.object(linear, "session_queue") as queue:
+            worker.spawn.side_effect = [RuntimeError("connection lost"), Mock(object_id="fc-approved")]
+            first = event("prompted", "approve", "first-approval")
+            with self.assertRaisesRegex(RuntimeError, "connection lost"):
+                linear.resolve(first, linear.event_job(first))
+            original = worker.spawn.call_args.args[0]
+            self.assertEqual(storage["linear:state:session-1"], saved)
+            second = event("prompted", "approve", "retry-approval")
+            linear.resolve(second, linear.event_job(second))
+            self.assertEqual(worker.spawn.call_count, 2)
+            self.assertEqual(worker.spawn.call_args.args[0], original)
+            self.assertEqual(original["key"], "linear:prompt:first-approval")
+            self.assertFalse(original["linear"]["plan_only"])
+            self.assertIn("Fix parser", original["prompt"])
+            queue.assert_not_called()
+            # A confirmed enqueue must not enqueue a third worker before startup.
+            third = event("prompted", "approve", "confirmed-approval")
+            linear.resolve(third, linear.event_job(third))
+            self.assertEqual(worker.spawn.call_count, 2)
+
     def test_approval_required_and_once_only(self):
         saved_job = {**self.job, "repo": "untapped-media/tower", "linear": {**self.job["linear"], "plan_only": True}}
         saved = {"state": "awaiting_approval", "job": saved_job, "plan": [{"content": "Fix parser", "status": "pending"}]}
-        with patch.object(runner, "CLAIMS") as claims, patch.object(linear, "get_state", return_value=saved), \
-                patch.object(linear, "activity") as activity, patch.object(linear, "set_state") as state, \
-                patch.object(runner, "worker") as worker:
-            claims.get.return_value = None
+        storage = {}
+        claims = Mock()
+
+        def put(key, value, skip_if_exists=False):
+            if skip_if_exists and key in storage:
+                return False
+            storage[key] = value
+            return True
+
+        claims.put.side_effect = put
+        claims.get.side_effect = lambda key, default=None: storage.get(key, default)
+        with patch.object(runner, "CLAIMS", claims), patch.object(linear, "get_state", return_value=saved), \
+                patch.object(linear, "activity") as activity, patch.object(runner, "worker") as worker:
             for body in ("What about tests?", "do not approve", "yes but wait", "", "looks good maybe"):
                 if not body:
                     continue
@@ -377,15 +422,12 @@ class ResolutionTests(unittest.TestCase):
             worker.spawn.assert_not_called()
             claims.put.assert_not_called()
             self.assertEqual(activity.call_args.args[1], "elicitation")
-            claims.put.return_value = True
             payload = event("prompted", "Approve!")
             linear.resolve(payload, linear.event_job(payload))
             approved = worker.spawn.call_args.args[0]
             self.assertFalse(approved["linear"]["plan_only"])
             self.assertEqual(approved["key"], "linear:prompt:activity-1")
             self.assertIn("Fix parser", approved["prompt"])
-            state.assert_called_once_with(approved, "running")
-            claims.put.return_value = False
             linear.resolve(payload, linear.event_job(payload))
             self.assertEqual(worker.spawn.call_count, 1)
 

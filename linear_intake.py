@@ -282,14 +282,26 @@ def resolve(payload: dict[str, Any], job: dict[str, Any]) -> None:
                 if not explicit_approval(body):
                     activity(job, "elicitation", "The plan is waiting for approval. Reply 'approve' to start implementation.")
                     return
-                if not runner.CLAIMS.put(f'linear:approval:{job["linear"]["session_id"]}', "claimed", skip_if_exists=True):
-                    return
                 approved = {**saved["job"], "key": job["key"], "linear": {**saved["job"]["linear"], "plan_only": False}}
                 approved["prompt"] += "\n\nApproved implementation plan:\n" + json.dumps(saved.get("plan", []))
                 if not runner.allowed_repository(approved["repo"]):
                     raise ValueError("Linear repository is outside allowed owners")
-                set_state(approved, "running")
-                runner.worker.spawn(approved)
+                approval_key = f'linear:approval:{job["linear"]["session_id"]}'
+                launch = {"job": approved}
+                if not runner.CLAIMS.put(approval_key, launch, skip_if_exists=True):
+                    launch = runner.CLAIMS.get(approval_key, None)
+                    if not isinstance(launch, dict):
+                        raise RuntimeError("Linear approval launch record unavailable")
+                    if launch.get("call_id"):
+                        return
+                    approved = launch["job"]
+                    if not runner.allowed_repository(approved["repo"]):
+                        raise ValueError("Linear repository is outside allowed owners")
+                # A lost spawn response may still enqueue work. Reuse the original
+                # command key so the serialized coding pool reconciles execution.
+                # Only the coding worker may replace the saved plan with running.
+                call = runner.worker.spawn(approved)
+                runner.CLAIMS.put(approval_key, {**launch, "call_id": call.object_id})
                 return
             activity(job, "elicitation", "There is no live job for this session. Please delegate the issue to Autokas again.")
             return
