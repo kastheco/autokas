@@ -480,6 +480,23 @@ class CommandPublicationTests(unittest.TestCase):
         self.pages[0][0] = self.commit(self.record["starting_head"], "base")
         self.assertEqual(command_publication(self.job)["status"], "uncertain")
 
+    def test_retry_stops_at_existing_remote_head_before_old_receipts(self) -> None:
+        self.record["remote_start"] = "c" * 40
+        self.pages = [[self.commit(self.head, "chore: unrelated"),
+                       self.commit(self.record["remote_start"], "fix: old command\n\n" + self.trailer)]]
+        self.assertEqual(command_publication(self.job)["status"], "uncertain")
+
+    def test_completed_reused_branch_does_not_claim_old_receipt(self) -> None:
+        self.record.update(state="completed", remote_start=self.head)
+        self.assertEqual(command_publication(self.job)["status"], "completed")
+
+    def test_retry_finds_new_receipt_above_existing_remote_head(self) -> None:
+        self.record["remote_start"] = "c" * 40
+        self.pages[0].append(self.commit(self.record["remote_start"], "old task"))
+        result = command_publication(self.job)
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(result["commit"], self.head)
+
     def test_lookup_failure_never_falls_back_to_execution(self) -> None:
         with patch("runner.github", side_effect=TimeoutError("lost read response")):
             result = command_publication(self.job)

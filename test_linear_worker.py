@@ -164,7 +164,7 @@ with open('frames.json', 'w') as stream:
         ack.assert_not_called()
         worker.run.spawn.assert_called_once()
 
-    def invoke(self, rpc_result, plan=False, final="new", remote="new", approved=False):
+    def invoke(self, rpc_result, plan=False, final="new", remote="new", approved=False, remote_start=""):
         self.job["linear"]["plan_only"] = plan
         self.job = runner.linear_intake.signed_execution(self.job, approved=approved)
         seen = {}
@@ -180,7 +180,9 @@ with open('frames.json', 'w') as stream:
                 output = "main"
             if args[:2] == ["git", "ls-remote"]:
                 seen["remote_args"] = args
-                output = remote + "\trefs/heads/" + self.job["branch"] if remote else ""
+                current = remote if "remote_read" in seen else remote_start
+                seen["remote_read"] = True
+                output = current + "\trefs/heads/" + self.job["branch"] if current else ""
             return subprocess.CompletedProcess(args, 0, output, "")
 
         def rpc(args, worktree, env, job, prompt, deadline, **kwargs):
@@ -346,6 +348,34 @@ sys.exit({exit_code})
             result = runner.command_publication(self.job)
         self.assertEqual(result["status"], "completed")
         github.assert_not_called()
+
+    def test_reused_branch_without_push_completes_with_actual_summary(self):
+        for final in ("base", "old", "unpublished"):
+            with self.subTest(final=final):
+                self.job["key"] = JOB["key"] + ":" + final
+                summary = "No push. The task branch already exists."
+                self.invoke((0, summary), final=final, remote="old", remote_start="old")
+                record = self.claims.get("command:" + self.job["key"])
+                self.assertEqual(record["state"], "completed")
+                self.assertNotIn("published_head", record)
+                self.assertEqual(self.activity.call_args.args, (self.job, "response", summary))
+                self.assertEqual(self.state.call_args.args, (self.job, "completed"))
+
+    def test_reused_branch_new_push_is_published(self):
+        with patch("runner.linear_finish"):
+            self.invoke((0, "Updated validation"), remote_start="old")
+        record = self.claims.get("command:" + self.job["key"])
+        self.assertEqual(record["published_head"], "new")
+
+    def test_completed_run_does_not_attach_preexisting_pr(self):
+        pr = {"html_url": "https://github.com/example/app/pull/4", "draft": False, "number": 4,
+              "head": {"ref": self.job["branch"], "repo": {"full_name": "example/app"}}}
+        summary = "The task branch already exists. No changes published."
+        with patch("runner.github", return_value=[pr]):
+            runner.linear_finish(self.job, summary, {"status": "completed"})
+        self.update.assert_not_called()
+        self.assertEqual(self.activity.call_args.args, (self.job, "response", summary))
+        self.assertEqual(self.state.call_args.args, (self.job, "completed"))
 
     def test_finish_links_verified_pr_and_draft(self):
         pr = {"html_url": "https://github.com/example/app/pull/4", "draft": True, "number": 4,

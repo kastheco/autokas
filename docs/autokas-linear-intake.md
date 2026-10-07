@@ -61,6 +61,8 @@ saved states and approval receipts carry session-bound HMACs in separate domains
 
 approval startup keeps the saved job and plan in `awaiting_approval` until the coding worker starts. the approval claim stores the original approved job without its write-back proof, and a successful spawn adds its Modal call id. if the spawn response fails, a later explicit approval restores the session proof and retries that same job and command key. the serialized coding pool uses its existing execution and publication records to reconcile duplicate deliveries instead of executing the task again. a confirmed spawn receipt prevents another approval from enqueueing more work.
 
+the worker records the task branch's remote head before launch. a run is published only when that head changes and matches the final local head. an unchanged remote branch completes with the agent's summary, without attaching a pre-existing PR as that run's output. reporting retries stop commit searches at the recorded remote head or checkout head, so earlier branch work isn't counted as a new publication.
+
 ## acceptance
 
 - delegating a test issue in a sandbox linear team to autokas produces, without other input: an ack within 10 seconds, progress activities, a PR on `autokas/<workspace-sha256>/<identifier>` linked in the linear session, and a final `response`.

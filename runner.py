@@ -1934,7 +1934,7 @@ def command_publication(job: dict[str, Any]) -> dict[str, Any] | None:
         for page in range(1, 11):
             commits = github(f"repos/{repo}/commits?sha={remote_head}&per_page=100&page={page}")
             for commit in commits:
-                if commit["sha"] == record["starting_head"]:
+                if commit["sha"] in {record["starting_head"], record.get("remote_start")}:
                     break
                 own_commit = (commit.get("committer") or {}).get("login") == CONFIG["git_author"]["name"]
                 if (commit["sha"] == record.get("published_head")
@@ -1947,7 +1947,7 @@ def command_publication(job: dict[str, Any]) -> dict[str, Any] | None:
                 if len(commits) == 100:
                     continue
             break
-        if record.get("state") == "completed" and remote_head == record["starting_head"]:
+        if record.get("state") == "completed" and remote_head == record.get("remote_start", record["starting_head"]):
             result.update(status="completed")
             result.pop("reason", None)
         else:
@@ -2157,8 +2157,9 @@ def linear_finish(job: dict[str, Any], summary: str, publication: dict[str, Any]
         raise RuntimeError("Earlier Linear response delivery is uncertain; not posting a duplicate outcome")
     if publication.get("status") == "uncertain":
         raise RuntimeError(publication.get("reason", "Publication could not be confirmed"))
-    prs = github("repos/" + job["repo"] + "/pulls?state=open&head="
-                 + urllib.parse.quote(job["repo"].split("/")[0] + ":" + job["branch"], safe=""))
+    prs = (github("repos/" + job["repo"] + "/pulls?state=open&head="
+                  + urllib.parse.quote(job["repo"].split("/")[0] + ":" + job["branch"], safe=""))
+           if publication.get("status") == "published" else [])
     prs = [pr for pr in prs if pr["head"]["ref"] == job["branch"]
            and (pr["head"].get("repo") or {}).get("full_name") == job["repo"]]
     if len(prs) > 1:
@@ -2405,8 +2406,10 @@ class PRWorker:
                         linear_finish(job, saved["linear_summary"], command_resume)
                         return
                     if command_resume is None:
+                        remote_start = run(["git", "ls-remote", "origin", "refs/heads/" + job["branch"]], worktree).split("\t")[0]
                         CLAIMS.put("command:" + job["key"], {
                             "state": "executing", "starting_head": head, "branch": job["branch"],
+                            "remote_start": remote_start,
                         })
                     code, summary = linear_rpc(args, worktree, env, job, prompt_file.read_text(), deadline)
                     if code:
@@ -2417,11 +2420,11 @@ class PRWorker:
                         final_head = run(["git", "rev-parse", "HEAD"], worktree)
                         remote_head = run(["git", "ls-remote", "origin", "refs/heads/" + job["branch"]], worktree).split("\t")[0]
                         record = CLAIMS.get("command:" + job["key"])
-                        if final_head != head and remote_head == final_head:
+                        if remote_head and remote_head != remote_start and remote_head == final_head:
                             record["published_head"] = final_head
                             linear_progress(job, "Confirmed task branch push: " + final_head)
                             publication = {"status": "published", "commit": final_head}
-                        elif final_head == head and (not remote_head or remote_head == head):
+                        elif remote_head == remote_start:
                             record["state"] = "completed"
                             publication = {"status": "completed"}
                         else:

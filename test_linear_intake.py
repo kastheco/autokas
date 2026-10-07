@@ -428,7 +428,7 @@ class ResolutionTests(unittest.TestCase):
         patcher = patch.dict(os.environ, LINEAR_WEBHOOK_SECRET="synthetic-signing-secret")
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.config = patch.dict(runner.CONFIG, {"allowed_owners": ["example-org", "untapped-media", "kastheco"],
+        self.config = patch.dict(runner.CONFIG, {"allowed_owners": ["example-org"],
                                                 "linear": {"repo_map": {"projects": {}, "teams": {}}, "confidence_threshold": .8,
                                                            "gated_repos": ["example-org/gated"]}})
         self.config.start()
@@ -618,7 +618,7 @@ class ResolutionTests(unittest.TestCase):
             self.assertEqual(worker.spawn.call_count, 2)
 
     def test_approval_required_and_once_only(self):
-        saved_job = {**self.job, "repo": "untapped-media/tower", "linear": {**self.job["linear"], "plan_only": True}}
+        saved_job = {**self.job, "repo": "example-org/gated", "linear": {**self.job["linear"], "plan_only": True}}
         saved = {"state": "awaiting_approval", "job": saved_job, "plan": [{"content": "Fix parser", "status": "pending"}]}
         storage = {}
         claims = Mock()
