@@ -179,3 +179,7 @@ docs/                 readme banner and long-form operations notes
 ```
 
 for the advisor rules, provider accounts, live verification path and duplicate-claim limits, read [`docs/operations.md`](docs/operations.md).
+
+## license
+
+autokas is licensed under the [Apache License 2.0](LICENSE). bundled skills under `skills/` keep their own licenses, listed in `skills/SOURCES.json`.
