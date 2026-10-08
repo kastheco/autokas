@@ -1,0 +1,82 @@
+# autokas: linear intake
+
+status: implemented. app provisioning and OAuth refresh are verified. production deployment and end-to-end sandbox acceptance remain unverified.
+
+## goal
+
+delegating a linear issue to autokas starts the same coding job an `@autokas` comment on a github issue starts today, and the linear issue shows progress and the resulting PR. a follow-up message in the linear session while the job runs steers it. after the PR opens, the existing review and fix loop runs unchanged.
+
+## scope
+
+in:
+- a linear app installed as an agent (`actor=app`) in two configured workspaces.
+- a second webhook endpoint for linear agent session events.
+- mapping a linear session to a repo and a coding job.
+- steering a running job from the linear session.
+- progress, the PR link and the outcome written back to the linear session.
+- a plan-first gate for the installed repositories listed in private `linear.gated_repos` configuration.
+
+out, for later specs:
+- run log, spend caps, DMS status widget.
+- triage automation (auto-delegation without a human).
+- any change to PR-Agent review, finding fixes, docs follow-ups or stack handling.
+
+## linear side (from linear's developer docs, developer preview)
+
+- app created with webhooks on and the "agent session events" category enabled. scopes include `app:assignable` and `app:mentionable`. assigning the app sets it as the issue's delegate, a human stays assignee.
+- each workspace that installs the app gets its own OAuth access and refresh tokens. access tokens expire after 24 hours. renew them with the app credentials and retain rotated refresh tokens. payloads carry `organizationId`.
+- `AgentSessionEvent` webhooks with `action: created` (delegated or mentioned) or `prompted` (a user follow-up, text in `agentActivity.content.body`).
+- the receiver must return within 5 seconds. after `created`, the agent must emit an activity or set `externalUrls` within 10 seconds or the session is marked unresponsive.
+- `promptContext` on the payload is a ready-made string with the issue, parent, project, comment threads and team guidance. pass the full bundle as untrusted task data, not a trusted command. delegation authorizes work on the issue, not instructions from every author in that bundle.
+- progress goes back through `agentActivityCreate` with types `thought`, `action`, `elicitation`, `response`, `error`. session state follows the last activity, no manual state.
+- `agentSessionUpdate` sets `externalUrls` (put the PR there, linear says this enables PR features) and an optional `plan` checklist.
+- `issueRepositorySuggestions` ranks candidate repos for an issue.
+- `Linear-Signature` is a hex HMAC-SHA256 of the raw body with the webhook signing secret. the body's `webhookTimestamp` is unix milliseconds, and linear recommends rejecting anything more than 60 seconds off. source: https://linear.app/developers/webhooks.
+- the API is developer preview and may change. pin the shapes in tests.
+
+## autokas changes
+
+linear intake and OAuth exchange code live in `linear_intake.py`. `runner.py` registers the per-workspace OAuth refresh class and owns the worker changes in items 5 and 6.
+
+the dispatcher and coding containers do not mount `omp-runner-linear`. same-app Modal access is not authorization to use the Linear OAuth app. `linear_graphql`, `linear_resolve` and the OAuth refresher require domain-separated HMAC proofs over their exact arguments, signed with the existing webhook secret. coding workers cannot sign these calls.
+
+authenticated intake gives each Linear job a write-back proof bound to its workspace and agent session. workers use `linear_writeback`, which builds fixed activity and session-update mutations and permits only activity content, plans and external URLs. it accepts no GraphQL document or caller-selected target session. changing the workspace or session invalidates the proof. proofs are excluded from shared `CLAIMS` jobs and agent prompt context, and approval startup restores the session proof before dispatch. workers still receive only GraphQL results, not OAuth credentials. possession of a session proof authorizes those limited writes to that session, not arbitrary workspace actions.
+
+resolved jobs carry an execution proof over the full job except the proof itself and dispatcher links. normal delegation and explicit plan approval use separate HMAC domains. both `worker` and `PRWorker.run` call `linear_authorize` before routing, state writes or GitHub token creation. that credential-only verifier rechecks the current `linear.gated_repos` list and requires approval authority for full-tool execution on a gated repository. execution proofs stay out of shared jobs and agent context. workers never receive the signing secret.
+
+saved states and approval receipts carry session-bound HMACs in separate domains. the resolver verifies the full record before using its job or plan, including retry records without a call id. workers request signed state writes through `linear_set_state`, which checks their exact execution proof. altered and unsigned legacy records fail closed. old waiting plans must be delegated again, not silently trusted or re-signed.
+
+1. **new endpoint `linear_webhook`.** separate from the github `webhook`, with its own secret `omp-runner-linear`: the signing secret, OAuth client credentials and each workspace's token bundle keyed by `organizationId`. every token lookup uses a single-container, single-input Modal pool keyed by client and workspace. it reloads the `<app>-linear-oauth` Volume and commits rotations before returning them. shared `CLAIMS` entries are never accepted as tokens. `deploy.py` purges legacy `linear:oauth:` keys without reading their values, including idle entries. each workspace needs current credentials in the secret or credential-only volume before cutover. shared-cache-only refresh tokens require operator recovery or reauthorization, not automatic migration. previously exposed credentials need a rotation assessment. check `Linear-Signature` on raw bytes and `webhookTimestamp` within 60 seconds, `401` otherwise.
+2. **ack.** before returning, the receiver posts one `thought` ("picked up, finding the repo"). it starts one three-second wall-clock deadline before calling write-back, inside the receiver's 3.5-second wait. write-back and the serialized OAuth refresher carry that deadline across containers. queueing, token lookup and refresh consume the same budget, and GraphQL gets only the time remaining. an expired deadline prevents another HTTP request. a completed token rotation is persisted even if the budget expires during storage. cold starts or slow storage can still cause a `503`, which releases the intake claim without spawning resolution.
+3. **dedupe.** in the existing `CLAIMS` dict, `created` claims `linear:session:<agentSession.id>` and `prompted` claims `linear:prompt:<agentActivity.id>`.
+4. **repo resolution, in order.** a repo map in private config from linear team or project to `owner/repo`. then `issueRepositorySuggestions` over `installed_repos()`, accepted only above a confidence threshold. otherwise an `elicitation` listing the top candidates and stop. a repo that fails `allowed_repository()` gets an `error` activity and no job.
+5. **issue command flow without a github issue.** linear jobs run as `mode: "command"`, `target: "issue"` with the linear session id, organization id, identifier and issue url. where the flow assumes a github issue number:
+   - new jobs use `autokas/<workspace-sha256>/<linear-identifier>`. the workspace component is the full SHA-256 hex digest of `organizationId`, so matching identifiers in different workspaces don't share a branch or reconcile to each other's PR. the identifier remains in the branch for linear linking. the worker takes the branch from the job instead of using its github issue branch format.
+   - the coding prompt labels `promptContext` as untrusted Linear task data. the Linear policy does not inherit GitHub's trusted-command or write-access claims. issue context and appended plans describe the task and acceptance criteria, but cannot override agent policy, credentials or publication scope. the PR title includes the identifier, the PR body links the linear issue instead of `Closes #<number>`, and there's no `gh issue comment` outcome.
+   - no queued reply or acknowledgment comment on github.
+6. **steering.** linear jobs run omp with `--mode rpc` instead of `--print`, same flags otherwise. the worker sends the task as a `prompt` command and reads events until it finishes. on `prompted`, the resolver queues the body and activity id with an HMAC bound to the workspace, session and live job key. the worker calls credential-only `linear_steer` before forwarding a `steer` command. plaintext, altered and wrong-scope messages are discarded, and repeated activity ids are ignored within the run. a verifier failure stops the RPC instead of forwarding unchecked input. otherwise the receiver answers with an `elicitation` saying to delegate again. a failed follow-up reports an error without replacing the saved job or plan. github-started jobs keep `--print`.
+7. **write-back.** best-effort `action` activities at clone, checks and push. failed progress delivery logs `linear_activity_uncertain` without interrupting the agent or publication bookkeeping. on PR open, `agentSessionUpdate` adds the PR to `externalUrls`. finish with one strict `response` (what changed, checks run, PR link, draft or not) or `error` (why it stopped).
+   post-acknowledgment repository queries and write-back default to a 20-second wall-clock budget shared across queueing, OAuth refresh and GraphQL. the receiver's acknowledgment still passes its explicit three-second deadline.
+8. **plan-first gate.** private `linear.gated_repos` lists installed repositories requiring a plan, matched case-insensitively. missing or malformed configuration stops startup. an explicit empty list allows ungated work. the credential worker clones the repository and sends only a tracked `git archive` snapshot without `.git` to a separate, single-use `linear_planner` Modal container. that container mounts no secrets or OAuth volume and cannot read the worker's filesystem or process environment. it receives only the task, checkout and proxy API key, not GitHub, Jarvis or Linear credentials or signing proofs. its standalone investigation policy uses `read,grep,glob` with LSP disabled. the worker posts the returned plan and asks for approval. explicit approval in the next `prompted` message starts coding. local tests exercise the child environment and RPC path, not live Modal isolation.
+9. **identity and access.** commits and PRs stay `autokas[bot]` through the existing github app. linear writes use the linear app token. anyone who can delegate to the app may use it.
+
+approval startup keeps the saved job and plan in `awaiting_approval` until the coding worker starts. the approval claim stores the original approved job without its write-back proof, and a successful spawn adds its Modal call id. if the spawn response fails, a later explicit approval restores the session proof and retries that same job and command key. the serialized coding pool uses its existing execution and publication records to reconcile duplicate deliveries instead of executing the task again. a confirmed spawn receipt prevents another approval from enqueueing more work.
+
+the worker records the task branch's remote head before launch. a run is published only when that head changes and matches the final local head. an unchanged remote branch completes with the agent's summary, without attaching a pre-existing PR as that run's output. reporting retries stop commit searches at the recorded remote head or checkout head, so earlier branch work isn't counted as a new publication.
+
+terminal state writes delete the session's named steering queue and any pending messages. this covers worker completion, resolver completion and every error path that saves `error`, through the existing authenticated state service. missing queues are allowed, so repeated terminal writes don't create a queue or fail because it is already gone. nonterminal states, including `awaiting_approval`, retain their queue. cleanup failures propagate to the caller rather than being hidden.
+
+the deployment purge snapshots shared claim keys before deleting legacy `linear:oauth:` entries. deleting a key cannot skip the next idle workspace, and unrelated claims remain untouched.
+
+## acceptance
+
+- delegating a test issue in a sandbox linear team to autokas produces, without other input: an ack within 10 seconds, progress activities, a PR on `autokas/<workspace-sha256>/<identifier>` linked in the linear session, and a final `response`.
+- a follow-up message sent in the session during that run steers it.
+- the PR then gets the normal `autokas review` check and fix loop.
+- redelivering the same webhook does not start a second job.
+- concurrent API calls for one client and workspace consume an expiring refresh token once and retain the rotated token for the next expiry.
+- matching issue identifiers in different workspaces use distinct branches, even when both resolve to the same github repo.
+- an issue with no resolvable repo ends in an elicitation, not a guess.
+- delegating an issue for a gated repo posts a plan and waits. approving in the session starts the run.
+- a bad signature gets `401`. a repo outside `allowed_owners` ends in an `error` activity and no job.
+- existing tests pass, and new tests cover signature checks, claim keys, repo resolution order, gates and session-scoped authorization without external calls. `python -m unittest test_linear_intake test_linear_worker -v` covers unsigned peers, tampered workspace/session identities, GraphQL argument substitution, raw-token access, forged resolver and worker intake, current execution gates, signed RPC follow-ups and fixed write-back operations.

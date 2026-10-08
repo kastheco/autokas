@@ -15,6 +15,7 @@ class DeploymentTests(unittest.TestCase):
         self.claims = Mock()
         self.claims.get.side_effect = lambda *_: copy.deepcopy(self.persisted)
         self.claims.put.side_effect = lambda _key, state: setattr(self, "persisted", copy.deepcopy(state))
+        self.claims.keys.return_value = []
 
     def patches(self):
         stack = ExitStack()
@@ -29,6 +30,16 @@ class DeploymentTests(unittest.TestCase):
 
     def drained(self):
         self.assertIsNotNone(self.persisted, "the reconcile window must be saved before the cutover")
+
+    def test_cutover_purges_idle_oauth_entries_without_reading_values(self):
+        with self.patches():
+            keys = ["linear:oauth:client:org", "linear:oauth:client:idle-org",
+                    "linear:state:session", "job-key", "linear:oauthish:keep", 42]
+            self.claims.keys.return_value = iter(keys)
+            self.claims.pop.side_effect = lambda key, default: keys.remove(key)
+            deploy.main()
+        self.assertEqual(keys, ["linear:state:session", "job-key", "linear:oauthish:keep", 42])
+        self.assertTrue(self.persisted["complete"])
 
     def test_failures_at_each_cutover_stage_still_reconcile(self):
         for stage in ("drain", "deploy", "verify"):

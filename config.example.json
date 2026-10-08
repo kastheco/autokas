@@ -1,6 +1,10 @@
 {
   "app": "omp-runner",
   "allowed_owners": [],
+  "linear": {
+    "repo_map": {"projects": {}, "teams": {}},
+    "confidence_threshold": 0.8
+  },
   "docs_update": {
     "model": "railway-codex/gpt-6-luna",
     "thinking": "medium",
