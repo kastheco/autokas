@@ -6,7 +6,7 @@
     "confidence_threshold": 0.8
   },
   "docs_update": {
-    "model": "railway-codex/gpt-6-luna",
+    "model": "railway-codex/claude-haiku-5-5",
     "thinking": "medium",
     "service_tier": "default",
     "webhook_url": "https://runner.example.invalid/webhook",
@@ -29,7 +29,7 @@
     "enabled": true,
     "pr_agent_version": "0.47.0",
     "model": "railway-codex/gpt-6.1-sol",
-    "restack_model": "railway-codex/gpt-6-luna",
+    "restack_model": "railway-codex/claude-haiku-5-5",
     "thinking": "medium",
     "max_model_tokens": 200000,
     "fix_severity": "P2",
@@ -71,14 +71,14 @@
             "maxTokens": 32768
           },
           {
-            "id": "gpt-6-luna",
+            "id": "claude-haiku-5-5",
             "reasoning": true,
             "input": [
               "text",
               "image"
             ],
-            "contextWindow": 272000,
-            "maxTokens": 32768
+            "contextWindow": 1000000,
+            "maxTokens": 128000
           }
         ]
       }
