@@ -238,9 +238,42 @@ class WritebackTests(unittest.TestCase):
                 patch.object(linear.urllib.request, "urlopen", side_effect=exchange):
             claims.get.return_value = None
             with self.assertRaises(TimeoutError):
-                linear.activity(job, "thought", "picked up, finding the repo")
+                linear.activity(job, "thought", "picked up, finding the repo", deadline=1003.0)
         self.assertEqual(calls, ["https://api.linear.app/oauth/token", "https://api.linear.app/graphql"])
         self.assertLessEqual(now[0] - 1000, 3)
+
+    def test_post_ack_calls_allow_refresh_and_graphql_beyond_three_seconds(self):
+        job = linear.event_job(event())
+        job["linear"]["writeback_signature"] = linear.request_signature("writeback", ["org-1", "session-1"])
+        tokens = {"org-1": {"access_token": "old", "refresh_token": "refresh", "expires_at": 900}}
+        for operation in (lambda: linear.graphql("org-1", "query { viewer { id } }", {}),
+                          lambda: linear.activity(job, "response", "finished")):
+            with self.subTest(operation=operation):
+                now = [1000.0]
+                calls = []
+
+                def exchange(request, timeout):
+                    calls.append(request.full_url)
+                    if timeout < 2:
+                        now[0] += timeout
+                        raise TimeoutError("shared request budget exhausted")
+                    now[0] += 2
+                    result = ({"access_token": "new", "refresh_token": "rotated", "expires_in": 3600}
+                              if request.full_url.endswith("/oauth/token") else {"data": {"result": {"success": True}}})
+                    return io.BytesIO(json.dumps(result).encode())
+
+                with patch.dict(os.environ, LINEAR_OAUTH_TOKENS=json.dumps(tokens),
+                                LINEAR_CLIENT_ID="client", LINEAR_CLIENT_SECRET="synthetic-secret"), \
+                        patch.object(linear.time, "time", side_effect=lambda: now[0]), \
+                        patch.object(runner, "CLAIMS"), \
+                        patch.object(runner.linear_graphql, "remote", side_effect=runner.linear_graphql.local), \
+                        patch.object(runner.linear_writeback, "remote", side_effect=runner.linear_writeback.local):
+                    with tempfile.TemporaryDirectory() as directory, \
+                            patch.object(linear, "OAUTH_STORAGE", Path(directory)), \
+                            patch.object(linear.urllib.request, "urlopen", side_effect=exchange):
+                        self.assertEqual(operation(), {"result": {"success": True}})
+                self.assertEqual(calls, ["https://api.linear.app/oauth/token", "https://api.linear.app/graphql"])
+                self.assertEqual(now[0], 1004.0)
 
     def test_expired_refresher_queue_does_not_consume_refresh_token(self):
         deadline = 1003.0
@@ -268,7 +301,7 @@ class WritebackTests(unittest.TestCase):
                 "access_token": "new", "refresh_token": "rotated", "expires_in": 3600}).encode())
             runner.LINEAR_OAUTH_VOLUME.commit.side_effect = lambda: now.__setitem__(0, 1003.0)
             with self.assertRaises(TimeoutError):
-                linear.activity(job, "thought", "picked up, finding the repo")
+                linear.activity(job, "thought", "picked up, finding the repo", deadline=1003.0)
         self.assertEqual([call.args[0].full_url for call in http.call_args_list], ["https://api.linear.app/oauth/token"])
         filename = hashlib.sha256(json.dumps(["client", "org-1"]).encode()).hexdigest() + ".json"
         self.assertEqual(json.loads((linear.OAUTH_STORAGE / filename).read_text())["refresh_token"], "rotated")

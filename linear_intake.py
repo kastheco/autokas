@@ -186,7 +186,7 @@ def refresh_oauth_token(organization_id: str, client_id: str, deadline: float) -
     return token["access_token"]
 
 
-def graphql(organization_id: str, query: str, variables: dict[str, Any], timeout: float = 3.0) -> dict[str, Any]:
+def graphql(organization_id: str, query: str, variables: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
     """Authorize an exact API request from a Linear credential-bearing caller."""
     import runner
     deadline = time.time() + timeout
@@ -241,7 +241,7 @@ def writeback(job: dict[str, Any], operation: str, fields: dict[str, Any],
     import runner
     linear = job["linear"]
     if deadline is None:
-        deadline = time.time() + 3.0
+        deadline = time.time() + 20.0
     return runner.linear_writeback.remote(linear["organization_id"], linear["session_id"],
                                           linear["writeback_signature"], operation, fields, deadline)
 
