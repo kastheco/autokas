@@ -481,24 +481,34 @@ def autokas_ignored(pr: dict[str, Any]) -> bool:
 COMMAND = re.compile(r"(?:@autokas|!kas)(?![\w-])", re.IGNORECASE)
 REVIEW_COMMAND = re.compile(r"review(?![\w-])[\s:,.;!-]*", re.IGNORECASE)
 
+def trusted_reviewer(author: dict[str, Any]) -> bool:
+    """Trust a configured reviewer only by its exact login and GitHub user ID."""
+    return any(all(author.get(field) == reviewer[field] for field in ("login", "id"))
+               for reviewer in CONFIG.get("trusted_reviewers", []))
+
+
 def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Accept a new human comment starting with @autokas or !kas; the dispatcher checks access."""
+    """Accept human commands or trusted bot PR review-loop requests; handlers check access."""
     if event not in {"issue_comment", "pull_request_review_comment"} or payload.get("action") != "created":
         return None
     comment = payload["comment"]
     body = (comment.get("body") or "").lstrip()
     match = COMMAND.match(body)
     instruction = body[match.end():].strip() if match else ""
-    if comment["user"].get("type") != "User" or not instruction:
+    author = comment["user"]
+    if not instruction:
         return None
     repo = payload["repository"]["full_name"]
     target = payload["issue"] if event == "issue_comment" else payload["pull_request"]
     target_kind = "issue" if event == "issue_comment" and "pull_request" not in target else "pr"
     review = REVIEW_COMMAND.match(instruction) if target_kind == "pr" else None
     fix_review = re.fullmatch(r"fix review ([1-9][0-9]*)", instruction, re.IGNORECASE) if target_kind == "pr" else None
+    if author.get("type") != "User" and not (
+            author.get("type") == "Bot" and (review or fix_review) and trusted_reviewer(author)):
+        return None
     if fix_review:
         return {"mode": "review_fix_request", "repo": repo, "pr": target["number"],
-                "comment": int(fix_review[1]), "author": comment["user"]["login"],
+                "comment": int(fix_review[1]), "author": author["login"], "author_id": author.get("id"),
                 "key": f"{repo}:review_fix:command:{comment['id']}"}
     if review:
         # `@autokas review …` on a PR asks for a PR-Agent review, never an omp coding job.
@@ -506,7 +516,7 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         if not CONFIG["pr_review"]["enabled"]:
             return None
         return {"mode": "pr_review", "kind": event, "repo": repo, "pr": target["number"],
-                "comment": comment["id"], "author": comment["user"]["login"],
+                "comment": comment["id"], "author": author["login"], "author_id": author.get("id"),
                 "instructions": instruction[review.end():].strip(),
                 "key": f"{repo}:pr_review:command:{comment['id']}"}
     job = {"mode": "command", "kind": event, "repo": repo, "pr": target["number"],
@@ -811,7 +821,7 @@ def pr_agent_round(repo: str, number: int) -> int:
 
 
 def pr_agent_prompt(body: str, *, bypass_depth: bool = False) -> str:
-    """Select findings at the fix threshold, enforcing depth unless a human explicitly bypassed it."""
+    """Select findings at the fix threshold, enforcing depth unless an authorized requester bypassed it."""
     settings = CONFIG["pr_review"]
     state = pr_agent_review_state(body)
     if not state or settings.get("fix_severity") not in SEVERITIES:
@@ -879,10 +889,11 @@ def reviewer_of(user: dict[str, Any]) -> str | None:
 def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
     """Authorize one depth bypass against the current PR and the bot's exact source review."""
     repo, number = job["repo"], job["pr"]
-    access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
-    if access.get("permission") not in {"admin", "write"}:
-        log("command_unauthorized", key=job["key"])
-        return None
+    if not trusted_reviewer({"login": job.get("author"), "id": job.get("author_id")}):
+        access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
+        if access.get("permission") not in {"admin", "write"}:
+            log("command_unauthorized", key=job["key"])
+            return None
     comment = github(f"repos/{repo}/issues/comments/{job['comment']}")
     pr = github(f"repos/{repo}/pulls/{number}")
     body = comment.get("body") or ""
@@ -908,7 +919,7 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
     fingerprint = hashlib.sha256(prompt.encode()).hexdigest()
     return {"repo": repo, "pr": number, "comment": job["comment"], "kind": "issue_comment",
             "reviewer": "pr_agent", "head": state["head"], "prompt": prompt,
-            "bypass_depth": True, "author": job["author"],
+            "bypass_depth": True, "author": job["author"], "author_id": job.get("author_id"),
             "key": f"{repo}:issue_comment:{job['comment']}:{fingerprint}"}
 
 
@@ -922,7 +933,7 @@ def allowed_repository(repo: Any) -> bool:
                 and any(isinstance(allowed, str) and owner.lower() == allowed.lower() for allowed in owners))
 
 
-def event_job(event: str, payload: dict[str, Any], posted_review: bool = False) -> dict[str, Any] | None:
+def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, delivery: str = "") -> dict[str, Any] | None:
     """Dispatch docs merges separately while preserving review-bot intake. `posted_review` is set only by `pr_review`
     for the comment it just posted: coding jobs also comment as autokas[bot], so a delivered or reconciled
     autokas[bot] comment never starts a PR-Agent fix."""
@@ -934,6 +945,20 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False) 
         sender = payload.get("sender", {})
         if not isinstance(repo, str):
             return None
+        if payload.get("action") == "rerequested":
+            prs = check.get("pull_requests") or []
+            app_id = CONFIG["github_app"].get("id")
+            if (not CONFIG["pr_review"]["enabled"] or check.get("name") != "autokas review"
+                    or type(app_id) is not int or check.get("app", {}).get("id") != app_id
+                    or type(check.get("id")) is not int or not delivery or not prs
+                    or sender.get("type") != "User" or not sender.get("login")):
+                return None
+            number = prs[0].get("number")
+            if type(number) is not int or number <= 0:
+                return None
+            return {"mode": "pr_review", "kind": "rerequest", "repo": repo, "pr": number,
+                    "author": sender["login"],
+                    "key": f"{repo}:pr_review:rerequest:{check['id']}:{delivery}"}
         action = re.fullmatch(r"fix:([1-9][0-9]*)", payload.get("requested_action", {}).get("identifier", ""))
         target = re.fullmatch(rf"https://github.com/{re.escape(repo)}/pull/([1-9][0-9]*)#issuecomment-([1-9][0-9]*)",
                               check.get("details_url") or "")
@@ -1019,7 +1044,8 @@ async def webhook(request: Request) -> JSONResponse:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise ValueError
-        job = event_job(request.headers.get("x-github-event", ""), payload)
+        job = event_job(request.headers.get("x-github-event", ""), payload,
+                        delivery=request.headers.get("x-github-delivery", ""))
     except (ValueError, TypeError, AttributeError):
         raise HTTPException(400, "invalid event") from None
     if job is None:
@@ -1782,7 +1808,7 @@ def pr_review(job: dict[str, Any]) -> None:
     repo, number = job["repo"], job["pr"]
     # automatic: a PR became ready (`pull_request`) or an autokas fix landed (`fix`). anything else is a command.
     automatic = job["kind"] in {"pull_request", "fix"}
-    if not automatic:
+    if not automatic and not trusted_reviewer({"login": job.get("author"), "id": job.get("author_id")}):
         access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
         if access.get("permission") not in {"admin", "write"}:
             log("command_unauthorized", key=job["key"])
@@ -1914,7 +1940,7 @@ def pr_review(job: dict[str, Any]) -> None:
                 status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
-    # automatic intake only: delivered bot comments never start a fix without an authorized human bypass.
+    # automatic intake only: delivered review comments never start a fix without an authorized bypass request.
     fix = event_job("issue_comment", {
         "action": "created", "repository": {"full_name": repo}, "sender": comment["user"], "comment": comment,
         "issue": {**current, "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/{number}"}},
@@ -1975,7 +2001,8 @@ def worker(job: dict[str, Any]) -> None:
         if fix is not None:
             dispatch(fix)
         return
-    if job.get("bypass_depth") and not job.get("linear"):
+    if (job.get("bypass_depth") and not job.get("linear")
+            and not trusted_reviewer({"login": job.get("author"), "id": job.get("author_id")})):
         access = github(f"repos/{job['repo']}/collaborators/{job['author']}/permission")
         if access.get("permission") not in {"admin", "write"}:
             log("command_unauthorized", key=job["key"])

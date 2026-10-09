@@ -21,6 +21,7 @@
     "login": "cursor[bot]",
     "id": 206951365
   },
+  "trusted_reviewers": [{"login": "kasthecrew[bot]", "id": 340343662}],
   "pr_agent": {
     "login": "autokas[bot]",
     "id": 334744567
@@ -96,6 +97,7 @@
     "email": "334744567+autokas[bot]@users.noreply.github.com"
   },
   "github_app": {
+    "id": 5102262,
     "name": "autokas",
     "owner": "kastheco",
     "permissions": {
