@@ -70,15 +70,19 @@ def enabled(value=True):
 
 
 class PRReviewIntakeTests(unittest.TestCase):
-    def test_trusted_bot_can_only_request_pr_reviews(self):
+    def test_trusted_bot_can_only_request_pr_review_loop_commands(self):
         for event in ("issue_comment", "pull_request_review_comment"):
-            with self.subTest(event=event):
-                job = runner.event_job(*trusted_comment(event=event))
-                self.assertEqual((job["mode"], job["author"], job["author_id"]),
-                                 ("pr_review", TRUSTED_BOT["login"], TRUSTED_BOT["id"]))
-                for body in ("@autokas fix it", "@autokas fix review 777", "@autokas reviewer notes"):
+            for body, mode in (("@autokas review", "pr_review"),
+                               ("@autokas fix review 777", "review_fix_request")):
+                with self.subTest(event=event, body=body):
+                    job = runner.event_job(*trusted_comment(body, event=event))
+                    self.assertEqual((job["mode"], job["author"], job["author_id"]),
+                                     (mode, TRUSTED_BOT["login"], TRUSTED_BOT["id"]))
+                    self.assertIsNone(runner.event_job(*trusted_comment(body, on_issue=True)))
+            for body in ("@autokas fix it", "@autokas reviewer notes",
+                         "@autokas fix review 0", "@autokas fix review 777 then edit code"):
+                with self.subTest(event=event, body=body):
                     self.assertIsNone(runner.event_job(*trusted_comment(body, event=event)))
-        self.assertIsNone(runner.event_job(*trusted_comment(on_issue=True)))
 
     def test_issue_command_bot_opened_ready_pr_is_eligible(self):
         payload = pr_event("opened")
@@ -90,10 +94,11 @@ class PRReviewIntakeTests(unittest.TestCase):
     def test_review_bot_identity_requires_both_login_and_id(self):
         for author in ({**TRUSTED_BOT, "id": 1}, {**TRUSTED_BOT, "login": "outsider[bot]"},
                        {"login": "outsider[bot]", "id": 1, "type": "Bot"}):
-            event, payload = trusted_comment()
-            payload["comment"]["user"] = author
-            with self.subTest(author=author):
-                self.assertIsNone(runner.event_job(event, payload))
+            for body in ("@autokas review", "@autokas fix review 777"):
+                event, payload = trusted_comment(body)
+                payload["comment"]["user"] = author
+                with self.subTest(author=author, body=body):
+                    self.assertIsNone(runner.event_job(event, payload))
 
     def test_rerequest_requires_own_named_check_and_a_pr(self):
         job = runner.event_job("check_run", rerequest_event(), delivery="delivery-1")
@@ -322,16 +327,25 @@ class PRReviewRunTests(unittest.TestCase):
         review.spawn.assert_called_once()
         coding.assert_not_called()
 
-    def test_trusted_bot_routes_to_review_without_command_access_or_coding(self):
-        job = runner.event_job(*trusted_comment())
-        with (patch.object(runner, "pr_review") as review, patch.object(runner, "PRWorker") as coding,
-              patch.object(runner, "github") as github, patch.object(runner, "acknowledge_review") as ack):
-            review.spawn.return_value = Mock(object_id="call")
-            runner.worker.local(job)
-        review.spawn.assert_called_once_with(job)
-        github.assert_not_called()
-        ack.assert_not_called()
-        coding.assert_not_called()
+    def test_trusted_bot_routes_only_to_review_loop_handlers(self):
+        for body, mode in (("@autokas review", "pr_review"),
+                           ("@autokas fix review 777", "review_fix_request")):
+            job = runner.event_job(*trusted_comment(body))
+            with (self.subTest(mode=mode), patch.object(runner, "pr_review") as review,
+                  patch.object(runner, "requested_review_fix", return_value=None) as fix,
+                  patch.object(runner, "PRWorker") as coding, patch.object(runner, "github") as github,
+                  patch.object(runner, "acknowledge_review") as ack):
+                review.spawn.return_value = Mock(object_id="call")
+                runner.worker.local(job)
+                if mode == "pr_review":
+                    review.spawn.assert_called_once_with(job)
+                    fix.assert_not_called()
+                else:
+                    fix.assert_called_once_with(job)
+                    review.spawn.assert_not_called()
+                github.assert_not_called()
+                ack.assert_not_called()
+                coding.assert_not_called()
 
     def test_trusted_bot_review_skips_collaborator_lookup(self):
         self.run_review(runner.event_job(*trusted_comment()), permission="none")
@@ -1296,6 +1310,38 @@ class ReviewFixBypassTests(unittest.TestCase):
             runner.dispatch(fallback)
         self.assertEqual(worker.spawn.call_count, 1)
         self.assertEqual(runner.pr_agent_prompt(self.comment["body"]), "")
+
+    def test_trusted_bot_fix_request_and_derived_fix_skip_collaborator_lookup(self):
+        request = runner.event_job(*trusted_comment("@autokas fix review 777"))
+        self.permission = "none"
+        fixes = []
+        with (patch.object(runner, "github", side_effect=self.github),
+              patch.object(runner, "dispatch", side_effect=fixes.append),
+              patch.object(runner, "CLAIMS", Mock(put=Mock(return_value=True))),
+              patch.object(runner, "PRWorker") as coding,
+              patch.object(runner, "acknowledge_review") as ack, patch.object(runner, "log")):
+            coding.return_value.run.spawn.return_value = Mock(object_id="call")
+            runner.worker.local(request)
+            self.assertEqual(len(fixes), 1)
+            fix = fixes[0]
+            self.assertEqual((fix["author"], fix["author_id"], fix["bypass_depth"]),
+                             (TRUSTED_BOT["login"], TRUSTED_BOT["id"], True))
+            runner.worker.local(fix)
+            coding.return_value.run.spawn.assert_called_once_with(fix)
+            ack.assert_not_called()
+        self.assertFalse(any(path.endswith("/permission") for path in self.reads))
+
+    def test_human_comment_fix_request_still_requires_write(self):
+        request = runner.event_job(*comment_event("@autokas fix review 777"))
+        self.permission = "read"
+        with patch.object(runner, "github", side_effect=self.github), patch.object(runner, "log") as log:
+            self.assertIsNone(runner.requested_review_fix(request))
+        log.assert_called_once_with("command_unauthorized", key=request["key"])
+        self.assertEqual(self.reads, [f"repos/{REPO}/collaborators/kas/permission"])
+
+    def test_check_action_remains_human_only(self):
+        self.event["sender"] = dict(TRUSTED_BOT)
+        self.assertIsNone(runner.event_job("check_run", self.event))
 
     def test_read_only_requester_cannot_bypass(self):
         self.permission = "read"

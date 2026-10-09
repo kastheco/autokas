@@ -488,7 +488,7 @@ def trusted_reviewer(author: dict[str, Any]) -> bool:
 
 
 def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Accept human commands or a trusted bot PR review; the review worker checks access."""
+    """Accept human commands or trusted bot PR review-loop requests; handlers check access."""
     if event not in {"issue_comment", "pull_request_review_comment"} or payload.get("action") != "created":
         return None
     comment = payload["comment"]
@@ -502,12 +502,13 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     target = payload["issue"] if event == "issue_comment" else payload["pull_request"]
     target_kind = "issue" if event == "issue_comment" and "pull_request" not in target else "pr"
     review = REVIEW_COMMAND.match(instruction) if target_kind == "pr" else None
-    if author.get("type") != "User" and not (author.get("type") == "Bot" and review and trusted_reviewer(author)):
-        return None
     fix_review = re.fullmatch(r"fix review ([1-9][0-9]*)", instruction, re.IGNORECASE) if target_kind == "pr" else None
+    if author.get("type") != "User" and not (
+            author.get("type") == "Bot" and (review or fix_review) and trusted_reviewer(author)):
+        return None
     if fix_review:
         return {"mode": "review_fix_request", "repo": repo, "pr": target["number"],
-                "comment": int(fix_review[1]), "author": comment["user"]["login"],
+                "comment": int(fix_review[1]), "author": author["login"], "author_id": author.get("id"),
                 "key": f"{repo}:review_fix:command:{comment['id']}"}
     if review:
         # `@autokas review …` on a PR asks for a PR-Agent review, never an omp coding job.
@@ -820,7 +821,7 @@ def pr_agent_round(repo: str, number: int) -> int:
 
 
 def pr_agent_prompt(body: str, *, bypass_depth: bool = False) -> str:
-    """Select findings at the fix threshold, enforcing depth unless a human explicitly bypassed it."""
+    """Select findings at the fix threshold, enforcing depth unless an authorized requester bypassed it."""
     settings = CONFIG["pr_review"]
     state = pr_agent_review_state(body)
     if not state or settings.get("fix_severity") not in SEVERITIES:
@@ -888,10 +889,11 @@ def reviewer_of(user: dict[str, Any]) -> str | None:
 def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
     """Authorize one depth bypass against the current PR and the bot's exact source review."""
     repo, number = job["repo"], job["pr"]
-    access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
-    if access.get("permission") not in {"admin", "write"}:
-        log("command_unauthorized", key=job["key"])
-        return None
+    if not trusted_reviewer({"login": job.get("author"), "id": job.get("author_id")}):
+        access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
+        if access.get("permission") not in {"admin", "write"}:
+            log("command_unauthorized", key=job["key"])
+            return None
     comment = github(f"repos/{repo}/issues/comments/{job['comment']}")
     pr = github(f"repos/{repo}/pulls/{number}")
     body = comment.get("body") or ""
@@ -917,7 +919,7 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
     fingerprint = hashlib.sha256(prompt.encode()).hexdigest()
     return {"repo": repo, "pr": number, "comment": job["comment"], "kind": "issue_comment",
             "reviewer": "pr_agent", "head": state["head"], "prompt": prompt,
-            "bypass_depth": True, "author": job["author"],
+            "bypass_depth": True, "author": job["author"], "author_id": job.get("author_id"),
             "key": f"{repo}:issue_comment:{job['comment']}:{fingerprint}"}
 
 
@@ -1938,7 +1940,7 @@ def pr_review(job: dict[str, Any]) -> None:
                 status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
-    # automatic intake only: delivered bot comments never start a fix without an authorized human bypass.
+    # automatic intake only: delivered review comments never start a fix without an authorized bypass request.
     fix = event_job("issue_comment", {
         "action": "created", "repository": {"full_name": repo}, "sender": comment["user"], "comment": comment,
         "issue": {**current, "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/{number}"}},
@@ -1999,7 +2001,8 @@ def worker(job: dict[str, Any]) -> None:
         if fix is not None:
             dispatch(fix)
         return
-    if job.get("bypass_depth") and not job.get("linear"):
+    if (job.get("bypass_depth") and not job.get("linear")
+            and not trusted_reviewer({"login": job.get("author"), "id": job.get("author_id")})):
         access = github(f"repos/{job['repo']}/collaborators/{job['author']}/permission")
         if access.get("permission") not in {"admin", "write"}:
             log("command_unauthorized", key=job["key"])
