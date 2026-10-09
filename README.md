@@ -46,6 +46,8 @@ each PR-Agent review also runs as an `autokas review` check on the head it revie
 
 the GitHub App needs checks read/write permission, declared in `config.example.json`. installations must accept the updated permission before check runs can be written. a check API failure logs its HTTP status code without response bodies or tokens and does not stop the review.
 
+the check's **re-run** button requests a fresh review of the PR's current head, not the old check commit. it requires write or admin access and keeps the PR's counted fix budget. redelivery of the same request starts no second review; closed PRs and checks without an associated PR are ignored. kas must subscribe the App to `check_run` before enabling this path; checks are already read/write. see [the cutover gap](docs/operations.md#deploy-and-update).
+
 ## fixes
 
 a fix job starts from CodeRabbit or Cursor findings, or from a PR-Agent review's findings at or above the fix threshold described above. CodeRabbit and Cursor findings follow this path:
@@ -86,9 +88,11 @@ you don't have to wait for CodeRabbit. start a GitHub comment with `@autokas` or
 - **on a PR**, in the conversation or on a review thread, it works on that PR's head branch and pushes there.
 - **on an issue**, it branches from the default branch as `autokas/issue-<number>`, does the work and opens one PR containing `Closes #<number>`.
 - only users with `write` or `admin` access on the repo can trigger it. other people's comments are ignored.
+- the only bot exception is `trusted_reviewers`: both login and user ID must match. the example allows `kasthecrew[bot]` to request a PR review, nothing else. it cannot start coding jobs or issue commands.
 - each comment runs once. editing a comment doesn't rerun it, so post a new comment for a follow-up.
 - commands still run on PRs marked `autokas:ignore` and on generated docs PRs.
 - a PR command that starts with the word `review` posts a fresh PR-Agent review of the current head instead of starting a coding job, and its findings start the fix loop above. anything after `review` goes to PR-Agent as extra instructions, so `@autokas review focus on the auth changes` steers it. it works on drafts too. on an issue, `review` is an ordinary command.
+- review requests post no queued acknowledgment and do not reset `max_fix_rounds`. qualifying findings can queue a fixer only within the existing budget.
 
 ```text
 @autokas the date filter drops the last day of the range, fix it and add a test
@@ -110,7 +114,7 @@ autokas also opens follow-up docs PRs after merges. docs jobs targeting the same
 
 autokas is a GitHub App owned by `kastheco`. a repository must have the App installed and its owner must appear in `allowed_owners` before any review, fix, command or docs job can run. owner matching is exact and case-insensitive. an empty or missing list denies all owners. mint-per-repo installation tokens keep one owner's credentials away from another's.
 
-the installed set is managed in the App's GitHub installation settings. events arrive through one App-level webhook pointed at the receiver and subscribed to `issue_comment`, `pull_request`, `pull_request_review` and `pull_request_review_comment`, so installing the App on a repo is all it takes to start delivery. no per-repo hooks are needed.
+the installed set is managed in the App's GitHub installation settings. events arrive through one App-level webhook pointed at the receiver and subscribed to `check_run`, `issue_comment`, `pull_request`, `pull_request_review` and `pull_request_review_comment`, so installing the App on a repo is all it takes to start delivery. existing Apps need kas to add the `check_run` subscription for re-runs and check actions. no per-repo hooks are needed.
 
 installation alone does not authorize spending the deployment's model quota or Modal balance. set `allowed_owners` in private `config.json`; the Actions deployment reads the JSON list from the `AUTOKAS_ALLOWED_OWNERS_JSON` repository secret. the public example denies all owners. queued jobs recheck the list before routing or execution.
 
