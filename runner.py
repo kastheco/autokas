@@ -1880,7 +1880,14 @@ def pr_review(job: dict[str, Any]) -> None:
                 detail = redact((result.stdout + result.stderr).strip(), (env["OPENAI__KEY"],))
                 log("pr_review_failed", key=job["key"], model=model, code=result.returncode, detail=detail[-2000:])
                 raise RuntimeError(f"PR-Agent exited with {result.returncode} and {len(review)} review characters")
-            structured_review = json.loads(structured.read_text())
+            try:
+                structured_review = json.loads(structured.read_text())
+            except ValueError:
+                structured_review = None
+            if not isinstance(structured_review, dict):
+                detail = redact((result.stdout + result.stderr).strip(), (env["OPENAI__KEY"],))
+                log("pr_review_failed", key=job["key"], model=model, reason="invalid_json_output", detail=detail[-2000:])
+                raise RuntimeError("PR-Agent wrote invalid structured output")
             findings = pr_agent_findings(structured_review)
             rendered = structured_review.get("review") if isinstance(structured_review.get("review"), dict) else {}
         current = github(f"repos/{repo}/pulls/{number}")
@@ -1899,8 +1906,12 @@ def pr_review(job: dict[str, Any]) -> None:
     if exhausted:
         # the fallback command names this comment, so the note is added once its ID exists.
         note = depth_note(repo, number, round_, check, comment["id"])
-        comment = {**comment, **github_request("PATCH", f"repos/{repo}/issues/comments/{comment['id']}", {
-            "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, note=note)})}
+        try:
+            comment = {**comment, **github_request("PATCH", f"repos/{repo}/issues/comments/{comment['id']}", {
+                "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, note=note)})}
+        except Exception as error:
+            log("fix_limit_note_uncertain", key=job["key"], reason=type(error).__name__,
+                status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
     # automatic intake only: delivered bot comments never start a fix without an authorized human bypass.

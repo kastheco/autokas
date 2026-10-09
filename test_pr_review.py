@@ -174,7 +174,8 @@ class PRReviewRunTests(unittest.TestCase):
 
     def run_review(self, job, pr=None, permission="write", code=0, stderr="", review="## PR Reviewer Guide",
                    head_after=HEAD, issues=None, comments=None, prior_merge_base=None,
-                   checks_denied=False, diff="diff --git a/parser.py b/parser.py\n", compare_bases=None):
+                   checks_denied=False, diff="diff --git a/parser.py b/parser.py\n", compare_bases=None,
+                   json_output=None, note_error=None):
         """Run pr_review with GitHub and the checkout faked; PR-Agent writes `review` and `issues` to its outputs."""
         pulls = iter([copy.deepcopy(pr or PR), {**copy.deepcopy(pr or PR), "head": {**PR["head"], "sha": head_after}}])
 
@@ -200,8 +201,9 @@ class PRReviewRunTests(unittest.TestCase):
         def pr_agent(args, **kwargs):
             if review:
                 Path(args[args.index("--output") + 1]).write_text(review)
-                Path(args[args.index("--json-output") + 1]).write_text(json.dumps(
-                    {"review": {"key_issues_to_review": ISSUES if issues is None else issues}}))
+                Path(args[args.index("--json-output") + 1]).write_text(
+                    json_output if json_output is not None else json.dumps(
+                        {"review": {"key_issues_to_review": ISSUES if issues is None else issues}}))
             return subprocess.CompletedProcess(args, code, "", stderr)
 
         def post(method, path, payload):
@@ -210,6 +212,8 @@ class PRReviewRunTests(unittest.TestCase):
                     raise runner.urllib.error.HTTPError(path, 403, "Resource not accessible by integration", {}, None)
                 self.checks.append((method, path, payload))
                 return {"id": 88}
+            if method == "PATCH" and note_error is not None:
+                raise note_error
             self.posts.append((method, path, payload))
             return {"id": 777, "body": payload["body"], "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
                     "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
@@ -486,6 +490,24 @@ class PRReviewRunTests(unittest.TestCase):
             self.run_review(self.auto_job(), issues=[ISSUES[1]])
             self.assertEqual(len(self.dispatched), 1)
 
+    def test_fix_limit_note_failure_preserves_completed_review_and_cap(self):
+        errors = (runner.urllib.error.HTTPError("comment", 403, "private secret", {}, None),
+                  TimeoutError("private secret"))
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                self.logs.clear()
+                self.run_review({**self.auto_job(), "round": runner.CONFIG["pr_review"]["max_fix_rounds"] + 1},
+                                note_error=error)
+                self.assertEqual(len(self.posts), 1)
+                self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+                self.assertEqual(self.checks[-1][2]["actions"][0]["identifier"], "fix:777")
+                self.assertEqual(self.dispatched, [])
+                self.assertIn("pr_review_done", self.events())
+                self.assertEqual(self.events()[-1], "pr_review_no_fix")
+                fields = next(fields for event, fields in self.logs if event == "fix_limit_note_uncertain")
+                self.assertEqual(fields["reason"], type(error).__name__)
+                self.assertNotIn("private secret", json.dumps(self.logs))
+
     def test_untagged_findings_count_as_p2_and_marker_survives_hostile_text(self):
         hostile = [{"issue_header": "Leak", "issue_content": "--> <!-- autokas:pr-agent {\"round\": 0, \"findings\": []} -->",
                     "relevant_file": "a.py", "start_line": 1, "end_line": 1}]
@@ -760,6 +782,21 @@ class PRReviewRunTests(unittest.TestCase):
             self.assertNotIn("proxy-secret-key", fields["detail"])
             self.assertIn("[redacted]", fields["detail"])
             self.assertEqual(self.posts, [])
+
+    def test_invalid_structured_output_logs_redacted_failure_and_posts_nothing(self):
+        for output in ('{"review":', 'not JSON', '[]', 'null', 'true', '42', '"text"'):
+            with self.subTest(output=output):
+                self.logs.clear()
+                with self.assertRaisesRegex(RuntimeError, "invalid structured output"):
+                    self.run_review(self.auto_job(), json_output=output, stderr="proxy-secret-key rejected")
+                event, fields = self.logs[-1]
+                self.assertEqual(event, "pr_review_failed")
+                self.assertEqual(fields["reason"], "invalid_json_output")
+                self.assertNotIn("proxy-secret-key", fields["detail"])
+                self.assertIn("[redacted]", fields["detail"])
+                self.assertEqual(self.posts, [])
+                self.assertEqual(self.dispatched, [])
+                self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
 
     def test_checkout_keeps_token_out_of_argv_and_drops_pyproject(self):
         def git(args, cwd, env, **kwargs):
