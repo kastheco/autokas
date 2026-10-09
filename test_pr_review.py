@@ -506,7 +506,26 @@ class PRReviewRunTests(unittest.TestCase):
         glance, details = body.split("<details>", 1)
         self.assertIn("Wrong lookup", glance)
         self.assertIn("Naming", glance)
-        self.assertIn(runner.REVIEW_TRIMMED, details)
+        self.assertEqual(details.count("</details>"), 1)
+        _, outside = details.split("</details>", 1)
+        self.assertIn(runner.REVIEW_TRIMMED, outside)
+        self.assertIn("<sub>PR-Agent", outside)
+
+    def test_trimmed_review_reserves_the_fold_even_when_no_content_fits(self):
+        review = {"narrative": "short"}
+        body = runner.pr_agent_comment(review, REPO, HEAD, 1, [])
+        minimum = len(body.encode()) - len("**narrative:** short".encode()) + len(runner.REVIEW_TRIMMED.encode())
+        with patch.object(runner, "GITHUB_COMMENT_LIMIT", minimum):
+            body = runner.pr_agent_comment({"narrative": "é" * 1000}, REPO, HEAD, 1, [])
+            self.assertEqual(len(body.encode()), minimum)
+            self.assertEqual(body.count("<details>"), 1)
+            self.assertEqual(body.count("</details>"), 1)
+            _, outside = body.split("</details>", 1)
+            self.assertIn(runner.REVIEW_TRIMMED, outside)
+            self.assertIn("<sub>PR-Agent", outside)
+        with patch.object(runner, "GITHUB_COMMENT_LIMIT", minimum - 1):
+            with self.assertRaisesRegex(ValueError, "review metadata exceeds GitHub's comment limit"):
+                runner.pr_agent_comment({"narrative": "é" * 1000}, REPO, HEAD, 1, [])
 
     def test_metadata_heavy_review_fits_and_preserves_finding_locations(self):
         issues = [{**issue, "issue_header": "[P1] " + "🔍<>" * 20000,

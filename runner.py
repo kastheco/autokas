@@ -740,7 +740,9 @@ def pr_agent_comment(review: dict[str, Any], repo: str, head: str, round_: int, 
     for key, value in review.items():
         if key not in PR_AGENT_RENDERED_FIELDS and isinstance(value, str) and value.strip().lower() not in ("", "no", "none"):
             sections.append(f"**{key.replace('_', ' ')}:** {value.strip()}\n\n")
-    details = "<details><summary>details</summary>\n\n" + "".join(sections) + "</details>" if sections else ""
+    details_open, details_close = "<details><summary>details</summary>\n\n", "\n\n</details>"
+    details = "".join(sections).rstrip()
+    wrapper_size = len((details_open + details_close).encode()) if sections else 0
     effort = review.get("estimated_effort_to_review_[1-5]")
     tests = {"yes": "has tests", "no": "no tests"}.get(str(review.get("relevant_tests") or "").strip().lower())
     notes = " · ".join(["PR-Agent"] + ([f"effort {effort}/5"] if effort else []) + ([tests] if tests else []))
@@ -755,12 +757,16 @@ def pr_agent_comment(review: dict[str, Any], repo: str, head: str, round_: int, 
             findings = [{**finding, field: utf8_cut(finding[field], cap)} for finding in findings]
             marker = pr_agent_marker(head, round_, findings, restack)
     footer = sub + marker
-    room = GITHUB_COMMENT_LIMIT - len(prefix.encode()) - len(footer.encode())
+    room = GITHUB_COMMENT_LIMIT - len(prefix.encode()) - len(footer.encode()) - wrapper_size
     if room < len(REVIEW_TRIMMED.encode()):
         raise ValueError("PR-Agent review metadata exceeds GitHub's comment limit")
+    trimmed = ""
     if len(details.encode()) > room:
-        details = utf8_cut(details, room - len(REVIEW_TRIMMED.encode())) + REVIEW_TRIMMED
-    return (prefix + details).rstrip() + footer
+        details = utf8_cut(details, room - len(REVIEW_TRIMMED.encode()))
+        trimmed = REVIEW_TRIMMED
+    if sections:
+        details = details_open + details + details_close
+    return (prefix + details + trimmed).rstrip() + footer
 
 
 def pr_agent_review_state(body: str) -> dict[str, Any] | None:
