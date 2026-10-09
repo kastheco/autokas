@@ -31,6 +31,7 @@
     "model": "railway-codex/gpt-6.1-sol",
     "restack_model": "railway-codex/claude-haiku-5-5",
     "thinking": "medium",
+    "service_tier": "priority",
     "max_model_tokens": 200000,
     "fix_severity": "P2",
     "max_fix_rounds": 3
