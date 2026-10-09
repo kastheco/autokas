@@ -204,9 +204,11 @@ Run typecheck, lint or a build only when your change can affect them, and run te
 for the modules you touched, not unrelated suites or whole-repository runs your
 change can't affect. A documentation, comment or prose-only change needs no tests or
 builds; check its links, anchors and cited paths or symbols instead. For a merge,
-rebase or conflict resolution, validate only the hunks you resolved by hand, since
-changes that merged cleanly from the base are already validated there. A fix for
-review findings validates only those fixes, not the whole PR again. This scoping
+rebase or conflict resolution, validate the hunks you resolved by hand and the
+interactions between incoming base changes and the PR in the combined tree,
+even when there are no conflicts. Include affected callers and shared contracts,
+expanding check scope when needed. A fix for review findings validates only those
+fixes, not the whole PR again. This scoping
 overrides generic repository guidance to run every check before each commit.
 Diagnose and repair in-scope code, test setup, dependency resolution,
 and your own throwaway harness, then rerun affected checks. Reuse the repository's
