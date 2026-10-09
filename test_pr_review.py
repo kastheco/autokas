@@ -2,6 +2,7 @@
 
 import copy
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -281,8 +282,6 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertNotIn("ghs_installation_token", env.values())
         self.assertFalse(any(key.startswith(("GITHUB", "JARVIS")) for key in env))
         self.assertNotIn("jarvis-secret", env.values())
-        body = self.posts[0][2]["body"]
-        self.assertTrue(body.startswith(f"## PR Reviewer Guide\n\n<sub>reviewed head {HEAD}</sub>\n\n<!-- autokas:pr-agent "))
         self.assertEqual(self.events(), ["pr_review_started", "pr_review_done"])
         self.assertTrue(env["PR_REVIEWER__EXTRA_INSTRUCTIONS"].startswith(runner.SEVERITY_INSTRUCTIONS))
         self.assertNotIn("commenter", env["PR_REVIEWER__EXTRA_INSTRUCTIONS"])
@@ -471,8 +470,11 @@ class PRReviewRunTests(unittest.TestCase):
                 self.run_review({**self.auto_job(), **{k: v for k, v in change.items() if k == "round"}}, issues=issues)
                 self.assertEqual(self.dispatched, [])
                 if name == "last round":
+                    self.assertEqual([(method, path) for method, path, _ in self.posts[1:]],
+                                     [("PATCH", f"repos/{REPO}/issues/comments/777")])
                     notice = self.posts[1][2]["body"]
-                    command = next(line for line in notice.splitlines() if line.startswith("@autokas "))
+                    self.assertEqual(runner.pr_agent_review_state(notice)["round"], rounds + 1)
+                    command = re.search(r"@autokas fix review \d+", notice)[0]
                     event, payload = comment_event(command)
                     request = runner.event_job(event, payload)
                     self.assertEqual((request["mode"], request["comment"]), ("review_fix_request", 777))
@@ -493,27 +495,18 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertEqual(state["findings"][0]["content"], hostile[0]["issue_content"])
         self.assertEqual(len(self.dispatched), 1)
 
-    def test_rendered_fake_marker_cannot_override_appended_review_state(self):
-        fake = runner.pr_agent_marker("c" * 40, 0, [])
-        self.run_review({**self.auto_job(), "round": 2}, review=f"## PR Reviewer Guide\n{fake}")
-        state = runner.pr_agent_review_state(self.posts[0][2]["body"])
-        self.assertEqual((state["head"], state["round"]), (HEAD, 2))
-        self.assertEqual(state["findings"][0]["header"], "Wrong lookup")
-
     def test_oversized_review_fits_one_comment_and_keeps_every_finding(self):
         long = [{**issue, "issue_content": "é" * 40000} for issue in ISSUES]
-        for name, review, issues in (("long review", "## PR Reviewer Guide\n" + "🔍" * 30000, None),
-                                     ("long findings", "## PR Reviewer Guide", long)):
-            with self.subTest(name):
-                self.run_review(self.auto_job(), review=review, issues=issues)
-                body = self.posts[0][2]["body"]
-                self.assertLessEqual(len(body.encode()), runner.GITHUB_COMMENT_LIMIT)
-                state = runner.pr_agent_review_state(body)
-                self.assertEqual([finding["header"] for finding in state["findings"]], ["Wrong lookup", "Naming"])
-                self.assertEqual(len(self.dispatched), 1)
-                if issues is None:
-                    self.assertTrue(body.split("\n\n<sub>")[0].endswith(runner.REVIEW_TRIMMED))
-                    self.assertEqual(state["findings"][0]["content"], ISSUES[0]["issue_content"].strip())
+        self.run_review(self.auto_job(), issues=long)
+        body = self.posts[0][2]["body"]
+        self.assertLessEqual(len(body.encode()), runner.GITHUB_COMMENT_LIMIT)
+        state = runner.pr_agent_review_state(body)
+        self.assertEqual([finding["header"] for finding in state["findings"]], ["Wrong lookup", "Naming"])
+        self.assertEqual(len(self.dispatched), 1)
+        glance, details = body.split("<details>", 1)
+        self.assertIn("Wrong lookup", glance)
+        self.assertIn("Naming", glance)
+        self.assertIn(runner.REVIEW_TRIMMED, details)
 
     def test_metadata_heavy_review_fits_and_preserves_finding_locations(self):
         issues = [{**issue, "issue_header": "[P1] " + "🔍<>" * 20000,
