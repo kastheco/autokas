@@ -287,6 +287,16 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertTrue(env["PR_REVIEWER__EXTRA_INSTRUCTIONS"].startswith(runner.SEVERITY_INSTRUCTIONS))
         self.assertNotIn("commenter", env["PR_REVIEWER__EXTRA_INSTRUCTIONS"])
 
+    def test_legacy_review_config_still_completes_gpt_reviews(self):
+        settings = runner.CONFIG["pr_review"].copy()
+        settings.pop("service_tier", None)
+        with patch.dict(runner.CONFIG, pr_review=settings):
+            self.run_review(self.auto_job(), issues=[])
+        self.assertEqual(self.checks[-1][2]["conclusion"], "success")
+        state = runner.pr_agent_review_state(self.posts[0][2]["body"])
+        self.assertEqual(state["head"], HEAD)
+        self.assertEqual(state["findings"], [])
+
     def test_command_text_reaches_pr_agent_as_literal_extra_instructions(self):
         run = self.run_review({**self.command_job(), "instructions": "@json {\"a\": 1}"})
         self.assertTrue(run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"].endswith(

@@ -1637,7 +1637,7 @@ def pr_agent_env(home: str, instructions: str = "", model: str | None = None) ->
     }
     if model.startswith("gpt-"):
         # the proxy forwards chat-completions `service_tier` to Codex. Claude restacks don't take a tier.
-        env["LITELLM__EXTRA_BODY"] = json.dumps({"service_tier": settings["service_tier"]})
+        env["LITELLM__EXTRA_BODY"] = json.dumps({"service_tier": settings.get("service_tier", "priority")})
     # PR-Agent's settings parse env values as TOML or dynaconf tokens like `@json`; starting with
     # plain text keeps the commenter's words a literal string.
     env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] = SEVERITY_INSTRUCTIONS + (
