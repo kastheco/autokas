@@ -29,13 +29,10 @@ from fastapi.responses import JSONResponse
 
 ROOT = Path(__file__).resolve().parent if modal.is_local() else Path("/opt/autokas/runner")
 CONFIG = json.loads((ROOT / "config.json").read_text())
-# Hash the actual deployed sources, including uncommitted edits, not just Git HEAD.
+# Hash only sources mounted in every image, including uncommitted edits.
 REVISION = hashlib.sha256(b"".join(
-    (path.relative_to(ROOT) if path.is_relative_to(ROOT) else path.relative_to("/opt/autokas")).as_posix().encode() + b"\0" + path.read_bytes() + b"\0"
-    for path in [
-        ROOT / "runner.py", ROOT / "linear_intake.py", ROOT / "config.json", ROOT / "consult.py", ROOT / "kas-voice-profile.md",
-        *sorted(path for path in ((ROOT / "skills") if modal.is_local() else Path("/opt/autokas/skills")).rglob("*") if path.is_file()),
-    ]
+    name.encode() + b"\0" + (ROOT / name).read_bytes() + b"\0"
+    for name in ("runner.py", "linear_intake.py", "config.json", "consult.py", "kas-voice-profile.md")
 )).hexdigest()
 app = modal.App(CONFIG["app"])
 CLAIMS = modal.Dict.from_name(f'{CONFIG["app"]}-comments', create_if_missing=True)
@@ -106,7 +103,7 @@ _CONFIG_DIRECTORY = tempfile.TemporaryDirectory(prefix="autokas-config-") if mod
 CONFIG_SOURCE = ROOT / "config.json"
 if _CONFIG_DIRECTORY is not None:
     CONFIG_SOURCE = Path(_CONFIG_DIRECTORY.name) / "config.json"
-    CONFIG_SOURCE.write_text(json.dumps(CONFIG))
+    CONFIG_SOURCE.write_bytes((ROOT / "config.json").read_bytes())
     CONFIG_SOURCE.chmod(0o644)
 
 
@@ -649,7 +646,7 @@ def docs_path_allowed(path: str, folders: list[str]) -> bool:
 
 def log(event: str, **fields: Any) -> None:
     """Write operational evidence without comment bodies or credentials."""
-    print(json.dumps({"event": event, "revision": REVISION, **fields}), flush=True)
+    print(json.dumps({"event": event, "revision": REVISION, "team_image": TEAM["image"], **fields}), flush=True)
 
 
 def agent_prompt(body: str) -> str:
