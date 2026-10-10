@@ -89,7 +89,7 @@ jobs:
           path: evidence/
           retention-days: 7
   publish:
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'kastheco/autokas'
+    if: github.repository == 'kastheco/autokas' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
