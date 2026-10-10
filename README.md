@@ -159,6 +159,8 @@ pushes to `main` run `.github/workflows/deploy.yml`, which runs the tests agains
 
 repository reconciliation does not reconstruct `opened`, `ready_for_review` or `synchronize` deliveries from current PR metadata. it cannot recover a push's before/after heads or sender. replay of an actual App delivery retains that payload and follows normal intake and head deduplication.
 
+the [public base image workflow](.github/workflows/images.yml) keeps a separate build artifact for each run attempt. publication downloads the artifact ID from the successful build job, so rerunning all jobs doesn't overwrite earlier evidence and rerunning only publication still uses the smoke-tested build.
+
 ## test
 
 ```sh
