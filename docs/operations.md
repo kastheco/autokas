@@ -31,6 +31,20 @@ validation is scoped to the change. omp runs the checks that cover the files and
 
 
 
+## paperclip pr watcher
+
+`scripts/pr-watch.sh` reads the company projects API and watches open, non-draft PRs in their `kastheco` GitHub workspaces. this matches the process agent's `PAPERCLIP_GH_OWNERS=kastheco` binding. it doesn't read repositories belonging to other owners or write to GitHub. integrations and autokas still own review requests, fixes and handoffs.
+
+the script needs bash, `/usr/local/bin/gh`, jq, curl and flock. Paperclip supplies `PAPERCLIP_API_URL`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_RUN_ID`, an injected run token in `PAPERCLIP_API_KEY`, and `PAPERCLIP_TASK_ID`. never configure a long-lived API key. an unscoped run exits without posting or advancing state because Paperclip requires issue-scoped run attribution for comments. the watcher has its own issue, KAS-33, and posts updates to KAS-5. enabling a timer alone isn't sufficient, its runs must retain issue context.
+
+one JSON snapshot lives at `/paperclip/pr-watch/state.json` on the persistent volume. `PR_WATCH_STATE_FILE` can select another volume path. a stable lock serializes writers, and the snapshot is replaced only after a successful update comment. unreadable or incomplete repository reads preserve previous state rather than reporting false closures. a failed comment leaves the snapshot unchanged for the next run.
+
+the fingerprint includes the head, mergeability, review decision, checks, sorted labels, and paginated conversation, review and inline-comment counts. comments and reviews starting with `@autokas` don't count. an autokas review must belong to the current head, either as a submitted GitHub review or an `autokas[bot]` comment with the runner's `autokas:pr-agent` marker.
+
+a head without an autokas review stalls 30 minutes after first observation. `autokas:fixing` stalls 75 minutes after first observation of the label on that head. one update comment contains all changes and stalls. a head consumes at most two stall wakes, even if both stall conditions apply. a new head resets the budget. quiet runs don't post. `PR_WATCH_ISSUE_ID` overrides the KAS-5 target for an authorized smoke run, and `PR_WATCH_GH` overrides the gh executable.
+
+after the script PR merges, the approved process command should fetch `repos/kastheco/autokas/contents/scripts/pr-watch.sh?ref=main` through `gh api`, decode its content, and run it with bash. kas or an authorized control-plane operator must apply the consent-gated command and heartbeat changes. retain the disabled watcher timer until an issue-scoped live run proves the KAS-5 comment and integrations wake. then enable the 600-second watcher heartbeat, change integrations to an 86400-second heartbeat with on-demand wakes, and replace its polling and issue-monitor instructions. don't deploy or restart athena for this change.
+
 ## configuration
 
 copy `config.example.json` to `config.json` and fill in your webhook URL, provider base URL, `jarvis_owner` and `jarvis_url` (leave the last two empty to run with no advisor), and any per-repository docs settings. `config.json` is ignored by git; the runtime, Modal mounts and revision hash all read that filename.
