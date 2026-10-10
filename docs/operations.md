@@ -53,6 +53,10 @@ copy `config.example.json` to `config.json` and fill in your webhook URL, provid
 
 the deploy workflow builds production `config.json` from the tracked `config.example.json` and takes only the private keys from the `AUTOKAS_CONFIG_JSON` secret: `docs_update`, `jarvis_owner`, `jarvis_url`, `omp_models`, `owner_approvals`, `linear` and `teams`. versions, tools, top-level model selections, `omp_settings` and every other public setting change through a normal PR to `config.example.json`, never through the secret. `omp_models` is supplied by `AUTOKAS_CONFIG_JSON` and can override the tracked value. other keys in the secret are ignored.
 
+deployed workers start with the team's baked `/opt/autokas/settings.json`, overlay `config.json.omp_settings` by top-level key, then set the job's model roles. configured objects replace their baked counterparts rather than merging recursively. baked skills aren't overlaid. PR, docs and planner checkouts live inside each job's unique temporary directory under `/state` and are removed with its agent home on success or failure.
+
+`MODAL_ENVIRONMENT` must be explicit before importing the runner. missing or empty values fail instead of selecting `main` and its worker secret. the pinned Modal CLI sets it from `--env`, and the deployment workflow sets `main` explicitly for tests and deployment.
+
 production `allowed_owners` comes separately from the `AUTOKAS_ALLOWED_OWNERS_JSON` repository secret. set it to a JSON list such as `["approved-owner"]`; an absent or empty secret becomes `[]` and denies all jobs. this keeps installed repository owners out of public config without rewriting the existing private configuration secret. changing the list takes effect on the next deployment. removing an owner blocks queued jobs when they reach the updated entry points, but does not cancel an agent already running.
 
 - coding jobs use `railway-codex/gpt-6.1-sol`, high reasoning and requested priority service. docs jobs use `railway-codex/claude-haiku-5-5`, medium effort and default service. both use CLIProxyAPI's Responses API. the `railway-codex` provider name is historical and also serves Claude. Haiku's catalogue limits are a 1M-token context and 128k-token output, matching [Anthropic's model specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview). native omp flags set the model, reasoning effort and service tier explicitly. all model roles follow the selected job profile. model fallback and automatic agent retries are disabled.
@@ -201,6 +205,7 @@ before the first check in a checkout, run:
 
 ```sh
 bash scripts/setup-test-env.sh
+export MODAL_ENVIRONMENT=main
 .venv/bin/python -m unittest test_runner -v
 ```
 
