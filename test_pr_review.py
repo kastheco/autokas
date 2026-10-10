@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import runner
 from test_queue_ack import REPO
+from smoke_helper import GitOmpSmoke
 
 
 def setUpModule():
@@ -940,17 +941,13 @@ class PRReviewRunTests(unittest.TestCase):
 
 class FixPublicationTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.smoke = GitOmpSmoke(PR["head"]["ref"])
+        self.addCleanup(self.smoke.close)
+        self.root = self.smoke.root
         self.origin = self.root / "origin.git"
-        self.parent = self.root / "parent"
-        self.parent.mkdir()
-        self.real_run = subprocess.run
-        self.real_popen = subprocess.Popen
-        self.env = {"PATH": runner.os.defpath, "HOME": temporary.name, "GIT_CONFIG_NOSYSTEM": "1"}
+        self.smoke.origin = self.origin
+        self.parent = self.smoke.checkout
         self.git(["init", "--bare", str(self.origin)])
-        self.git(["init", "-b", PR["head"]["ref"]], self.parent)
         (self.parent / "parser.py").write_text("result = 'broken'\n")
         self.commit(self.parent, "base")
         self.starting_head = self.git(["rev-parse", "HEAD"], self.parent)
@@ -967,8 +964,7 @@ class FixPublicationTests(unittest.TestCase):
         self.claims = {}
 
     def git(self, args, cwd=None):
-        return self.real_run(["git", *args], cwd=cwd or self.root, env=self.env,
-                             capture_output=True, text=True, check=True).stdout.strip()
+        return self.smoke.git(args, cwd=cwd or self.root).stdout.strip()
 
     def commit(self, cwd, message):
         self.git(["add", "."], cwd)
@@ -1021,18 +1017,8 @@ class FixPublicationTests(unittest.TestCase):
                         "ahead" if common == base else "behind" if common == head else "diverged"}
             raise AssertionError(f"unexpected GitHub read: {path}")
 
-        def run(args, **kwargs):
-            if args == ["gh", "auth", "setup-git"]:
-                return subprocess.CompletedProcess(args, 0, "", "")
-            if args[:3] == ["git", "clone", "--no-checkout"]:
-                args = [*args[:3], str(self.origin), args[-1]]
-            self.assertEqual(args[0], "git")
-            return self.real_run(args, **kwargs)
 
-        def popen(args, *, cwd, **kwargs):
-            if args[0] == "git":
-                return self.real_popen(args, cwd=cwd, **kwargs)
-            self.assertEqual(args[0], "omp")
+        def capture_omp(args, *, cwd, **kwargs):
             policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
             context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
             Path(context["outcome_file"]).write_text("already handled\n" if movement == "handled" else "published\n")
@@ -1059,6 +1045,7 @@ class FixPublicationTests(unittest.TestCase):
             self.remote_head = self.git(["rev-parse", f"refs/heads/{PR['head']['ref']}"], self.origin)
             self.launched = True
             return Mock(pid=-1, **{"wait.return_value": code})
+        self.smoke.on_omp = capture_omp
 
         with (patch.object(runner, "CLAIMS", store),
               patch.dict(runner.CONFIG, {"jarvis_owner": ""}),
@@ -1067,7 +1054,8 @@ class FixPublicationTests(unittest.TestCase):
               patch.object(runner, "github_token", return_value="disposable-token"),
               patch.object(runner, "check_proxy_model"),
               patch.object(runner, "github", side_effect=github),
-              patch.object(runner, "subprocess", Mock(run=run, Popen=popen)),
+              patch.object(runner.subprocess, "run", side_effect=self.smoke.run),
+              patch.object(runner.subprocess, "Popen", side_effect=self.smoke.popen),
               patch.object(runner.os, "killpg"),
               patch.object(runner, "dispatch", side_effect=self.dispatched.append),
               patch.object(runner, "set_fix_label", side_effect=lambda repo, pr, state, key: self.labels.append(state)),

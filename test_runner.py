@@ -15,6 +15,7 @@ from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
 from runner import CONFIG, POLICY, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job, upstack
+from smoke_helper import GitOmpSmoke
 
 def setUpModule():
     owners = patch.dict(CONFIG, allowed_owners=["example-org", "example"])
@@ -513,15 +514,11 @@ class CommandInitializationTests(unittest.TestCase):
                     "kind": "issue_comment", "comment": 555, "author": "kas", "target": "pr",
                     "source_url": f"https://github.com/{REPO}/pull/142#issuecomment-555",
                     "prompt": "fix the command launch regression"}
-        self.temporary_directory = tempfile.TemporaryDirectory
-        self.subprocess_run = subprocess.run
-        self.subprocess_popen = subprocess.Popen
-        temporary = self.temporary_directory()
-        self.addCleanup(temporary.cleanup)
-        self.upstream = Path(temporary.name)
-        self.git_env = {"PATH": os.defpath, "HOME": temporary.name, "GIT_CONFIG_NOSYSTEM": "1"}
         self.branch = "feature/command"
-        self.git(["git", "init", "-b", self.branch])
+        self.smoke = GitOmpSmoke(self.branch)
+        self.addCleanup(self.smoke.close)
+        self.temporary_directory = self.smoke.temporary_directory
+        self.upstream = self.smoke.checkout
         self.git(["git", "-c", "user.name=test", "-c", "user.email=test@example.com",
                   "commit", "--allow-empty", "-m", "base"])
         self.head = self.git(["git", "rev-parse", "HEAD"]).stdout.strip()
@@ -551,8 +548,7 @@ class CommandInitializationTests(unittest.TestCase):
             PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
 
     def git(self, args, **kwargs):
-        return self.subprocess_run(args, cwd=kwargs.get("cwd", self.upstream),
-                                   env=self.git_env, capture_output=True, text=True, check=True)
+        return self.smoke.git(args[1:], cwd=kwargs.get("cwd", self.upstream))
 
     def launch(self, agent=None) -> dict:
         """Reach omp with a local checkout or an empty reporting-only directory.
@@ -576,19 +572,8 @@ class CommandInitializationTests(unittest.TestCase):
                 return {"merge_base_commit": {"sha": "f" * 40}, "ahead_by": 1}
             raise AssertionError(f"unexpected GitHub read: {path}")
 
-        def run(args, **kwargs):
-            if args == ["gh", "auth", "setup-git"]:
-                return subprocess.CompletedProcess(args, 0, "", "")
-            if args[:3] == ["git", "clone", "--no-checkout"]:
-                args = [*args[:3], str(self.upstream), args[-1]]
-            elif args[:2] not in (["git", "fetch"], ["git", "checkout"], ["git", "rev-parse"]):
-                raise AssertionError(f"unexpected command: {args}")
-            return self.git(args, **kwargs)
 
-        def popen(args, *, cwd, **kwargs):
-            if args[0] == "git":
-                return self.subprocess_popen(args, cwd=cwd, **kwargs)
-            self.assertEqual(args[0], "omp")
+        def capture_omp(args, *, cwd, **kwargs):
             observed["prompt"] = Path(args[-1].removeprefix("@")).read_text()
             policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
             observed["context"] = json.loads(policy.split("\nTrusted job context:\n", 1)[1])
@@ -601,6 +586,7 @@ class CommandInitializationTests(unittest.TestCase):
                 agent(cwd)
                 return Mock(pid=-1, **{"wait.return_value": 0})
             raise self.Interrupted
+        self.smoke.on_omp = capture_omp
 
         model = CONFIG["model"].split("/", 1)[1]
         with (patch("runner.tempfile.TemporaryDirectory", self.temporary_directory),
@@ -610,8 +596,8 @@ class CommandInitializationTests(unittest.TestCase):
               patch("runner.github_token", return_value="disposable-token"),
               patch("runner.github", side_effect=read_github),
               patch("runner.urllib.request.urlopen", return_value=StringIO(json.dumps({"data": [{"id": model}]}))),
-              patch("runner.subprocess.run", side_effect=run),
-              patch("runner.subprocess.Popen", side_effect=popen),
+              patch("runner.subprocess.run", side_effect=self.smoke.run),
+              patch("runner.subprocess.Popen", side_effect=self.smoke.popen),
               patch("runner.os.killpg")):
             if agent:
                 PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
@@ -635,6 +621,27 @@ class CommandInitializationTests(unittest.TestCase):
         self.assertEqual(observed["context"]["command_resume"]["status"], status)
         self.assertIn("reporting-only", observed["prompt"])
         self.assertIn(self.job["prompt"], observed["prompt"])
+
+    def test_smoke_helper_keeps_git_real_and_captures_omp(self) -> None:
+        (self.upstream / "smoke.txt").write_text("real checkout content\n")
+        self.git(["git", "add", "smoke.txt"])
+        self.git(["git", "-c", "user.name=test", "-c", "user.email=test@example.com",
+                  "commit", "-m", "smoke content"])
+        self.head = self.git(["git", "rev-parse", "HEAD"]).stdout.strip()
+        self.git(["git", "update-ref", "refs/pull/142/head", self.head])
+
+        def inspect_checkout(cwd):
+            self.assertEqual((cwd / "smoke.txt").read_text(), "real checkout content\n")
+            self.assertEqual(self.git(["git", "show", "HEAD:smoke.txt"], cwd=cwd).stdout,
+                             "real checkout content\n")
+            raise self.Interrupted
+
+        with self.assertRaises(self.Interrupted):
+            self.launch(inspect_checkout)
+        launch, = self.smoke.launches
+        self.assertEqual(launch["argv"][0], "omp")
+        self.assertNotEqual(launch["cwd"], self.upstream)
+        self.assertEqual(launch["env"]["CLI_PROXY_API_KEY"], "disposable-proxy-key")
 
     def test_preemption_after_start_claim_allows_command_preparation_on_redelivery(self) -> None:
         self.interrupt_after_start = True
