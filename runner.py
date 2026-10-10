@@ -52,7 +52,9 @@ def team_config(config: dict[str, Any], environment: str) -> dict[str, Any]:
     return team
 
 
-TEAM = team_config(CONFIG, os.environ.get("MODAL_ENVIRONMENT", "main"))
+if not os.environ.get("MODAL_ENVIRONMENT"):
+    raise ValueError("Set MODAL_ENVIRONMENT explicitly before importing runner")
+TEAM = team_config(CONFIG, os.environ["MODAL_ENVIRONMENT"])
 WORKER_SECRET = modal.Secret.from_name(
     TEAM["worker_secret"], environment_name=TEAM["modal_environment"],
     required_keys=["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN"],
@@ -124,10 +126,9 @@ IMAGE = with_runner_files(modal.Image.from_registry(
 ).pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1").dockerfile_commands("USER node"))
 
 def image_settings() -> dict[str, Any]:
-    """Read the team's baked settings before adding this job's model roles."""
-    if modal.is_local():
-        return CONFIG["omp_settings"]
-    return json.loads(Path("/opt/autokas/settings.json").read_text())
+    """Overlay runtime settings on team defaults, then let callers set job model roles."""
+    defaults = {} if modal.is_local() else json.loads(Path("/opt/autokas/settings.json").read_text())
+    return defaults | CONFIG["omp_settings"]
 
 
 def image_skills() -> Path:
@@ -1554,7 +1555,7 @@ def docs_worker(
         return
     branch = f'{CONFIG["docs_update"]["branch_prefix"]}{number}-{job["source_sha"][:12]}'
     run(["gh", "auth", "setup-git"], root)
-    worktree = root / "repo" if modal.is_local() else Path("/workspace/repo")
+    worktree = root / "repo"
     run(["git", "clone", "--no-checkout", f"https://github.com/{repo}.git", str(worktree)], root)
     run(["git", "fetch", "origin", base_branch, job["source_sha"]], worktree)
     base_head = run(["git", "rev-parse", f"origin/{base_branch}"], worktree)
@@ -2319,8 +2320,8 @@ def linear_planner(job: dict[str, Any], checkout: bytes, proxy_key: str,
     deadline = time.monotonic() + linear_intake.remaining_timeout(expires_at)
     with tempfile.TemporaryDirectory(prefix="linear-plan-", dir=None if modal.is_local() else "/state") as directory:
         root = Path(directory)
-        worktree = root / "repo" if modal.is_local() else Path("/workspace/repo")
-        worktree.mkdir(exist_ok=True)
+        worktree = root / "repo"
+        worktree.mkdir()
         with tarfile.open(fileobj=io.BytesIO(checkout)) as archive:
             archive.extractall(worktree, filter="data")
         home = root / "home"
@@ -2493,7 +2494,7 @@ class PRWorker:
                                 if job.get("bypass_depth") else finding_prompt(reviewer, comment.get("body") or ""))
                             != job.get("review_prompt", job["prompt"])):
                         raise RuntimeError("comment changed or PR relationship is invalid")
-                worktree = root / "repo" if modal.is_local() else Path("/workspace/repo")
+                worktree = root / "repo"
                 if command_resume is not None:
                     worktree.mkdir(exist_ok=True)
                     head, branch = command_resume.get("starting_head", ""), command_resume.get("branch", "")

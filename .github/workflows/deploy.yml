@@ -21,6 +21,8 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: test
+        env:
+          MODAL_ENVIRONMENT: main
         run: |
           cp config.example.json config.json
           python -m unittest discover -v
