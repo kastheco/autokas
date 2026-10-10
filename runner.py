@@ -112,6 +112,7 @@ if _CONFIG_DIRECTORY is not None:
 
 def with_runner_files(image: modal.Image) -> modal.Image:
     """Mount runtime sources separately from the team's immutable settings and skills."""
+    image = image.env({"MODAL_ENVIRONMENT": TEAM["modal_environment"]})
     image = image.add_local_file(CONFIG_SOURCE, "/opt/autokas/runner/config.json")
     for name in ("runner.py", "consult.py", "linear_intake.py", "kas-voice-profile.md"):
         image = image.add_local_file(ROOT / name, f"/opt/autokas/runner/{name}")
