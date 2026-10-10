@@ -16,19 +16,22 @@ api=${api%/api}/api
 state=${PR_WATCH_STATE_FILE:-/paperclip/pr-watch/state.json}
 target=${PR_WATCH_ISSUE_ID:-b123e711-14ac-4a4a-9b4a-024d31ea8f5f}
 gh=${PR_WATCH_GH:-/usr/local/bin/gh}
-mkdir -p "$(dirname "$state")"
-# One writer, including manually triggered runs. Lock the stable path, not the
-# state inode, since successful snapshots replace that inode atomically.
-exec 9>"$state.lock"
-flock -n 9 || exit 0
-work=$(mktemp -d "${PAPERCLIP_RUN_SCRATCH_DIR:-${TMPDIR:-/tmp}}/pr-watch.XXXXXX")
-trap 'rm -rf "$work"' EXIT
 request() {
   curl --fail-with-body --silent --show-error \
     -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
     -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
     -H 'Content-Type: application/json' "$@"
 }
+mkdir -p "$(dirname "$state")"
+# One writer, including manually triggered runs. Lock the stable path, not the
+# state inode, since successful snapshots replace that inode atomically.
+exec 9>"$state.lock"
+if ! flock -n 9; then
+  request -X PATCH --data '{"status":"done"}' "$api/issues/$PAPERCLIP_TASK_ID" >/dev/null
+  exit 0
+fi
+work=$(mktemp -d "${PAPERCLIP_RUN_SCRATCH_DIR:-${TMPDIR:-/tmp}}/pr-watch.XXXXXX")
+trap 'rm -rf "$work"' EXIT
 if [[ -f $state ]]; then
   jq -e '(.version == 1) and (.prs | type == "object")' "$state" >/dev/null
   cp "$state" "$work/old.json"
@@ -148,3 +151,4 @@ fi
 # Use the same filesystem as the state for atomic publication.
 jq 'del(.events)' "$work/result.json" >"$state.next"
 mv "$state.next" "$state"
+request -X PATCH --data '{"status":"done"}' "$api/issues/$PAPERCLIP_TASK_ID" >/dev/null
