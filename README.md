@@ -155,7 +155,7 @@ npm run login:claude
 
 ## pinned job images
 
-`images/base/Dockerfile` builds the public linux-x64 base from the node, bun and omp pins in `config.example.json`. `.github/workflows/images.yml` builds and smoke-checks clean tracked sources on pushes and PRs. an authorized manual dispatch publishes the smoke-tested image and records its registry digest, versions, source hashes and smoke output. the first package publication needs its owner to set the base package public in GitHub package settings. the release job checks anonymous digest access before accepting public release evidence.
+`images/base/Dockerfile` builds the public linux-x64 base from the node, bun and omp pins in `config.example.json`. `.github/workflows/images.yml` builds and smoke-checks clean tracked sources on pushes and PRs. pushes to `main` and authorized manual dispatches publish the smoke-tested image and record its registry digest, versions, source hashes and smoke output. branch pushes and PRs never publish. the first package publication needs its owner to set the base package public in GitHub package settings. the release job checks anonymous digest access before accepting public release evidence.
 
 coding workers pull one private team image by digest. private `config.json` supplies `teams`, with each entry containing `image`, `modal_environment`, `pull_secret` and `worker_secret`. exactly one entry must match `MODAL_ENVIRONMENT`, which defaults to `main`. the example entry is only a shape for tests and must be replaced in `AUTOKAS_CONFIG_JSON` before deployment. the private-config overlay includes `teams` and leaves the existing validation and 0600 host file mode unchanged.
 
