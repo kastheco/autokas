@@ -167,18 +167,6 @@ npm run login:codex
 npm run login:claude
 ```
 
-## pinned job images
-
-`images/base/Dockerfile` builds the public linux-x64 base from the node, bun and omp pins in `config.example.json`. `.github/workflows/images.yml` builds and smoke-checks clean tracked sources on pushes and PRs. pushes to `main` and authorized manual dispatches publish the smoke-tested image and record its registry digest, versions, source hashes and smoke output. branch pushes and PRs never publish. the first package publication needs its owner to set the base package public in GitHub package settings. the release job checks anonymous digest access before accepting public release evidence.
-
-the base-only PR merges before the runner cutover. after its `main` image run publishes, commit the real base reference in the private image repository's `kas/base-image.txt`. merge the private image PR only after its clean build and smoke pass. then save the private registry digest in `AUTOKAS_CONFIG_JSON.teams`, provision the pull secret and merge the top runner PR. the base-only PR leaves runner code and deployment configuration unchanged.
-
-coding workers pull one private team image by digest. private `config.json` supplies `teams`, with each entry containing `image`, `modal_environment`, `pull_secret` and `worker_secret`. exactly one entry must match `MODAL_ENVIRONMENT`, which defaults to `main`. the example entry is only a shape for tests and must be replaced in `AUTOKAS_CONFIG_JSON` before deployment. the private-config overlay includes `teams` and leaves the existing validation and 0600 host file mode unchanged.
-
-the approved Modal environment needs an `autokas-ghcr-pull` secret with `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, using a credential with read-only access to the private package. registry credentials authenticate the image pull and are not passed to the coding process. existing worker secret names stay unchanged. configure the actual private digest and pull secret before merging the runner cutover, since pushes to `main` deploy automatically.
-
-team images supply `/opt/autokas/settings.json` and `/opt/autokas/skills`. workers read those baked sources before adding their per-job model roles. deployed clones use `/workspace/repo` and temporary job state uses `/state`. private settings and skill sources are not overlaid from this public checkout. the host agent-container switch is separate from this change.
-
 ## deploy
 
 pushes to `main` run [`deploy.yml`](.github/workflows/deploy.yml). it runs the tests against `config.example.json`, builds the real config from the `AUTOKAS_CONFIG_JSON` Actions secret, sets `MODAL_ENVIRONMENT=main` and runs `deploy.py`. its output goes to private runner files, so public logs show only exit statuses. `deploy.py` saves the reconcile window, drains running work, redeploys with `modal deploy --strategy recreate runner.py`, checks that an unsigned request gets `401` and a redelivered App event gets `200` or `202` with the expected revision, then reconstructs eligible comments, reviews and merged-PR events on every installed repo.
