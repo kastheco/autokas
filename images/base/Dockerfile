@@ -6,7 +6,7 @@ ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64 && test -n "$BUN_VERSION" && test -n "$OMP_VERSION" \
     && apt-get update \
     && apt-get install -y --no-install-recommends git gh curl unzip ca-certificates build-essential python3 \
-    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt \
     && curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" -o /tmp/bun.zip \
     && unzip /tmp/bun.zip -d /tmp \
     && install /tmp/bun-linux-x64/bun /usr/local/bin/bun \

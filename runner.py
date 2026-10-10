@@ -120,10 +120,10 @@ def with_runner_files(image: modal.Image) -> modal.Image:
 
 BASE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi==0.135.1")
 IMAGE = with_runner_files(modal.Image.from_registry(
-    TEAM["image"], add_python="3.12",
+    TEAM["image"], add_python="3.12", setup_dockerfile_commands=["USER root"],
     secret=modal.Secret.from_name(TEAM["pull_secret"], environment_name=TEAM["modal_environment"],
                                   required_keys=["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]),
-).pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1"))
+).pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1").dockerfile_commands("USER node"))
 
 def image_settings() -> dict[str, Any]:
     """Read the team's baked settings before adding this job's model roles."""
