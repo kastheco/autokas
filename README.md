@@ -162,8 +162,11 @@ repository reconciliation does not reconstruct `opened`, `ready_for_review` or `
 ## test
 
 ```sh
-python -m unittest discover -v
+bash scripts/setup-test-env.sh
+.venv/bin/python -m unittest discover -v
 ```
+
+the setup script needs Python 3 with venv support. it installs test dependencies without `uv` or credentials and leaves an existing `config.json` untouched. rerunning it skips installation when `requirements.txt` hasn't changed.
 
 covers intake and identity boundaries, review state and prompt selection, PR-Agent reviews, checks and the fix loop, installation token isolation, clean-review acknowledgments, deploy reconciliation and docs follow-up merge safety, all without external calls.
 
