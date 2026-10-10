@@ -195,6 +195,17 @@ railway ssh --project "$RAILWAY_PROJECT_ID" \
 
 add and verify a replacement account before changing the default. select its native proxy model in `omp_models`, update `model` and the native `modelRoles`, then push the change to `main` for the deployment workflow. there is no automatic provider fallback. unsupported proxy/omp combinations are blockers, not permission to add an auth service. prove a second account handled the request using native account-attributed evidence. success through an old account is insufficient. rotate the proxy access key only with approval, update its Modal secret and manually dispatch the deployment workflow.
 
+## local test setup
+
+before the first check in a checkout, run:
+
+```sh
+bash scripts/setup-test-env.sh
+.venv/bin/python -m unittest test_runner -v
+```
+
+the script uses Python 3's stdlib venv and installs `requirements.txt` into `.venv`. it needs no `uv`, Modal tokens or GitHub tokens. it copies the example config only when `config.json` is absent and skips installation on repeat runs with unchanged requirements. use `.venv/bin/python` for the scoped test commands below, or `.venv/bin/python -m unittest discover -v` for full discovery. deployment setup still uses the `uv` steps above.
+
 ## one live verification path
 
 1. select an approved repository and an open PR with an authorized publication scope. ensure the App is installed on it and the App webhook is active. core business-logic changes require real Jarvis consultation; only a business-intent mismatch needs explicit owner approval.
