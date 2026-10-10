@@ -1,0 +1,6 @@
+{
+  "retry": {
+    "enabled": false,
+    "modelFallback": false
+  }
+}
