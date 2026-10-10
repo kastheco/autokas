@@ -27,22 +27,38 @@ import linear_intake
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent if modal.is_local() else Path("/opt/autokas/runner")
 CONFIG = json.loads((ROOT / "config.json").read_text())
 # Hash the actual deployed sources, including uncommitted edits, not just Git HEAD.
 REVISION = hashlib.sha256(b"".join(
-    path.relative_to(ROOT).as_posix().encode() + b"\0" + path.read_bytes() + b"\0"
+    (path.relative_to(ROOT) if path.is_relative_to(ROOT) else path.relative_to("/opt/autokas")).as_posix().encode() + b"\0" + path.read_bytes() + b"\0"
     for path in [
         ROOT / "runner.py", ROOT / "linear_intake.py", ROOT / "config.json", ROOT / "consult.py", ROOT / "kas-voice-profile.md",
-        *sorted(path for path in (ROOT / "skills").rglob("*") if path.is_file()),
+        *sorted(path for path in ((ROOT / "skills") if modal.is_local() else Path("/opt/autokas/skills")).rglob("*") if path.is_file()),
     ]
 )).hexdigest()
 app = modal.App(CONFIG["app"])
 CLAIMS = modal.Dict.from_name(f'{CONFIG["app"]}-comments', create_if_missing=True)
 LINEAR_OAUTH_VOLUME = modal.Volume.from_name(f'{CONFIG["app"]}-linear-oauth', create_if_missing=True)
 WEBHOOK_SECRET = modal.Secret.from_name("omp-runner-webhook", required_keys=["GITHUB_WEBHOOK_SECRET"])
+def team_config(config: dict[str, Any], environment: str) -> dict[str, Any]:
+    """Select exactly one team for this Modal environment and require an immutable image."""
+    matches = [entry for entry in config.get("teams", {}).values()
+               if entry.get("modal_environment") == environment]
+    if len(matches) != 1:
+        raise ValueError("Configure exactly one team for the current Modal environment")
+    team = matches[0]
+    if not re.fullmatch(r"ghcr\.io/kastheco/autokas-teams/[a-z0-9-]+@sha256:[0-9a-f]{64}", team.get("image", "")):
+        raise ValueError("Team image must be a ghcr.io/kastheco/autokas-teams digest")
+    if team.get("pull_secret") != "autokas-ghcr-pull" or not team.get("worker_secret"):
+        raise ValueError("Team pull and worker secret names are required")
+    return team
+
+
+TEAM = team_config(CONFIG, os.environ.get("MODAL_ENVIRONMENT", "main"))
 WORKER_SECRET = modal.Secret.from_name(
-    "omp-runner-worker", required_keys=["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN"]
+    TEAM["worker_secret"], environment_name=TEAM["modal_environment"],
+    required_keys=["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN"],
 )
 LINEAR_SECRET = linear_intake.LINEAR_SECRET
 
@@ -84,30 +100,42 @@ def github_token(repo: str) -> str:
     return token
 
 
+# Modal preserves source file modes but mounts files as root. Keep config.json
+# at 0600 on the deploy host, staging the runtime copy inside a private directory.
+_CONFIG_DIRECTORY = tempfile.TemporaryDirectory(prefix="autokas-config-") if modal.is_local() else None
+CONFIG_SOURCE = ROOT / "config.json"
+if _CONFIG_DIRECTORY is not None:
+    CONFIG_SOURCE = Path(_CONFIG_DIRECTORY.name) / "config.json"
+    CONFIG_SOURCE.write_text(json.dumps(CONFIG))
+    CONFIG_SOURCE.chmod(0o644)
+
+
 def with_runner_files(image: modal.Image) -> modal.Image:
-    """Mount every file runner.py reads or hashes at import."""
-    return (
-        image.add_local_file(ROOT / "config.json", "/root/config.json")
-        .add_local_file(ROOT / "consult.py", "/root/consult.py")
-        .add_local_file(ROOT / "linear_intake.py", "/root/linear_intake.py")
-        .add_local_file(ROOT / "kas-voice-profile.md", "/root/kas-voice-profile.md")
-        .add_local_dir(ROOT / "skills", "/root/skills")
-    )
+    """Mount runtime sources separately from the team's immutable settings and skills."""
+    image = image.add_local_file(CONFIG_SOURCE, "/opt/autokas/runner/config.json")
+    for name in ("runner.py", "consult.py", "linear_intake.py", "kas-voice-profile.md"):
+        image = image.add_local_file(ROOT / name, f"/opt/autokas/runner/{name}")
+    return image
 
 
 BASE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi==0.135.1")
-IMAGE = with_runner_files(
-    modal.Image.from_registry("node:22.22.0-bookworm-slim", add_python="3.12")
-    .pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1")
-    .apt_install("git", "gh", "curl", "unzip", "ca-certificates", "build-essential")
-    .run_commands(
-        f"curl -fsSL https://github.com/oven-sh/bun/releases/download/bun-v{CONFIG['bun_version']}/bun-linux-x64.zip -o /tmp/bun.zip",
-        "unzip /tmp/bun.zip -d /tmp && install /tmp/bun-linux-x64/bun /usr/local/bin/bun && rm -rf /tmp/bun.zip /tmp/bun-linux-x64",
-        f"BUN_INSTALL=/opt/bun bun install --global @oh-my-pi/pi-coding-agent@{CONFIG['omp_version']}",
-        "npm install --global corepack && corepack enable",
-    )
-    .env({"PATH": "/opt/bun/bin:/usr/local/bin:/usr/bin:/bin", "BUN_INSTALL": "/opt/bun"})
-)
+IMAGE = with_runner_files(modal.Image.from_registry(
+    TEAM["image"], add_python="3.12",
+    secret=modal.Secret.from_name(TEAM["pull_secret"], environment_name=TEAM["modal_environment"],
+                                  required_keys=["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]),
+).pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1"))
+
+def image_settings() -> dict[str, Any]:
+    """Read the team's baked settings before adding this job's model roles."""
+    if modal.is_local():
+        return CONFIG["omp_settings"]
+    return json.loads(Path("/opt/autokas/settings.json").read_text())
+
+
+def image_skills() -> Path:
+    """Use local sources only for local execution, never overlay a deployed team image."""
+    return ROOT / "skills" if modal.is_local() else Path("/opt/autokas/skills")
+
 # PR-Agent brings its own fastapi and PyJWT; keep it out of the omp coding image.
 PR_AGENT_IMAGE = with_runner_files(
     modal.Image.debian_slim(python_version="3.12").apt_install("git")
@@ -156,7 +184,7 @@ does not block technical fixes. The consultation and business-intent override
 rules below apply only when advisor_available is true.
 Jarvis's role is business decisions and business logic only. Consult real Jarvis
 before changing core business rules or intended business behavior, using your bash
-tool: python /root/consult.py --request-id <fresh UUID>. A purely technical, safety
+tool: python /opt/autokas/runner/consult.py --request-id <fresh UUID>. A purely technical, safety
 or security fix that preserves those rules and intentions needs no Jarvis
 consultation, even in account-creation or other sensitive-domain code. For a mixed
 change, consult only about its business-decision or business-rule changes.
@@ -1528,7 +1556,7 @@ def docs_worker(
         return
     branch = f'{CONFIG["docs_update"]["branch_prefix"]}{number}-{job["source_sha"][:12]}'
     run(["gh", "auth", "setup-git"], root)
-    worktree = root / "repo"
+    worktree = root / "repo" if modal.is_local() else Path("/workspace/repo")
     run(["git", "clone", "--no-checkout", f"https://github.com/{repo}.git", str(worktree)], root)
     run(["git", "fetch", "origin", base_branch, job["source_sha"]], worktree)
     base_head = run(["git", "rev-parse", f"origin/{base_branch}"], worktree)
@@ -2291,19 +2319,19 @@ def linear_planner(job: dict[str, Any], checkout: bytes, proxy_key: str,
                    expires_at: float) -> tuple[int, str]:
     """Run outside the credential worker's filesystem and process namespace."""
     deadline = time.monotonic() + linear_intake.remaining_timeout(expires_at)
-    with tempfile.TemporaryDirectory(prefix="linear-plan-") as directory:
+    with tempfile.TemporaryDirectory(prefix="linear-plan-", dir=None if modal.is_local() else "/state") as directory:
         root = Path(directory)
-        worktree = root / "repo"
-        worktree.mkdir()
+        worktree = root / "repo" if modal.is_local() else Path("/workspace/repo")
+        worktree.mkdir(exist_ok=True)
         with tarfile.open(fileobj=io.BytesIO(checkout)) as archive:
             archive.extractall(worktree, filter="data")
         home = root / "home"
         agent = home / ".omp" / "agent"
         agent.mkdir(parents=True)
-        (agent / "skills").symlink_to(ROOT / "skills", target_is_directory=True)
+        (agent / "skills").symlink_to(image_skills(), target_is_directory=True)
         (agent / "models.yml").write_text(json.dumps(CONFIG["omp_models"]))
         settings = agent / "config.yml"
-        settings.write_text(json.dumps(CONFIG["omp_settings"] | {
+        settings.write_text(json.dumps(image_settings() | {
             "modelRoles": dict.fromkeys(("default", "smol", "slow", "plan"), CONFIG["model"]),
         }))
         policy = root / "policy.txt"
@@ -2399,16 +2427,16 @@ class PRWorker:
         execution = CONFIG["docs_update"] if job.get("mode") == "docs_update" else CONFIG
         log("started", repo=job["repo"], pr=job["pr"], comment=job.get("comment"),
             model=execution["model"], thinking=execution["thinking"], service_tier=execution["service_tier"])
-        with tempfile.TemporaryDirectory(prefix="omp-job-") as directory:
+        with tempfile.TemporaryDirectory(prefix="autokas-job-", dir=None if modal.is_local() else "/state") as directory:
             try:
                 root = Path(directory)
                 home = root / "home"
                 agent = home / ".omp" / "agent"
                 agent.mkdir(parents=True)
-                (agent / "skills").symlink_to(ROOT / "skills", target_is_directory=True)
+                (agent / "skills").symlink_to(image_skills(), target_is_directory=True)
                 (agent / "models.yml").write_text(json.dumps(CONFIG["omp_models"]))
                 settings = agent / "config.yml"
-                settings.write_text(json.dumps(CONFIG["omp_settings"] | {
+                settings.write_text(json.dumps(image_settings() | {
                     "modelRoles": dict.fromkeys(("default", "smol", "slow", "plan"), execution["model"]),
                 }))
                 env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL", "CLI_PROXY_API_KEY")}
@@ -2467,9 +2495,9 @@ class PRWorker:
                                 if job.get("bypass_depth") else finding_prompt(reviewer, comment.get("body") or ""))
                             != job.get("review_prompt", job["prompt"])):
                         raise RuntimeError("comment changed or PR relationship is invalid")
-                worktree = root / "repo"
+                worktree = root / "repo" if modal.is_local() else Path("/workspace/repo")
                 if command_resume is not None:
-                    worktree.mkdir()
+                    worktree.mkdir(exist_ok=True)
                     head, branch = command_resume.get("starting_head", ""), command_resume.get("branch", "")
                 elif job.get("target") == "issue":
                     run(["git", "clone", f"https://github.com/{repo}.git", str(worktree)])

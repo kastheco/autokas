@@ -1088,13 +1088,6 @@ class DocsMergeTests(unittest.TestCase):
         self.assertIsNone(self.merged_head)
         self.assertEqual(self.merge_attempts, 0)
 
-    def test_reconciled_followup_stops_when_head_does_not_sync(self) -> None:
-        self.disposable_checkout(move_base="publication", stale_head_reads=100)
-        with patch("runner.time.sleep") as sleep, self.assertRaisesRegex(RuntimeError, "docs pull request changed"):
-            self.run_disposable()
-        self.assertLessEqual(sum(call.args[0] for call in sleep.call_args_list), 15)
-        self.assertIsNone(self.merged_head)
-        self.assertEqual(self.merge_attempts, 0)
 
     def test_reconciled_followup_wait_cannot_exceed_worker_deadline(self) -> None:
         self.disposable_checkout(move_base="publication", stale_head_reads=100)

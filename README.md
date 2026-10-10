@@ -153,6 +153,16 @@ npm run login:codex
 npm run login:claude
 ```
 
+## pinned job images
+
+`images/base/Dockerfile` builds the public linux-x64 base from the node, bun and omp pins in `config.example.json`. `.github/workflows/images.yml` builds and smoke-checks clean tracked sources on pushes and PRs. an authorized manual dispatch publishes the smoke-tested image and records its registry digest, versions, source hashes and smoke output. the first package publication needs its owner to set the base package public in GitHub package settings. the release job checks anonymous digest access before accepting public release evidence.
+
+coding workers pull one private team image by digest. private `config.json` supplies `teams`, with each entry containing `image`, `modal_environment`, `pull_secret` and `worker_secret`. exactly one entry must match `MODAL_ENVIRONMENT`, which defaults to `main`. the example entry is only a shape for tests and must be replaced in `AUTOKAS_CONFIG_JSON` before deployment. the private-config overlay includes `teams` and leaves the existing validation and 0600 host file mode unchanged.
+
+the approved Modal environment needs an `autokas-ghcr-pull` secret with `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, using a credential with read-only access to the private package. registry credentials authenticate the image pull and are not passed to the coding process. existing worker secret names stay unchanged. configure the actual private digest and pull secret before merging the runner cutover, since pushes to `main` deploy automatically.
+
+team images supply `/opt/autokas/settings.json` and `/opt/autokas/skills`. workers read those baked sources before adding their per-job model roles. deployed clones use `/workspace/repo` and temporary job state uses `/state`. private settings and skill sources are not overlaid from this public checkout. the host agent-container switch is separate from this change.
+
 ## deploy
 
 pushes to `main` run `.github/workflows/deploy.yml`, which runs the tests against `config.example.json`, materializes your real config from the `AUTOKAS_CONFIG_JSON` Actions secret, and then runs `deploy.py`. its output is written to private runner files, so public logs show only exit statuses. it saves the reconcile window, drains running work, redeploys with `modal deploy --strategy recreate runner.py`, checks that an unsigned request returns `401` and that a redelivered App event returns `200` or `202` with the expected source revision, then reconstructs eligible comments, reviews and merged-PR events on every installed repo. App webhooks can't be paused through the API, so reconciliation recovers those eligible event types during the cutover; actual PR-ready and push deliveries require App redelivery. rollback is a revert on `main`.
