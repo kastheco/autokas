@@ -35,7 +35,7 @@ jobs:
           from urllib.parse import urlparse
           # Public settings, including version pins, come from the tracked config. The secret
           # supplies only private values, so a version bump never needs a secret change.
-          PRIVATE_KEYS = ("docs_update", "jarvis_owner", "jarvis_url", "omp_models", "owner_approvals", "linear")
+          PRIVATE_KEYS = ("docs_update", "jarvis_owner", "jarvis_url", "omp_models", "owner_approvals", "linear", "teams")
           try:
               private = json.loads(os.environ["AUTOKAS_CONFIG_JSON"])
               with open("config.example.json") as f:

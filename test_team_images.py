@@ -1,28 +1,35 @@
-"""Image evidence checks independent of the Modal runner."""
+"""Environment isolation and immutable team image selection."""
 
-import tempfile
-from pathlib import Path
+import copy
 import unittest
+from runner import CONFIG, team_config
 
-from images.smoke import tree_hash
 
+class TeamImageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = copy.deepcopy(CONFIG)
+        self.config["teams"] = {
+            "first": {"image": "ghcr.io/kastheco/autokas-teams/first@sha256:" + "a" * 64,
+                      "modal_environment": "first-env", "pull_secret": "autokas-ghcr-pull",
+                      "worker_secret": "autokas-worker"},
+            "second": {"image": "ghcr.io/kastheco/autokas-teams/second@sha256:" + "b" * 64,
+                       "modal_environment": "second-env", "pull_secret": "autokas-ghcr-pull",
+                       "worker_secret": "autokas-worker"},
+        }
 
-class SkillEvidenceTests(unittest.TestCase):
-    def test_hash_tracks_skill_names_and_contents(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            skill = root / "SKILL.md"
-            skill.write_text("first skill")
-            original = tree_hash(root)
-            skill.write_text("changed skill")
-            self.assertNotEqual(original, tree_hash(root))
-            skill.write_text("first skill")
-            skill.rename(root / "OTHER.md")
-            self.assertNotEqual(original, tree_hash(root))
+    def test_environment_never_selects_another_teams_image(self) -> None:
+        self.assertEqual(team_config(self.config, "second-env")["image"],
+                         "ghcr.io/kastheco/autokas-teams/second@sha256:" + "b" * 64)
+        with self.assertRaisesRegex(ValueError, "exactly one team"):
+            team_config(self.config, "unknown")
+        self.config["teams"]["first"]["modal_environment"] = "second-env"
+        with self.assertRaisesRegex(ValueError, "exactly one team"):
+            team_config(self.config, "second-env")
 
-    def test_symlink_cannot_hide_external_skill_content(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "SKILL.md").symlink_to("/etc/passwd")
-            with self.assertRaisesRegex(RuntimeError, "skill symlink"):
-                tree_hash(root)
+    def test_mutable_tag_and_other_registry_are_rejected(self) -> None:
+        for image in ("ghcr.io/kastheco/autokas-teams/first:latest",
+                      "ghcr.io/another/team@sha256:" + "a" * 64):
+            with self.subTest(image=image):
+                self.config["teams"]["first"]["image"] = image
+                with self.assertRaisesRegex(ValueError, "digest"):
+                    team_config(self.config, "first-env")

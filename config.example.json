@@ -1,6 +1,14 @@
 {
   "app": "omp-runner",
   "allowed_owners": [],
+  "teams": {
+    "example": {
+      "image": "ghcr.io/kastheco/autokas-teams/example@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "modal_environment": "main",
+      "pull_secret": "autokas-ghcr-pull",
+      "worker_secret": "omp-runner-worker"
+    }
+  },
   "linear": {
     "repo_map": {
       "projects": {},
@@ -46,6 +54,7 @@
     "max_fix_rounds": 3
   },
   "timeout_seconds": 3600,
+  "node_version": "22.22.0",
   "omp_version": "18.4.10",
   "bun_version": "1.4.2",
   "model": "railway-codex/gpt-6.1-sol",

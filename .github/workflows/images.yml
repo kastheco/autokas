@@ -22,8 +22,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    outputs:
-      artifact_id: ${{ steps.artifact.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -86,13 +84,12 @@ jobs:
           PY
           docker save autokas-base:smoke -o evidence/image.tar
       - uses: actions/upload-artifact@v4
-        id: artifact
         with:
-          name: public-base-build-${{ github.run_id }}-${{ github.run_attempt }}
+          name: public-base-build-${{ github.run_id }}
           path: evidence/
           retention-days: 7
   publish:
-    if: github.repository == 'kastheco/autokas' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'kastheco/autokas'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -102,8 +99,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.build.outputs.artifact_id }}
-          merge-multiple: true
+          name: public-base-build-${{ github.run_id }}
           path: evidence
       - uses: docker/login-action@v3
         with:
@@ -126,11 +122,6 @@ jobs:
           import json, os, pathlib, urllib.parse, urllib.request
           image = os.environ['IMAGE']
           digest = next(value.removeprefix(image + '@') for value in json.loads(pathlib.Path('evidence/digests.json').read_text()) if value.startswith(image + '@'))
-          path = pathlib.Path('evidence/manifest.json')
-          manifest = json.loads(path.read_text())
-          manifest.update(registry_digest=digest, image_ref=image + '@' + digest,
-                          tag=os.environ['IMAGE_TAG'], public=False)
-          path.write_text(json.dumps(manifest, indent=2) + '\n')
           # Anonymous token and manifest fetch prove public visibility. GHCR packages
           # start private; an owner must make the package public in package settings.
           query = urllib.parse.urlencode({'service': 'ghcr.io', 'scope': 'repository:kastheco/autokas-base:pull'})
@@ -143,11 +134,13 @@ jobs:
               if response.headers.get('Docker-Content-Digest') != digest:
                   raise SystemExit('anonymous registry digest does not match publication')
               response.read()
-          manifest['public'] = True
+          path = pathlib.Path('evidence/manifest.json')
+          manifest = json.loads(path.read_text())
+          manifest.update(registry_digest=digest, image_ref=image + '@' + digest,
+                          tag=os.environ['IMAGE_TAG'], public=True)
           path.write_text(json.dumps(manifest, indent=2) + '\n')
           PY
       - name: upload public digest, pins, hashes and smoke evidence
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: public-base-release-${{ github.run_id }}-${{ github.run_attempt }}
