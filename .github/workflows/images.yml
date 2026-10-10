@@ -1,0 +1,153 @@
+name: public base image
+on:
+  pull_request:
+    paths:
+      - images/base/**
+      - images/smoke.py
+      - config.example.json
+      - .github/workflows/images.yml
+  push:
+    paths:
+      - images/base/**
+      - images/smoke.py
+      - config.example.json
+      - .github/workflows/images.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: public-base-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: clean tracked build context and pins
+        id: pins
+        run: |
+          mkdir -p "$RUNNER_TEMP/base-context" evidence
+          git archive HEAD images/base/Dockerfile images/base/settings.json images/smoke.py | tar -x -C "$RUNNER_TEMP/base-context"
+          python - <<'PY'
+          import hashlib, json, os, pathlib, re
+          config = json.loads(pathlib.Path('config.example.json').read_text())
+          pins = {name: config[name] for name in ('node_version', 'bun_version', 'omp_version')}
+          for name, value in pins.items():
+              if not isinstance(value, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', value):
+                  raise SystemExit(f'invalid {name}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for name, value in pins.items():
+                  print(f'{name}={value}', file=output)
+          sources = ('images/base/Dockerfile', 'images/base/settings.json', 'images/smoke.py', 'config.example.json', '.github/workflows/images.yml')
+          manifest = {'image': 'ghcr.io/kastheco/autokas-base', 'platform': 'linux/amd64',
+                      'source_revision': os.environ['GITHUB_SHA'], 'pins': pins,
+                      'source_hashes': {name: hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() for name in sources}}
+          pathlib.Path('evidence/manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+      - name: build linux-x64
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/base-context
+          file: ${{ runner.temp }}/base-context/images/base/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: autokas-base:smoke
+          build-args: |
+            NODE_VERSION=${{ steps.pins.outputs.node_version }}
+            BUN_VERSION=${{ steps.pins.outputs.bun_version }}
+            OMP_VERSION=${{ steps.pins.outputs.omp_version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/kastheco/autokas
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: smoke without mounts, network or credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 --network none --cap-drop ALL --security-opt no-new-privileges autokas-base:smoke python3 /opt/autokas/smoke.py | tee evidence/smoke.jsonl
+          python - <<'PY'
+          import json, pathlib
+          report = json.loads(pathlib.Path('evidence/smoke.jsonl').read_text().splitlines()[-1])
+          path = pathlib.Path('evidence/manifest.json')
+          manifest = json.loads(path.read_text())
+          manifest.update({name: report[name] for name in ('settings_sha256', 'skills_sha256')})
+          manifest['smoke'] = report
+          pins, versions = manifest['pins'], report['versions']
+          for tool, pin in (('node', 'node_version'), ('bun', 'bun_version'), ('omp', 'omp_version')):
+              if pins[pin] not in versions[tool].splitlines()[0]:
+                  raise SystemExit(f'{tool} version does not match configured pin')
+          path.write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+          docker save autokas-base:smoke -o evidence/image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-base-build-${{ github.run_id }}
+          path: evidence/
+          retention-days: 7
+  publish:
+    if: github.repository == 'kastheco/autokas' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: public-base-build-${{ github.run_id }}
+          path: evidence
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: publish the smoke-tested image
+        env:
+          IMAGE: ghcr.io/kastheco/autokas-base
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker load -i evidence/image.tar
+          tag="sha-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker tag autokas-base:smoke "$IMAGE:$tag"
+          docker push "$IMAGE:$tag"
+          docker inspect "$IMAGE:$tag" --format '{{json .RepoDigests}}' > evidence/digests.json
+          export IMAGE_TAG="$tag"
+          python - <<'PY'
+          import json, os, pathlib, urllib.parse, urllib.request
+          image = os.environ['IMAGE']
+          digest = next(value.removeprefix(image + '@') for value in json.loads(pathlib.Path('evidence/digests.json').read_text()) if value.startswith(image + '@'))
+          path = pathlib.Path('evidence/manifest.json')
+          manifest = json.loads(path.read_text())
+          manifest.update(registry_digest=digest, image_ref=image + '@' + digest,
+                          tag=os.environ['IMAGE_TAG'], public=False)
+          path.write_text(json.dumps(manifest, indent=2) + '\n')
+          # Anonymous token and manifest fetch prove public visibility. GHCR packages
+          # start private; an owner must make the package public in package settings.
+          query = urllib.parse.urlencode({'service': 'ghcr.io', 'scope': 'repository:kastheco/autokas-base:pull'})
+          with urllib.request.urlopen('https://ghcr.io/token?' + query, timeout=30) as response:
+              token = json.load(response)['token']
+          request = urllib.request.Request('https://ghcr.io/v2/kastheco/autokas-base/manifests/' + digest,
+              headers={'Authorization': 'Bearer ' + token,
+                       'Accept': 'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              if response.headers.get('Docker-Content-Digest') != digest:
+                  raise SystemExit('anonymous registry digest does not match publication')
+              response.read()
+          manifest['public'] = True
+          path.write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+      - name: upload public digest, pins, hashes and smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-base-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence/manifest.json
+            evidence/smoke.jsonl
+          retention-days: 90
