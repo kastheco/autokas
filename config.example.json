@@ -10,7 +10,10 @@
     }
   },
   "linear": {
-    "repo_map": {"projects": {}, "teams": {}},
+    "repo_map": {
+      "projects": {},
+      "teams": {}
+    },
     "confidence_threshold": 0.8
   },
   "docs_update": {
@@ -29,7 +32,12 @@
     "login": "cursor[bot]",
     "id": 206951365
   },
-  "trusted_reviewers": [{"login": "kasthecrew[bot]", "id": 340343662}],
+  "trusted_reviewers": [
+    {
+      "login": "kasthecrew[bot]",
+      "id": 340343662
+    }
+  ],
   "pr_agent": {
     "login": "autokas[bot]",
     "id": 334744567
@@ -118,5 +126,6 @@
     },
     "app_id_env": "GITHUB_APP_ID",
     "private_key_env": "GITHUB_APP_PRIVATE_KEY"
-  }
+  },
+  "node_version": "22.22.0"
 }
