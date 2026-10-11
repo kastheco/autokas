@@ -6,6 +6,7 @@ import json
 import os
 from io import StringIO
 import subprocess
+import sys
 from email.message import Message
 import unittest
 import tempfile
@@ -14,7 +15,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
-from runner import CONFIG, POLICY, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job, upstack
+from runner import CONFIG, POLICY, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job, stop_job_processes, upstack
 from smoke_helper import GitOmpSmoke
 
 def setUpModule():
@@ -1165,6 +1166,56 @@ class DocsMergeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid docs postprocess output path"):
             self.run_disposable()
         self.assertEqual(self.merge_attempts, 0)
+
+
+class JobProcessCleanupTests(unittest.TestCase):
+    WRITER = """import os, pathlib, subprocess, sys, time
+home = pathlib.Path(os.environ["HOME"])
+if sys.argv[1:] == ["write"]:
+    while True:
+        try:
+            (home / ".cache" / "daemon").mkdir(parents=True, exist_ok=True)
+            (home / ".cache" / "daemon" / "state").write_text(str(time.time()))
+        except OSError:
+            pass
+writer = subprocess.Popen([sys.executable, __file__, "write"], start_new_session=True,
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+(home / "writer.pid").write_text(str(writer.pid))
+"""
+
+    @staticmethod
+    def running(pid: int) -> bool:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0]
+        except FileNotFoundError:
+            return False
+        return state not in {"Z", "X"}
+
+    def test_detached_agent_helper_is_stopped_before_the_job_directory_is_removed(self) -> None:
+        bystander = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(bystander.wait)
+        self.addCleanup(bystander.kill)
+        job = tempfile.TemporaryDirectory(prefix="autokas-job-")
+        self.addCleanup(job.cleanup)
+        root = Path(job.name)
+        home = root / "home"
+        home.mkdir()
+        script = root / "agent.py"
+        script.write_text(self.WRITER)
+        env = {"PATH": os.defpath, "HOME": str(home), "AUTOKAS_JOB_ROOT": str(root)}
+        agent = subprocess.Popen([sys.executable, str(script)], cwd=root, env=env, start_new_session=True)
+        agent.wait(timeout=10)
+        writer = int((home / "writer.pid").read_text())
+        self.addCleanup(lambda: self.running(writer) and os.kill(writer, 9))
+        self.assertTrue(self.running(writer))
+
+        stop_job_processes(agent, env)
+
+        self.assertFalse(self.running(writer))
+        self.assertIsNone(bystander.poll())
+        job.cleanup()
+        self.assertFalse(root.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

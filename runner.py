@@ -1619,11 +1619,7 @@ def docs_worker(
         try:
             code = process.wait(timeout=max(1, deadline - time.monotonic()))
         finally:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+            stop_job_processes(process, env)
         final_head = run(["git", "rev-parse", "HEAD"], worktree)
         if code:
             raise RuntimeError(f"docs omp exited with {code}")
@@ -2201,6 +2197,43 @@ def linear_progress(job: dict[str, Any], action: str) -> None:
         log("linear_activity_uncertain", key=job["key"], reason=type(error).__name__)
 
 
+def stop_job_processes(process: subprocess.Popen, env: dict[str, str]) -> None:
+    """Kill omp's process group, then every job process that left it.
+
+    omp's daemon broker, LSP mux and background services detach into their own
+    session, so killpg misses them. A survivor that keeps writing into the job
+    directory makes its removal fail with "Directory not empty" after the job
+    has already finished. Every job process inherits AUTOKAS_JOB_ROOT.
+    """
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+    if "AUTOKAS_JOB_ROOT" not in env:
+        return
+    marker = ("AUTOKAS_JOB_ROOT=" + env["AUTOKAS_JOB_ROOT"]).encode()
+    for _ in range(100):
+        alive = False
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                # A killed process that nobody reaps stays a zombie. It can't write, so it's done.
+                if (entry / "stat").read_text().rpartition(")")[2].split()[0] in {"Z", "X"}:
+                    continue
+                if marker in (entry / "environ").read_bytes().split(b"\0"):
+                    os.kill(int(entry.name), signal.SIGKILL)
+                    alive = True
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+        if not alive:
+            return
+        time.sleep(0.05)
+    raise RuntimeError("job processes survived SIGKILL")
+
+
+
 def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[str, Any],
                prompt: str, deadline: float, *, mark_finishing: bool = True) -> tuple[int, str]:
     """Drive omp JSON-lines RPC and forward session steering until its agent ends."""
@@ -2300,11 +2333,7 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
         # Only successful runs may provide a summary for Linear write-back.
         return code, "" if code else "\n\n".join(messages[-1:])
     finally:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+        stop_job_processes(process, env)
         for reader in readers:
             reader.join(timeout=1)
         for stream in (process.stdout, process.stderr):
@@ -2337,7 +2366,8 @@ def linear_planner(job: dict[str, Any], checkout: bytes, proxy_key: str,
         policy = root / "policy.txt"
         policy.write_text(LINEAR_PLAN_POLICY + "\n" + (ROOT / "kas-voice-profile.md").read_text())
         env = {key: os.environ[key] for key in ("PATH", "BUN_INSTALL")}
-        env.update(HOME=str(home), PI_CODING_AGENT_DIR=str(agent), CI="true", CLI_PROXY_API_KEY=proxy_key)
+        env.update(HOME=str(home), PI_CODING_AGENT_DIR=str(agent), CI="true", CLI_PROXY_API_KEY=proxy_key,
+                   AUTOKAS_JOB_ROOT=str(root))
         args = ["omp", "--mode", "rpc", "--no-session", "--no-title", "--no-prewalk", "--no-extensions", "--no-lsp",
                 "--model", CONFIG["model"], "--thinking", CONFIG["thinking"], "--service-tier", CONFIG["service_tier"],
                 "--config", str(settings), "--tools", "read,grep,glob", "--approval-mode", "yolo",
@@ -2451,6 +2481,7 @@ class PRWorker:
                     env["JARVIS_RUNNER_TOKEN"] = os.environ["JARVIS_RUNNER_TOKEN"]
                     env["JARVIS_CONSULT_URL"] = CONFIG["jarvis_url"]
                 env.update(HOME=str(home), PI_CODING_AGENT_DIR=str(agent), CI="true", GH_PROMPT_DISABLED="1",
+                           AUTOKAS_JOB_ROOT=str(root),
                            GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME=CONFIG["git_author"]["name"],
                            GIT_AUTHOR_EMAIL=CONFIG["git_author"]["email"], GIT_COMMITTER_NAME=CONFIG["git_author"]["name"],
                            GIT_COMMITTER_EMAIL=CONFIG["git_author"]["email"])
@@ -2662,11 +2693,7 @@ class PRWorker:
                     code = process.wait(timeout=max(1, deadline - time.monotonic()))
                 finally:
                     # Stop any child tools too, including after omp exits successfully.
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait()
+                    stop_job_processes(process, env)
                 if command_resume is not None:
                     log("command_reporting_exited", key=job["key"], exit_code=code)
                     if code:
