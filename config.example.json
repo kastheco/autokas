@@ -55,7 +55,7 @@
   },
   "timeout_seconds": 3600,
   "node_version": "22.22.0",
-  "omp_version": "18.4.10",
+  "omp_version": "18.8.9",
   "bun_version": "1.4.2",
   "model": "railway-codex/gpt-6.1-sol",
   "thinking": "high",
