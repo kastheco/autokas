@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import subprocess
 import tarfile
 import time
 import tempfile
@@ -98,6 +99,48 @@ class RunnerRevisionTests(unittest.TestCase):
         for name in ("runner.py", "linear_intake.py", "consult.py", "kas-voice-profile.md"):
             shutil.copyfile(self.checkout / name, self.runtime / name)
         shutil.copyfile(local.CONFIG_SOURCE, self.runtime / "config.json")
+
+    def test_container_startup_imports_mounted_modules_without_checkout(self) -> None:
+        import runner
+
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+        class MountedImage:
+            def env(self, values):
+                environment.update(values)
+                return self
+
+            def add_local_file(image, source, destination):
+                shutil.copyfile(source, self.runtime / Path(destination).name)
+                return image
+
+        runner.with_runner_files(MountedImage())
+        entry = self.root / "modal-entry"
+        entry.mkdir()
+        shutil.copyfile(self.runtime / "runner.py", entry / "runner.py")
+        # Modal loads the entry module separately from the explicitly mounted files.
+        script = f"""
+import json
+from pathlib import Path
+from unittest.mock import patch
+import modal
+runtime = Path({str(self.runtime)!r})
+def runtime_path(*parts):
+    path = Path(*parts)
+    return runtime if path == Path('/opt/autokas/runner') else path
+with patch('modal.is_local', return_value=False), patch('pathlib.Path', side_effect=runtime_path):
+    import runner
+    print(json.dumps({{'revision': runner.REVISION, 'intake': runner.linear_intake.__file__}}))
+"""
+        # Redirect only the mount root, keeping Python's real import search behavior.
+        environment["PYTHONPATH"] = environment.get("PYTHONPATH", "").replace(
+            "/opt/autokas/runner", str(self.runtime))
+        result = subprocess.run([sys.executable, "-c", script], cwd=entry,
+                                env=environment, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        startup = json.loads(result.stdout)
+        self.assertEqual(startup["revision"], runner.REVISION)
+        self.assertEqual(Path(startup["intake"]), self.runtime / "linear_intake.py")
 
     def test_missing_environment_cannot_select_main(self) -> None:
         for environment in (None, ""):
