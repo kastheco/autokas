@@ -66,7 +66,7 @@ while IFS= read -r repo; do
     jq --arg key "$repo#$number" --slurpfile pr "$work/pr.json" \
       --slurpfile comments "$work/comments.json" --slurpfile reviews "$work/reviews.json" \
       --slurpfile inline "$work/inline.json" '
-      def counted: map(select(((.body // "") | startswith("@autokas")) | not)) | length;
+      def counted: map(select((.body // "") | test("^\\s*(@autokas|!kas)([^\\w-]|$)"; "i") | not)) | length;
       $pr[0] as $p |
       ($comments[0] | add // []) as $c |
       ($reviews[0] | add // []) as $r |

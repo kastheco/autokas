@@ -4,7 +4,7 @@ status: implemented. app provisioning and OAuth refresh are verified. production
 
 ## goal
 
-delegating a linear issue to autokas starts the same coding job an `@autokas` comment on a github issue starts today, and the linear issue shows progress and the resulting PR. a follow-up message in the linear session while the job runs steers it. after the PR opens, the existing review and fix loop runs unchanged.
+delegating a linear issue to autokas starts the same coding job a `!kas` comment (or its `@autokas` alias) on a github issue starts today, and the linear issue shows progress and the resulting PR. a follow-up message in the linear session while the job runs steers it. after the PR opens, the existing review and fix loop runs unchanged.
 
 ## scope
 

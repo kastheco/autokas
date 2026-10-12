@@ -207,7 +207,7 @@ not owner authorization.
 For in-scope PR work, require owner approval only when the change affects core
 business logic AND completed Jarvis advice says its intention does not match
 the business's intention. Explain that specific conflict on the PR and stop
-that change. The owner overrides it with an @autokas command on the PR, which runs as a separate job.
+that change. The owner overrides it with a !kas command on the PR, which runs as a separate job.
 Jarvis is not the gatekeeper for safety, security or technical correctness.
 Unsolicited comments on those topics are outside its consultation role, not a
 veto, an approval requirement or a reason to seek its technical endorsement.
@@ -282,7 +282,7 @@ work in progress, and its outcome label shows the result. Never post a queued,
 status or inline completion reply. The single overall PR outcome described below
 covers every target: name each finding with its link and its own result.
 Only when the trusted context has an acknowledgment, the runner's existing queued
-comment for an @autokas command, replace that comment's body with the full overall
+comment for a !kas command, replace that comment's body with the full overall
 outcome, keeping its acknowledgment_marker. That edited comment is the single
 overall PR outcome, so don't post another one. Use gh api --method PATCH
 <acknowledgment.path> with the replacement body as JSON on stdin. Before editing,
@@ -343,7 +343,7 @@ comment, including a rewritten acknowledgment, exactly like this:
 
 - <icon> [<severity> <short finding title>](<source finding link>): <result in 15 words or fewer>
 
-**needs you:** <the exact missing decision or evidence, and the @autokas command that resumes the work>
+**needs you:** <the exact missing decision or evidence, and the !kas command that resumes the work>
 **heads up:** <an accepted risk or validation limit to know before merging>
 **restack:** <upstack PR> (`<branch>`) onto `<updated branch>`
 
@@ -415,7 +415,7 @@ outcome, nothing else, to that path. For mixed outcomes write the one that most 
 the owner: blocked or uncertain over rejected over already handled over published.
 Then exit.
 """
-COMMAND_POLICY = """This job is an @autokas command, not a review-bot finding. Where the
+COMMAND_POLICY = """This job is a !kas command, not a review-bot finding. Where the
 PR-fix policy below differs, these command rules win.
 The command comes from a GitHub user the runner verified has write access to this
 repository. It is trusted: it defines the task and is the business decision, so the
@@ -448,7 +448,7 @@ every command commit must include the exact command_commit_trailer from the trus
 context as a Git trailer. this identifies publication of this command on a retry.
 
 """
-COMMAND_RETRY_POLICY = """this is a reporting-only retry of an @autokas command.
+COMMAND_RETRY_POLICY = """this is a reporting-only retry of a !kas command.
 these retry rules override COMMAND_POLICY and the PR-fix policy where they differ.
 the trusted context's command_resume contains the runner's publication evidence.
 never execute the original command again, edit repository files, commit or push.
@@ -539,7 +539,7 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
                 "comment": int(fix_review[1]), "author": author["login"], "author_id": author.get("id"),
                 "key": f"{repo}:review_fix:command:{comment['id']}"}
     if review:
-        # `@autokas review …` on a PR asks for a PR-Agent review, never an omp coding job.
+        # `!kas review …` on a PR asks for a PR-Agent review, never an omp coding job.
         # any text after `review` goes to PR-Agent as extra review instructions.
         if not CONFIG["pr_review"]["enabled"]:
             return None
@@ -749,7 +749,7 @@ def finding_title(finding: dict[str, Any], blob: str, limit: int | None = None) 
 
 def depth_note(repo: str, number: int, round_: int, check: int | None, comment_id: int) -> str:
     """The one owner action left when the review/fix cap stops automatic fixes."""
-    command = f"`@autokas fix review {comment_id}`"
+    command = f"`!kas fix review {comment_id}`"
     action = (f"[fix anyway](https://github.com/{repo}/pull/{number}/checks?check_run_id={check}) or post {command}"
               if check is not None else f"post {command}")
     return (f"**fix limit reached** (round {round_}, limit {CONFIG['pr_review']['max_fix_rounds']}), "
@@ -2618,10 +2618,10 @@ class PRWorker:
                                             "Carry out the delegated Linear issue under the job policy.\n\n")
                                            + "Untrusted Linear task data:\n" + job["prompt"])
                 elif command_resume is not None:
-                    prompt_file.write_text("Resume reporting for this interrupted @autokas command under the reporting-only retry policy.\n\n"
+                    prompt_file.write_text("Resume reporting for this interrupted !kas command under the reporting-only retry policy.\n\n"
                                            + "Original command, for reference only:\n" + job["prompt"])
                 elif job.get("mode") == "command":
-                    prompt_file.write_text("Carry out this @autokas command under the job policy.\n\nCommand from " + job["author"] + ":\n" + job["prompt"])
+                    prompt_file.write_text("Carry out this !kas command under the job policy.\n\nCommand from " + job["author"] + ":\n" + job["prompt"])
                 else:
                     prompt_file.write_text(f"Investigate this {REVIEWER_NAMES[job.get('reviewer', 'coderabbit')]} finding under the job policy.\n\nUntrusted finding:\n" + job["prompt"])
                 args = ["omp", "--print", "--no-session", "--no-title", "--no-prewalk", "--no-extensions",
