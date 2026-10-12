@@ -722,6 +722,9 @@ SEVERITY_ICONS = {"P0": "🟥", "P1": "🟧", "P2": "🟨", "P3": "⬜"}
 FINDING_TITLE_LIMIT = 200
 PR_AGENT_RENDERED_FIELDS = {"estimated_effort_to_review_[1-5]", "relevant_tests", "security_concerns",
                             "key_issues_to_review"}
+FIX_ANYWAY_TEXT = "fix anyway: run one fixer for these findings on this head"
+FIX_ANYWAY_UNCHECKED = f"- [ ] {FIX_ANYWAY_TEXT}"
+FIX_ANYWAY_CHECKED = f"- [x] {FIX_ANYWAY_TEXT}"
 
 
 def utf8_cut(text: str, size: int) -> str:
@@ -747,13 +750,11 @@ def finding_title(finding: dict[str, Any], blob: str, limit: int | None = None) 
     return f"{title} · [`{location}`]({url})"
 
 
-def depth_note(repo: str, number: int, round_: int, check: int | None, comment_id: int) -> str:
+def depth_note(round_: int, comment_id: int) -> str:
     """The one owner action left when the review/fix cap stops automatic fixes."""
-    command = f"`@autokas fix review {comment_id}`"
-    action = (f"[fix anyway](https://github.com/{repo}/pull/{number}/checks?check_run_id={check}) or post {command}"
-              if check is not None else f"post {command}")
     return (f"**fix limit reached** (round {round_}, limit {CONFIG['pr_review']['max_fix_rounds']}), "
-            f"so no fixer was queued. {action} to queue one fixer for these findings on this head.")
+            f"so no automatic fixer was queued.\n\n{FIX_ANYWAY_UNCHECKED}\n\n"
+            f"or post this command:\n\n```text\n@autokas fix review {comment_id}\n```")
 
 
 def pr_agent_comment(review: dict[str, Any], repo: str, head: str, round_: int, findings: list[dict[str, Any]],
@@ -914,6 +915,14 @@ def reviewer_of(user: dict[str, Any]) -> str | None:
                  if all(user.get(key) == value for key, value in CONFIG[name].items())), None)
 
 
+def consume_fix_checkbox(job: dict[str, Any], body: str, status: str) -> None:
+    """Replace only the action line, retaining the source review and its state marker."""
+    updated = "\n".join(f"**fix anyway:** {status}" if line in
+                        (FIX_ANYWAY_UNCHECKED, FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]"))
+                        else line for line in body.split("\n"))
+    github_request("PATCH", f"repos/{job['repo']}/issues/comments/{job['comment']}", {"body": updated})
+
+
 def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
     """Authorize one depth bypass against the current PR and the bot's exact source review."""
     repo, number = job["repo"], job["pr"]
@@ -926,12 +935,19 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
     pr = github(f"repos/{repo}/pulls/{number}")
     body = comment.get("body") or ""
     state = pr_agent_review_state(body)
+    if job.get("checkbox") and not any(line in body.splitlines() for line in
+                                        (FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]"))):
+        return None
     if (reviewer_of(comment.get("user", {})) != "pr_agent"
             or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
             or not state or state.get("head") != pr["head"]["sha"]
             or pr["state"] != "open" or generated_docs_pr(pr) or autokas_ignored(pr)
             or pr["head"]["repo"]["full_name"] != repo or pr["base"]["repo"]["full_name"] != repo):
         log("review_fix_outdated", key=job["key"])
+        if (job.get("checkbox") and reviewer_of(comment.get("user", {})) == "pr_agent"
+                and comment.get("issue_url") == f"https://api.github.com/repos/{repo}/issues/{number}"
+                and state and state.get("head") != pr["head"]["sha"]):
+            consume_fix_checkbox(job, body, "stale head, no fixer was queued. request a new review.")
         return None
     prompt = pr_agent_prompt(body, bypass_depth=True)
     if not prompt or pr_agent_prompt(body):
@@ -945,10 +961,13 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
             log("review_fix_invalid_check", key=job["key"])
             return None
     fingerprint = hashlib.sha256(prompt.encode()).hexdigest()
-    return {"repo": repo, "pr": number, "comment": job["comment"], "kind": "issue_comment",
-            "reviewer": "pr_agent", "head": state["head"], "prompt": prompt,
-            "bypass_depth": True, "author": job["author"], "author_id": job.get("author_id"),
-            "key": f"{repo}:issue_comment:{job['comment']}:{fingerprint}"}
+    fix = {"repo": repo, "pr": number, "comment": job["comment"], "kind": "issue_comment",
+           "reviewer": "pr_agent", "head": state["head"], "prompt": prompt,
+           "bypass_depth": True, "author": job["author"], "author_id": job.get("author_id"),
+           "key": f"{repo}:issue_comment:{job['comment']}:{fingerprint}"}
+    if job.get("checkbox"):
+        fix["checkbox_body"] = body
+    return fix
 
 
 def allowed_repository(repo: Any) -> bool:
@@ -999,6 +1018,28 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, 
                 "key": f"{repo}:review_fix:check:{check['id']}:{sender['login']}"}
     if event == "pull_request":
         return docs_event_job(payload) or review_event_job(payload)
+    if (event == "issue_comment" and payload.get("action") == "edited"
+            and reviewer_of(payload.get("comment", {}).get("user", {})) == "pr_agent"):
+        comment, issue, sender = (payload.get(key, {}) for key in ("comment", "issue", "sender"))
+        repo, number = payload["repository"]["full_name"], issue.get("number")
+        before = payload.get("changes", {}).get("body", {}).get("from")
+        body = comment.get("body") or ""
+        state = pr_agent_review_state(body)
+        if (reviewer_of(comment.get("user", {})) != "pr_agent" or sender.get("type") != "User"
+                or not sender.get("login") or type(comment.get("id")) is not int
+                or type(number) is not int or number <= 0
+                or issue.get("pull_request", {}).get("url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
+                or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
+                or not isinstance(before, str) or FIX_ANYWAY_UNCHECKED not in before.splitlines()
+                or any(line in before.splitlines() for line in (FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]")))
+                or not any(line in body.splitlines() for line in (FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]")))
+                or FIX_ANYWAY_UNCHECKED in body.splitlines() or not state
+                or not isinstance(state.get("head"), str) or not re.fullmatch(r"[0-9a-fA-F]{40}", state["head"])
+                or state != pr_agent_review_state(before)):
+            return None
+        return {"mode": "review_fix_request", "repo": repo, "pr": number, "comment": comment["id"],
+                "checkbox": True, "author": sender["login"], "author_id": sender.get("id"),
+                "key": f"{repo}:review_fix:checkbox:{comment['id']}:{sender['login']}"}
     command = command_job(event, payload)
     if command is not None:
         return command
@@ -1955,7 +1996,7 @@ def pr_review(job: dict[str, Any]) -> None:
                         fix_comment=comment["id"] if exhausted else None)
     if exhausted:
         # the fallback command names this comment, so the note is added once its ID exists.
-        note = depth_note(repo, number, round_, check, comment["id"])
+        note = depth_note(round_, comment["id"])
         try:
             comment = {**comment, **github_request("PATCH", f"repos/{repo}/issues/comments/{comment['id']}", {
                 "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, note=note)})}
@@ -2023,7 +2064,10 @@ def worker(job: dict[str, Any]) -> None:
     if job.get("mode") == "review_fix_request":
         fix = requested_review_fix(job)
         if fix is not None:
+            body = fix.pop("checkbox_body", None)
             dispatch(fix)
+            if body is not None:
+                consume_fix_checkbox(job, body, f"queued by @{job['author']}.")
         return
     if (job.get("bypass_depth") and not job.get("linear")
             and not trusted_reviewer({"login": job.get("author"), "id": job.get("author_id")})):
