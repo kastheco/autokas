@@ -821,6 +821,7 @@ class PRReviewRunTests(unittest.TestCase):
         pushed = "f" * 40
         cases = (("pushed", 0, True, "published", "fixed"),
                  ("pushed without outcome", 0, True, None, "blocked"),
+                 ("unchanged without outcome", 0, False, None, "blocked"),
                  ("pushed with empty outcome", 0, True, "", "blocked"),
                  ("pushed with whitespace outcome", 0, True, " \t\n", "blocked"),
                  ("unverified already handled", 0, False, "already handled", "blocked"),
@@ -864,6 +865,8 @@ class PRReviewRunTests(unittest.TestCase):
                       patch.object(runner.subprocess, "Popen", side_effect=omp),
                       patch.object(runner.os, "killpg"),
                       patch.object(runner, "dispatch") as dispatch,
+                      patch.object(runner.modal, "current_function_call_id", return_value="fc-missing-outcome"),
+                      patch.object(runner, "github_request") as request,
                       patch.object(runner, "set_fix_label", side_effect=lambda repo, pr, state, key: labels.append(state))):
                     if code:
                         with self.assertRaises(RuntimeError):
@@ -871,6 +874,16 @@ class PRReviewRunTests(unittest.TestCase):
                     else:
                         runner.PRWorker(pr_key=f"{REPO}#42").run.local(copy.deepcopy(fix))
                 self.assertEqual(labels, ["fixing", label])
+                if code == 0 and reported is None:
+                    request.assert_called_once()
+                    method, path, payload = request.call_args.args
+                    self.assertEqual((method, path), ("POST", f"repos/{REPO}/issues/42/comments"))
+                    self.assertIn("fixer exited without an outcome", payload["body"])
+                    self.assertIn("fc-missing-outcome", payload["body"])
+                    self.assertIn(f"start head: `{HEAD}`", payload["body"])
+                    self.assertIn(f"end head: `{pushed if push else HEAD}`", payload["body"])
+                else:
+                    request.assert_not_called()
                 if push:
                     [follow_up] = [call.args[0] for call in dispatch.call_args_list]
                     self.assertEqual((follow_up["mode"], follow_up["head"]), ("pr_review", pushed))

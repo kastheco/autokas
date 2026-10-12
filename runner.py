@@ -2726,7 +2726,8 @@ class PRWorker:
                         record["state"] = "completed"
                     CLAIMS.put("command:" + job["key"], record)
                 if labeled:
-                    reported = outcome_file.read_text(encoding="utf-8", errors="replace").strip().lower() if outcome_file.is_file() else ""
+                    outcome_missing = not outcome_file.is_file()
+                    reported = "" if outcome_missing else outcome_file.read_text(encoding="utf-8", errors="replace").strip().lower()
                     if code == 0 and publication_confirmed and reported == "published":
                         CLAIMS.put(f"fix:{repo}:{number}:{final_head}", {
                             "branch": branch, "findings": finding_keys(job)}, skip_if_exists=True)
@@ -2734,6 +2735,14 @@ class PRWorker:
                                and already_handled_confirmed(job, pr, branch, evidence_file, started_at))
                     set_fix_label(repo, number, fix_state(code, publication_confirmed, reported, handled), job["key"])
                     labeled = False
+                    if code == 0 and outcome_missing:
+                        change = ("no changes" if final_head == head else
+                                  f"[`{final_head[:7]}`](https://github.com/{repo}/commit/{final_head})")
+                        links = " · ".join(f"[{title}]({url})" for title, url in modal_run_links.items())
+                        github_request("POST", f"repos/{repo}/issues/{number}/comments", {
+                            "body": f"### ⛔ blocked · fixer exited without an outcome · {change}\n\n"
+                                    f"start head: `{head}` · end head: `{final_head}` · remote head: `{remote_head}`"
+                                    + (f"\n\n<sub>{links}</sub>" if links else "")})
                 if job.get("reviewer") == "pr_agent" and publication_confirmed:
                     dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head))
                 if code:

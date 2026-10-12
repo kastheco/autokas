@@ -270,6 +270,8 @@ use the app URL printed by deployment for native function-call status. omp's fin
 
 comment delivery is not blindly retried. omp reconciles an uncertain response by reading the PR and reports any remaining uncertainty in its final output. a zero exit without a remote update is not a successful fix. crashes, timeouts and failures before omp starts can still appear only in Modal logs; there is no separate failure-comment service.
 
+when a finding fixer exits 0 without `outcome.txt`, the runner keeps `autokas:blocked` and posts one short fallback PR outcome saying the fixer exited without an outcome. it includes the coding call id in the Modal link and the start, local end and remote heads. this uses the existing comment API helper without detecting earlier comments or retrying delivery. existing outcome files, including empty or unknown values, don't trigger this fallback.
+
 
 
 
