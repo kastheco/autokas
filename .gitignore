@@ -7,3 +7,4 @@ __pycache__/
 /config.json
 /.pi/
 /.autokas-modal-secret.env
+/node_modules/

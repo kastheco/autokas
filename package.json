@@ -2,7 +2,13 @@
   "name": "omp-runner",
   "private": true,
   "scripts": {
+    "railway:plan": "railway config plan",
+    "railway:apply": "railway config apply",
     "login:codex": "railway ssh --project \"${RAILWAY_PROJECT_ID:?set RAILWAY_PROJECT_ID}\" --environment \"${RAILWAY_ENVIRONMENT_ID:?set RAILWAY_ENVIRONMENT_ID}\" --service \"${RAILWAY_SERVICE_ID:?set RAILWAY_SERVICE_ID}\" -- sh -c 'umask 077; exec /CLIProxyAPI/CLIProxyAPI -config /CLIProxyAPI/config.yaml --codex-device-login'",
     "login:claude": "railway ssh --project \"${RAILWAY_PROJECT_ID:?set RAILWAY_PROJECT_ID}\" --environment \"${RAILWAY_ENVIRONMENT_ID:?set RAILWAY_ENVIRONMENT_ID}\" --service \"${RAILWAY_SERVICE_ID:?set RAILWAY_SERVICE_ID}\" -- sh -c 'umask 077; exec /CLIProxyAPI/CLIProxyAPI -config /CLIProxyAPI/config.yaml --claude-login --no-browser'"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "railway": "3.11.0"
   }
 }

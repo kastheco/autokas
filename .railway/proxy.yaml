@@ -1,0 +1,21 @@
+host: ""
+port: 8317
+auth-dir: /data/auths
+api-keys:
+  - "${CLI_PROXY_API_KEY}"
+remote-management:
+  allow-remote: false
+  secret-key: ""
+  disable-control-panel: true
+ws-auth: true
+usage-statistics-enabled: false
+logging-to-file: false
+request-log: false
+requests:
+  payload:
+    override:
+      - models:
+          - name: "gpt-*"
+            protocol: "codex"
+        params:
+          service_tier: priority

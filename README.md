@@ -160,7 +160,9 @@ do the Modal login and consent yourself. `config.json` holds your webhook URL, p
 
 `./setup_autokas.py` creates the GitHub App with its webhook inactive, finds its `kastheco` installation and can write the worker secret and deploy, asking before each step. set the App webhook secret to the value in `omp-runner-webhook`, then activate the webhook.
 
-model logins live in the Railway proxy volume, not Modal. export `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID` and `RAILWAY_SERVICE_ID` first:
+the personal CLIProxyAPI service is owned here in `.railway/railway.ts`, separately from the Modal app. it uses the existing Railway project `autokas` (formerly `digikas`), service `cli-proxy`, and credential volume. see [proxy operations](docs/operations.md#railway-proxy) for the target ids and update commands.
+
+model logins live in the Railway proxy volume, not Modal. export `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID` and `RAILWAY_SERVICE_ID` first, the scripts refuse to run without them:
 
 ```sh
 npm run login:codex
