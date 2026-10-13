@@ -1,5 +1,5 @@
 host: ""
-port: 8317
+port: 8318
 auth-dir: /data/auths
 api-keys:
   - "${CLI_PROXY_API_KEY}"
@@ -8,7 +8,7 @@ remote-management:
   secret-key: ""
   disable-control-panel: true
 ws-auth: true
-usage-statistics-enabled: false
+usage-statistics-enabled: true
 logging-to-file: false
 request-log: false
 requests:

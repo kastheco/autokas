@@ -1,0 +1,7 @@
+FROM eceasy/cli-proxy-api:v8.0.27
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY .railway/nginx.conf /CLIProxyAPI/nginx.conf
