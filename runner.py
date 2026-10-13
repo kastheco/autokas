@@ -2585,8 +2585,14 @@ class PRWorker:
                     if generated_docs_pr(pr) and job.get("mode") != "command":
                         log("ignored_generated_docs_pr", repo=repo, pr=number)
                         return
-                    if pr["state"] != "open" or pr["base"]["repo"]["full_name"] != repo or pr["head"]["repo"]["full_name"] != repo:
+                    if pr["base"]["repo"]["full_name"] != repo or pr["head"]["repo"]["full_name"] != repo:
                         raise RuntimeError("PR closed or head repository not approved (forks are not enabled)")
+                    if pr["state"] != "open":
+                        if job.get("mode") == "command":
+                            raise RuntimeError("PR closed or head repository not approved (forks are not enabled)")
+                        log("pr_closed_while_queued", repo=repo, pr=number, key=job["key"],
+                            merged=bool(pr.get("merged_at")))
+                        return
                     if job.get("mode") == "review":
                         current = review_job(job, pr)
                         if current is None or current["key"] != job["key"]:
