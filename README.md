@@ -21,7 +21,7 @@ the runner dispatches the job, not the agent's working process. omp owns investi
 
 - **reviews every PR.** a PR-Agent review posts as `autokas[bot]` when a PR is ready and again on each push, and shows as an `autokas review` check next to CI. findings are tagged `[P0]` to `[P3]`. see [reviews](#reviews).
 - **fixes review findings.** findings from CodeRabbit, Cursor Bugbot, Cursor Security Reviewer and autokas's own reviews go to an omp job that fixes what's still valid, runs the repo's checks and pushes to the PR branch. its own findings get up to three fix rounds, each re-reviewed. an `autokas:*` label shows the latest outcome. see [fixes](#fixes).
-- **takes instructions.** start a comment with `@autokas` or `!kas` on a PR or issue and it does the work, opening a PR for issues. see [commands](#autokas-commands).
+- **takes instructions.** start a comment with `!kas` on a PR or issue and it does the work, opening a PR for issues. see [commands](#kas-commands).
 - **takes linear issues.** delegate an issue to the linear app, steer the live run from its session, and get progress and the resulting PR there. gated repositories need plan approval before coding. see [linear intake](#linear-intake).
 - **keeps docs current.** after a merge in a configured repo, it opens, validates and merges a follow-up docs PR. see [docs follow-ups](#docs-follow-ups).
 - **leaves stacks linear.** fixes never merge into or rewrite upstack branches, and a review after a restack spends no fix round.
@@ -37,9 +37,9 @@ an ordinary push reviews only the diff since the latest completed bot-authored r
 
 each finding is tagged `[P0]` to `[P3]`. P0 is a security hole, data loss or an outage, P1 a bug in normal use, P2 a bug under specific inputs or conditions, and P3 maintainability, style or a speculative concern. an untagged finding counts as P2. when a review has findings at or above `pr_review.fix_severity` (default `P2`), autokas queues one fix job for them through the same path as CodeRabbit and Bugbot findings. if the fix pushes a commit, autokas reviews only the diff from the prior reviewed head to the new head and asks PR-Agent to confirm each prior finding, keep unresolved ones with their current location, and otherwise report only problems the diff introduced. after a force-push that drops the prior head, the review falls back to the merge-base diff.
 
-the loop ends when a review has nothing at or above the threshold, a fix pushes nothing, someone else pushes during a round, or the PR reaches `pr_review.max_fix_rounds` (default `3`). the last review is still posted. every review continues from the highest counted round in the PR's bot-authored markers, so a manual `@autokas review` never resets the budget. set `fix_severity` to `null` to keep reviews and turn off fixes. PRs marked `autokas:ignore` and generated docs PRs get no automatic fixes.
+the loop ends when a review has nothing at or above the threshold, a fix pushes nothing, someone else pushes during a round, or the PR reaches `pr_review.max_fix_rounds` (default `3`). the last review is still posted. every review continues from the highest counted round in the PR's bot-authored markers, so a manual `!kas review` never resets the budget. set `fix_severity` to `null` to keep reviews and turn off fixes. PRs marked `autokas:ignore` and generated docs PRs get no automatic fixes.
 
-when actionable findings arrive after the round cap, the review comment says no fixer was queued and offers a **fix anyway** checkbox. tick it in the PR conversation to authorize one fixer for that review's findings on the same head without resetting the cap. it requires a human with write or admin access. the runner replaces the checkbox with `queued by @user`, or a stale-head notice if the PR moved. unticking, re-ticking and redelivery don't launch another fixer. the note also has `@autokas fix review <review-comment-id>` in a fenced block for copying and posting as a new comment, which also accepts an exact `trusted_reviewers` bot. the failed review check keeps its **fix anyway** button, but that button needs the App's `check_run` subscription. all three paths reject stale heads and share one finding claim.
+when actionable findings arrive after the round cap, the review comment says no fixer was queued and offers a **fix anyway** checkbox. tick it in the PR conversation to authorize one fixer for that review's findings on the same head without resetting the cap. it requires a human with write or admin access. the runner replaces the checkbox with `queued by @user`, or a stale-head notice if the PR moved. unticking, re-ticking and redelivery don't launch another fixer. the note also has `!kas fix review <review-comment-id>` in a fenced block for copying and posting as a new comment, which also accepts an exact `trusted_reviewers` bot. the failed review check keeps its **fix anyway** button, but that button needs the App's `check_run` subscription. all three paths reject stale heads and share one finding claim.
 
 the review comment is built from PR-Agent's structured output, not its markdown: a heading with the round, finding count and reviewed commit, one line per finding with its severity and a link to its lines, then the full finding text in a collapsed section.
 
@@ -77,7 +77,7 @@ fix jobs set one label for the latest job's outcome, replacing any earlier one:
 | `autokas:rejected` | the findings didn't warrant a change |
 | `autokas:blocked` | omp failed or got blocked, publication couldn't be confirmed, or the outcome was missing |
 
-the label follows the latest job, not the head, so read it next to the check. `@autokas` commands and docs jobs don't set labels. that's enough for gh-dash sections:
+the label follows the latest job, not the head, so read it next to the check. `!kas` commands and docs jobs don't set labels. that's enough for gh-dash sections:
 
 ```yaml
 prSections:
@@ -89,20 +89,20 @@ prSections:
     filters: is:open author:@me -label:autokas:fixing -label:autokas:blocked status:success
 ```
 
-## @autokas commands
+## !kas commands
 
-start a GitHub comment with `@autokas` or `!kas` and an instruction, and autokas runs it as its own job. both prefixes are case-insensitive and behave the same.
+start a GitHub comment with `!kas` and an instruction, and autokas runs it as its own job. `@autokas` is an accepted alias. both prefixes are case-insensitive and behave the same.
 
 - **on a PR**, in the conversation or on a review thread, it works on that PR's head branch and pushes there.
 - **on an issue**, it branches from the default branch as `autokas/issue-<number>`, does the work and opens one PR containing `Closes #<number>`.
 - only users with `write` or `admin` access on the repo can trigger it.
-- the only bot exception is `trusted_reviewers`, matched by both login and user ID. the example lets `kasthecrew[bot]` send `@autokas review` and `@autokas fix review <review-comment-id>` on PRs, nothing else.
+- the only bot exception is `trusted_reviewers`, matched by both login and user ID. the example lets `kasthecrew[bot]` send `!kas review` and `!kas fix review <review-comment-id>` on PRs, nothing else.
 - each comment runs once. editing it doesn't rerun it, so post a new comment for a follow-up.
 - commands still run on PRs marked `autokas:ignore` and on generated docs PRs.
 - `review` on a PR posts a fresh review of the current head instead of starting a coding job, and its findings start the fix loop within the existing budget. anything after `review` goes to PR-Agent as extra instructions. it works on drafts too.
 
 ```text
-@autokas the date filter drops the last day of the range, fix it and add a test
+!kas the date filter drops the last day of the range, fix it and add a test
 !kas review focus on the auth changes
 ```
 
@@ -185,7 +185,7 @@ the setup script needs Python 3 with venv support. it installs test dependencies
 
 ## stop it
 
-add `autokas:ignore` or `@autokas ignore` anywhere in a PR body to skip automatic fixes, clean-review acknowledgments and docs jobs when it merges. markers are case-insensitive. [`@autokas` commands](#autokas-commands) from users with write access still run.
+add `autokas:ignore` or `@autokas ignore` anywhere in a PR body to skip automatic fixes, clean-review acknowledgments and docs jobs when it merges. markers are case-insensitive. [`!kas` commands](#kas-commands) from users with write access still run.
 
 deactivate the App webhook to stop new intake everywhere and let running work finish, or uninstall the App from one repo to stop its deliveries. neither cancels calls already queued. cancel an active job with Modal's native call cancellation, then reconcile the PR before doing anything else.
 

@@ -74,7 +74,9 @@ class PRReviewIntakeTests(unittest.TestCase):
     def test_trusted_bot_can_only_request_pr_review_loop_commands(self):
         for event in ("issue_comment", "pull_request_review_comment"):
             for body, mode in (("@autokas review", "pr_review"),
-                               ("@autokas fix review 777", "review_fix_request")):
+                               ("@autokas fix review 777", "review_fix_request"),
+                               ("!kas review", "pr_review"),
+                               ("!kas fix review 777", "review_fix_request")):
                 with self.subTest(event=event, body=body):
                     job = runner.event_job(*trusted_comment(body, event=event))
                     self.assertEqual((job["mode"], job["author"], job["author_id"]),
@@ -601,9 +603,9 @@ class PRReviewRunTests(unittest.TestCase):
                     notice = self.posts[1][2]["body"]
                     self.assertEqual(runner.pr_agent_review_state(notice)["round"], rounds + 1)
                     self.assertIn(runner.FIX_ANYWAY_UNCHECKED, notice)
-                    self.assertIn("```text\n@autokas fix review 777\n```", notice)
+                    self.assertIn("```text\n!kas fix review 777\n```", notice)
                     self.assertNotIn("/checks?", notice)
-                    command = re.search(r"@autokas fix review \d+", notice)[0]
+                    command = re.search(r"!kas fix review \d+", notice)[0]
                     event, payload = comment_event(command)
                     request = runner.event_job(event, payload)
                     self.assertEqual((request["mode"], request["comment"]), ("review_fix_request", 777))
