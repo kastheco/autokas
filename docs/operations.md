@@ -146,7 +146,7 @@ enter secrets through Modal's native secret form or SDK using hidden/local input
 
 ### railway proxy
 
-the personal CLIProxyAPI deployment is owned by `.railway/railway.ts` in this repo. the Railway project is `autokas`, formerly `digikas`. it runs `eceasy/cli-proxy-api:v8.0.23` independently of GitHub source deployments, so disabling the digikas repo doesn't stop it.
+the personal CLIProxyAPI deployment is owned by `.railway/railway.ts` in this repo. the Railway project is `autokas`, formerly `digikas`. it pins `eceasy/cli-proxy-api:v8.0.27` independently of GitHub source deployments, so disabling the digikas repo doesn't stop it.
 
 ```sh
 export RAILWAY_PROJECT_ID=03fd53c4-dbc1-4753-b334-95a3e6611e44

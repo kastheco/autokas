@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { defineRailway, image, preserve, project, service, volume } from 'railway/iac'
 
-export const proxyImage = 'eceasy/cli-proxy-api:v8.0.23'
+export const proxyImage = 'eceasy/cli-proxy-api:v8.0.27'
 
 // Embed the YAML in the image's startup command, expanding only its API-key placeholder.
 const proxyYaml = readFileSync(new URL('./proxy.yaml', import.meta.url), 'utf8')
