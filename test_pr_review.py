@@ -515,9 +515,10 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 3)
 
     def test_restack_at_the_cap_reports_findings_without_starting_a_fix(self):
-        comments = {1: [{"body": runner.pr_agent_marker("c" * 40, 3, []), "user": runner.CONFIG["pr_agent"]}]}
+        cap = runner.CONFIG["pr_review"]["max_fix_rounds"]
+        comments = {1: [{"body": runner.pr_agent_marker("c" * 40, cap, []), "user": runner.CONFIG["pr_agent"]}]}
         self.run_review(self.push_job(), comments=comments, prior_merge_base=MERGE_BASE)
-        self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 3)
+        self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], cap)
         self.assertEqual(self.dispatched, [])
         self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
 
@@ -569,15 +570,16 @@ class PRReviewRunTests(unittest.TestCase):
             return {"body": runner.pr_agent_marker("c" * 40, round_, []),
                     "user": user or runner.CONFIG["pr_agent"]}
 
-        comments = {1: [comment(2)] + [{"body": "ordinary comment", "user": {}}] * 99,
-                    2: [comment(3), comment(1), comment(100, {"login": "outsider", "id": 1})]}
+        cap = runner.CONFIG["pr_review"]["max_fix_rounds"]
+        comments = {1: [comment(cap - 1)] + [{"body": "ordinary comment", "user": {}}] * 99,
+                    2: [comment(cap), comment(1), comment(100, {"login": "outsider", "id": 1})]}
         self.run_review(self.command_job(), comments=comments)
         body = self.posts[0][2]["body"]
-        self.assertEqual(runner.pr_agent_review_state(body)["round"], 4)
+        self.assertEqual(runner.pr_agent_review_state(body)["round"], cap + 1)
         self.assertEqual(self.dispatched, [])
         comments[2].append({"body": body, "user": runner.CONFIG["pr_agent"]})
         self.run_review(self.command_job(), comments=comments)
-        self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 5)
+        self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], cap + 2)
         self.assertEqual(self.dispatched, [])
         self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
 
