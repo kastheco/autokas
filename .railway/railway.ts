@@ -17,7 +17,7 @@ printf '%s' "${shellYaml}" > /CLIProxyAPI/config.yaml
 exec /CLIProxyAPI/CLIProxyAPI -config /CLIProxyAPI/config.yaml`
 export const proxyStart = `/bin/sh -ec '${proxyScript.replaceAll("'", "'\\''")}'`
 
-export default defineRailway(() => {
+export default defineRailway((ctx) => {
   const auth = volume('cli-proxy-auth', { sizeMB: 500, region: 'sfo' })
   const proxy = service('cli-proxy', {
     source: image(proxyImage),
@@ -41,7 +41,7 @@ export default defineRailway(() => {
       PORT: '8080',
       OMCPA_CPA_BASE_URL: 'http://cli-proxy.railway.internal:8317',
       OMCPA_CPA_MANAGEMENT_KEY: proxy.env.MANAGEMENT_PASSWORD,
-      OMCPA_MASTER_KEY: preserve(),
+      OMCPA_MASTER_KEY: ctx.shared.OMCPA_MASTER_KEY,
       OMCPA_DATA_DIR: '/data',
       RAILWAY_RUN_UID: '0',
     },

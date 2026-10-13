@@ -154,6 +154,17 @@ export RAILWAY_ENVIRONMENT_ID=ccdf7ae4-c247-4401-a8a4-a0fae4a2dbc5
 export RAILWAY_SERVICE_ID=b57f366e-6941-4187-a1ac-08c584a6a81f
 railway link --project "$RAILWAY_PROJECT_ID" --environment "$RAILWAY_ENVIRONMENT_ID" --service "$RAILWAY_SERVICE_ID"
 npm ci
+```
+
+before the first plan or apply that creates `oh-my-cpa`, generate one master key and save it in the password store:
+
+```sh
+openssl rand -hex 32 | pass insert --multiline autokas/oh-my-cpa-master-key
+```
+
+in the linked Railway environment's shared variables, provision `OMCPA_MASTER_KEY` with that saved 64-character hex value before running `npm run railway:plan`. the graph references this shared variable, so the key exists before the service's first deployment. keep it out of source control and logs. if OMC already has data, use its existing master key instead of generating a new one. reuse the saved key on every apply and redeployment, don't rotate it while retaining encrypted data.
+
+```sh
 npm run railway:plan
 ```
 
@@ -164,6 +175,8 @@ edit `.railway/proxy.yaml` for proxy settings. `railway.ts` reads and embeds tha
 the endpoint remains `https://cli-proxy-production-533a.up.railway.app/v1`, used by `omp_models.providers.*.baseUrl` in private config. the start command generates `/CLIProxyAPI/config.yaml` from the existing Railway `CLI_PROXY_API_KEY`, which IaC preserves rather than regenerates. provider OAuth credentials stay in the `cli-proxy-auth` volume at `/data/auths`, not Modal or source control. retain the service and volume when updating the image.
 
 OMC is the usage dashboard at the `oh-my-cpa` service's generated domain under `/omc/`. its sign-in key is stored in `pass show autokas/cli-proxy-management-key`. usage is recorded only from deployment onward. dollar figures are price-book estimates, not subscription billing. `proxy.yaml` regenerates CPA's config on restart, so lasting CPA config changes belong in `proxy.yaml`, not OMC.
+
+back up `oh-my-cpa-data` with its matching `autokas/oh-my-cpa-master-key` in secure storage. to restore, stop OMC, restore the data volume, provision the same `OMCPA_MASTER_KEY` shared variable in the target Railway environment, then start OMC with that volume mounted at `/data`. a fresh key can't decrypt the restored credentials or payloads. follow the pinned image's [SQLite backup and restore procedure](https://github.com/WizisCool/oh-my-cpa/blob/v0.2.9/docs/ops/sqlite-operations.md) for a consistent database backup.
 
 
 ## deploy and update
