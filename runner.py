@@ -1554,7 +1554,9 @@ def run_docs_postprocess(
         text=True, capture_output=True, timeout=remaining,
     )
     if result.returncode:
-        raise RuntimeError(f"docs postprocess exited with {result.returncode}")
+        detail = redact((result.stdout + result.stderr).strip(), (hook_env.get("GH_TOKEN", ""),))
+        message = f"docs postprocess exited with {result.returncode}"
+        raise RuntimeError(f"{message}: {detail[-2000:]}" if detail else message)
     if run(["git", "rev-parse", "HEAD"], worktree) != agent_head:
         raise RuntimeError("docs postprocess changed the committed head")
     postprocess_paths(worktree, postprocess)

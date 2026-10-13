@@ -937,7 +937,7 @@ class DocsMergeTests(unittest.TestCase):
             "if (['CLI_PROXY_API_KEY', 'JARVIS_RUNNER_TOKEN', 'JARVIS_CONSULT_URL', "
             "'HOOK_MODE', 'EXPECT_BASE'].some(key => key in process.env)) process.exit(5);\n"
             f"const mode = {json.dumps(mode)};\n"
-            "if (mode === 'fail') process.exit(4);\n"
+            "if (mode === 'fail') { console.error('hook failed for ' + process.env.GH_TOKEN); process.exit(4); }\n"
             "const previous = fs.existsSync('.railway/worker-releases.json') ? JSON.parse(fs.readFileSync('.railway/worker-releases.json', 'utf8')) : {};\n"
             "if (mode === 'write') fs.writeFileSync('.railway/worker-releases.json', JSON.stringify({...previous, ...input}));\n"
             "if (mode === 'forbidden') fs.writeFileSync('src/injected.txt', 'not allowed');\n"
@@ -1133,7 +1133,7 @@ class DocsMergeTests(unittest.TestCase):
         self.assertEqual(self.merge_attempts, 0)
 
     def test_disposable_hook_rejects_failure_and_forbidden_output(self) -> None:
-        for mode, error in (("fail", "exited with 4"), ("forbidden", "undeclared"),
+        for mode, error in (("fail", r"exited with 4: hook failed for \[redacted\]"), ("forbidden", "undeclared"),
                             ("rename", "undeclared"), ("symlink", "symlink")):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 self.root = Path(directory)
