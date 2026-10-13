@@ -1,5 +1,5 @@
 host: ""
-port: 8317
+port: 8318
 auth-dir: /data/auths
 api-keys:
   - "${CLI_PROXY_API_KEY}"

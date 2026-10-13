@@ -146,7 +146,7 @@ enter secrets through Modal's native secret form or SDK using hidden/local input
 
 ### railway proxy
 
-the personal CLIProxyAPI deployment is owned by `.railway/railway.ts` in this repo. the Railway project is `autokas`, formerly `digikas`. it pins `eceasy/cli-proxy-api:v8.0.27` independently of GitHub source deployments, so disabling the digikas repo doesn't stop it.
+the personal CLIProxyAPI deployment is owned by `.railway/railway.ts` in this repo. the Railway project is `autokas`, formerly `digikas`. `.railway/Dockerfile.proxy` wraps the pinned `eceasy/cli-proxy-api:v8.0.27` image with nginx and builds from this repository's `main` branch. keep this repository available for future proxy builds.
 
 ```sh
 export RAILWAY_PROJECT_ID=03fd53c4-dbc1-4753-b334-95a3e6611e44
@@ -168,13 +168,13 @@ in the linked Railway environment's shared variables, provision `OMCPA_MASTER_KE
 npm run railway:plan
 ```
 
-review the plan before running `npm run railway:apply`. the Modal deployment workflow doesn't apply Railway changes.
+review the plan before running `npm run railway:apply`. merge the proxy wrapper files into `main` before applying the source cutover, since Railway builds that branch. the Modal deployment workflow doesn't apply Railway changes.
 
 edit `.railway/proxy.yaml` for proxy settings. `railway.ts` reads and embeds that file in the start command, expanding only `${CLI_PROXY_API_KEY}` inside the running container. don't put credentials in the YAML. a config apply redeploys the service with the updated YAML.
 
-the endpoint remains `https://cli-proxy-production-533a.up.railway.app/v1`, used by `omp_models.providers.*.baseUrl` in private config. the start command generates `/CLIProxyAPI/config.yaml` from the existing Railway `CLI_PROXY_API_KEY`, which IaC preserves rather than regenerates. provider OAuth credentials stay in the `cli-proxy-auth` volume at `/data/auths`, not Modal or source control. retain the service and volume when updating the image.
+the endpoint remains `https://cli-proxy-production-533a.up.railway.app/v1`, used by `omp_models.providers.*.baseUrl` in private config. nginx listens on public port 8317 and forwards only `/v1/` and `/healthz`. all other paths, including `/v0/management` and `/v8/management`, return 404. CPA listens on port 8318, which must not have a public domain or TCP proxy. OMC reaches that port through `cli-proxy.railway.internal`. `MANAGEMENT_PASSWORD` enables remote management in CPA even when `allow-remote` is false, so the public nginx allowlist is the access boundary, not that setting. the start command generates `/CLIProxyAPI/config.yaml` from the existing Railway `CLI_PROXY_API_KEY`, which IaC preserves rather than regenerates. provider OAuth credentials stay in the `cli-proxy-auth` volume at `/data/auths`, not Modal or source control. retain the service and volume when updating the image.
 
-OMC is the usage dashboard at the `oh-my-cpa` service's generated domain under `/omc/`. its sign-in key is stored in `pass show autokas/cli-proxy-management-key`. usage is recorded only from deployment onward. dollar figures are price-book estimates, not subscription billing. `proxy.yaml` regenerates CPA's config on restart, so lasting CPA config changes belong in `proxy.yaml`, not OMC.
+OMC is the usage dashboard at the `oh-my-cpa` service's generated domain under `/omc/`. `OMCPA_PUBLIC_URL` references that domain with an explicit `https://` scheme so the session cookie stays `Secure` behind Railway's TLS termination. keep the generated domain enabled. its sign-in key is stored in `pass show autokas/cli-proxy-management-key`. usage is recorded only from deployment onward. dollar figures are price-book estimates, not subscription billing. `proxy.yaml` regenerates CPA's config on restart, so lasting CPA config changes belong in `proxy.yaml`, not OMC.
 
 back up `oh-my-cpa-data` with its matching `autokas/oh-my-cpa-master-key` in secure storage. to restore, stop OMC, restore the data volume, provision the same `OMCPA_MASTER_KEY` shared variable in the target Railway environment, then start OMC with that volume mounted at `/data`. a fresh key can't decrypt the restored credentials or payloads. follow the pinned image's [SQLite backup and restore procedure](https://github.com/WizisCool/oh-my-cpa/blob/v0.2.9/docs/ops/sqlite-operations.md) for a consistent database backup.
 

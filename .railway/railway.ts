@@ -1,7 +1,6 @@
 import { readFileSync } from 'node:fs'
-import { defineRailway, image, preserve, project, service, volume } from 'railway/iac'
+import { defineRailway, github, image, preserve, project, service, volume } from 'railway/iac'
 
-export const proxyImage = 'eceasy/cli-proxy-api:v8.0.27'
 export const dashboardImage = 'wiziscool/oh-my-cpa:v0.2.9'
 
 // Embed the YAML in the image's startup command, expanding only its API-key placeholder.
@@ -14,13 +13,25 @@ const proxyScript = `umask 077
 mkdir -p /data/auths
 chmod 700 /data/auths
 printf '%s' "${shellYaml}" > /CLIProxyAPI/config.yaml
-exec /CLIProxyAPI/CLIProxyAPI -config /CLIProxyAPI/config.yaml`
-export const proxyStart = `/bin/sh -ec '${proxyScript.replaceAll("'", "'\\''")}'`
+pids=""
+trap 'kill $pids 2>/dev/null || true; wait' EXIT
+trap 'exit 143' TERM INT
+/usr/sbin/nginx -c /CLIProxyAPI/nginx.conf -g 'daemon off;' &
+pids="$!"
+/CLIProxyAPI/CLIProxyAPI -config /CLIProxyAPI/config.yaml &
+pids="$pids $!"
+wait -n $pids
+exit 1`
+export const proxyStart = `/bin/bash -ec '${proxyScript.replaceAll("'", "'\\''")}'`
 
 export default defineRailway((ctx) => {
   const auth = volume('cli-proxy-auth', { sizeMB: 500, region: 'sfo' })
   const proxy = service('cli-proxy', {
-    source: image(proxyImage),
+    source: github('kastheco/autokas', { branch: 'main' }),
+    build: { builder: 'DOCKERFILE', dockerfilePath: '.railway/Dockerfile.proxy', watchPatterns: ['.railway/**'] },
+    networking: {
+      serviceDomains: { 'cli-proxy-production-533a.up.railway.app': { port: 8317 } },
+    },
     start: proxyStart,
     healthcheck: '/healthz',
     healthcheckTimeout: 300,
@@ -39,7 +50,8 @@ export default defineRailway((ctx) => {
     healthcheck: '/omc/api/healthz',
     env: {
       PORT: '8080',
-      OMCPA_CPA_BASE_URL: 'http://cli-proxy.railway.internal:8317',
+      OMCPA_CPA_BASE_URL: 'http://cli-proxy.railway.internal:8318',
+      OMCPA_PUBLIC_URL: 'https://${{RAILWAY_PUBLIC_DOMAIN}}',
       OMCPA_CPA_MANAGEMENT_KEY: proxy.env.MANAGEMENT_PASSWORD,
       OMCPA_MASTER_KEY: ctx.shared.OMCPA_MASTER_KEY,
       OMCPA_DATA_DIR: '/data',
