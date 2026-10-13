@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { defineRailway, image, preserve, project, service, volume } from 'railway/iac'
 
 export const proxyImage = 'eceasy/cli-proxy-api:v8.0.27'
+export const dashboardImage = 'wiziscool/oh-my-cpa:v0.2.9'
 
 // Embed the YAML in the image's startup command, expanding only its API-key placeholder.
 const proxyYaml = readFileSync(new URL('./proxy.yaml', import.meta.url), 'utf8')
@@ -27,9 +28,25 @@ export default defineRailway(() => {
     env: {
       PORT: '8317',
       CLI_PROXY_API_KEY: preserve(),
+      MANAGEMENT_PASSWORD: preserve(),
     },
     volumeMounts: { '/data/auths': auth },
   })
 
-  return project('autokas', { resources: [proxy, auth] })
+  const dashboardData = volume('oh-my-cpa-data', { sizeMB: 1024, region: 'sfo' })
+  const dashboard = service('oh-my-cpa', {
+    source: image(dashboardImage),
+    healthcheck: '/omc/api/healthz',
+    env: {
+      PORT: '8080',
+      OMCPA_CPA_BASE_URL: 'http://cli-proxy.railway.internal:8317',
+      OMCPA_CPA_MANAGEMENT_KEY: proxy.env.MANAGEMENT_PASSWORD,
+      OMCPA_MASTER_KEY: preserve(),
+      OMCPA_DATA_DIR: '/data',
+      RAILWAY_RUN_UID: '0',
+    },
+    volumeMounts: { '/data': dashboardData },
+  })
+
+  return project('autokas', { resources: [proxy, auth, dashboard, dashboardData] })
 })

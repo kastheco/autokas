@@ -163,6 +163,8 @@ edit `.railway/proxy.yaml` for proxy settings. `railway.ts` reads and embeds tha
 
 the endpoint remains `https://cli-proxy-production-533a.up.railway.app/v1`, used by `omp_models.providers.*.baseUrl` in private config. the start command generates `/CLIProxyAPI/config.yaml` from the existing Railway `CLI_PROXY_API_KEY`, which IaC preserves rather than regenerates. provider OAuth credentials stay in the `cli-proxy-auth` volume at `/data/auths`, not Modal or source control. retain the service and volume when updating the image.
 
+OMC is the usage dashboard at the `oh-my-cpa` service's generated domain under `/omc/`. its sign-in key is stored in `pass show autokas/cli-proxy-management-key`. usage is recorded only from deployment onward. dollar figures are price-book estimates, not subscription billing. `proxy.yaml` regenerates CPA's config on restart, so lasting CPA config changes belong in `proxy.yaml`, not OMC.
+
 
 ## deploy and update
 
