@@ -602,6 +602,9 @@ class PRReviewRunTests(unittest.TestCase):
                                      [("PATCH", f"repos/{REPO}/issues/comments/777")])
                     notice = self.posts[1][2]["body"]
                     self.assertEqual(runner.pr_agent_review_state(notice)["round"], rounds + 1)
+                    self.assertIn(runner.FIX_ANYWAY_UNCHECKED, notice)
+                    self.assertIn("```text\n!kas fix review 777\n```", notice)
+                    self.assertNotIn("/checks?", notice)
                     command = re.search(r"!kas fix review \d+", notice)[0]
                     event, payload = comment_event(command)
                     request = runner.event_job(event, payload)
@@ -1275,6 +1278,100 @@ class ReviewFixBypassTests(unittest.TestCase):
                       "repository": {"full_name": REPO}, "sender": {"login": "kas", "type": "User"},
                       "check_run": self.check}
         self.reads = []
+        self.claims = set()
+        self.queued = []
+
+    def checkbox_event(self):
+        before = runner.depth_note(7, 777) + "\n\n" + self.comment["body"]
+        self.comment["body"] = before.replace(runner.FIX_ANYWAY_UNCHECKED, runner.FIX_ANYWAY_CHECKED)
+        return {"action": "edited", "repository": {"full_name": REPO},
+                "sender": {"login": "kas", "id": 1, "type": "User"},
+                "issue": {"number": 42, "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/42"}},
+                "comment": copy.deepcopy(self.comment), "changes": {"body": {"from": before}}}
+
+    def run_checkbox(self, payload):
+        def claim(key, value, **kwargs):
+            if key in self.claims:
+                return False
+            self.claims.add(key)
+            return True
+
+        def update(method, path, data):
+            self.assertEqual((method, path), ("PATCH", f"repos/{REPO}/issues/comments/777"))
+            self.comment.update(data)
+            return self.comment
+
+        def spawn(job):
+            self.queued.append(job)
+            return Mock(object_id="fix")
+
+        with (patch.object(runner, "github", side_effect=self.github),
+              patch.object(runner, "github_request", side_effect=update),
+              patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim))),
+              patch.object(runner.worker, "spawn", side_effect=spawn), patch.object(runner, "log")):
+            job = runner.event_job("issue_comment", payload)
+            if job:
+                runner.worker.local(job)
+
+    def test_checkbox_tick_queues_once_and_consumes_action(self):
+        payload = self.checkbox_event()
+        self.run_checkbox(payload)
+        self.assertEqual(len(self.queued), 1)
+        fix = self.queued[0]
+        self.assertEqual((fix["head"], fix["bypass_depth"], fix["author"]), (HEAD, True, "kas"))
+        self.assertIn("[P1] Wrong lookup", fix["prompt"])
+        self.assertNotIn("[P3]", fix["prompt"])
+        self.assertIn("queued by @kas", self.comment["body"])
+        self.assertNotIn(runner.FIX_ANYWAY_CHECKED, self.comment["body"])
+        self.run_checkbox(payload)  # redelivery reads the consumed source
+        untick = copy.deepcopy(payload)
+        untick["changes"]["body"]["from"] = payload["comment"]["body"]
+        untick["comment"]["body"] = payload["changes"]["body"]["from"]
+        self.run_checkbox(untick)
+        self.comment["body"] = payload["comment"]["body"]  # restore and tick again
+        self.run_checkbox(payload)
+        self.assertEqual(len(self.queued), 1)
+
+    def test_checkbox_rejects_unauthorized_author_and_unrelated_edits(self):
+        original = copy.deepcopy(self.comment)
+        for case in ("read", "author", "sender", "unchanged", "marker", "head", "identity", "issue"):
+            with self.subTest(case=case):
+                self.comment = copy.deepcopy(original)
+                self.permission = "read" if case == "read" else "write"
+                payload = self.checkbox_event()
+                if case == "author":
+                    payload["comment"]["user"] = {"login": "kas", "type": "User"}
+                elif case == "sender":
+                    payload["sender"] = dict(TRUSTED_BOT)
+                elif case == "unchanged":
+                    payload["changes"]["body"]["from"] = payload["comment"]["body"]
+                elif case == "marker":
+                    payload["comment"]["body"] = runner.FIX_ANYWAY_CHECKED
+                elif case == "head":
+                    payload["comment"]["body"] = payload["comment"]["body"].replace(HEAD, "bad")
+                elif case == "identity":
+                    payload["comment"]["user"]["id"] = 1
+                elif case == "issue":
+                    payload["issue"].pop("pull_request")
+                self.run_checkbox(payload)
+                self.assertEqual(self.queued, [])
+
+    def test_checkbox_stale_head_consumes_action_without_fix(self):
+        payload = self.checkbox_event()
+        self.pr["head"]["sha"] = "c" * 40
+        self.run_checkbox(payload)
+        self.assertEqual(self.queued, [])
+        self.assertIn("stale head", self.comment["body"])
+        self.assertNotIn(runner.FIX_ANYWAY_CHECKED, self.comment["body"])
+        self.assertEqual(runner.pr_agent_review_state(self.comment["body"])["head"], HEAD)
+
+    def test_checkbox_fallback_and_check_share_the_finding_claim(self):
+        payload = self.checkbox_event()
+        self.run_checkbox(payload)
+        with patch.object(runner, "github", side_effect=self.github):
+            fallback = runner.requested_review_fix(runner.event_job(*comment_event("@autokas fix review 777")))
+        self.assertEqual(self.queued[0]["key"], fallback["key"])
+        self.assertEqual(self.queued[0]["key"], self.resolve()["key"])
 
     def github(self, path):
         self.reads.append(path)
