@@ -307,6 +307,7 @@ class PRReviewRunTests(unittest.TestCase):
         self.github = Mock(side_effect=github)
         with patch.object(runner, "github", self.github), patch.object(runner.subprocess, "run", self.run), \
                 patch.object(runner, "checkout_pr_diff", self.checkout), \
+                patch.object(runner, "merge_base_patch", return_value=""), \
                 patch.object(runner, "github_request", side_effect=post), \
                 patch.object(runner, "dispatch", side_effect=self.dispatched.append):
             runner.pr_review.local(job)
@@ -957,6 +958,167 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertFalse(any("ghs_installation_token" in part for command in commands for part in command))
         self.assertFalse(any("proxy-secret-key" in value for call in run.call_args_list
                              for value in call.kwargs["env"].values()))
+
+
+class PRReviewStackTests(unittest.TestCase):
+    def setUp(self):
+        self.smoke = GitOmpSmoke("main")
+        self.addCleanup(self.smoke.close)
+        self.origin = self.smoke.root / "origin.git"
+        self.smoke.origin = self.origin
+        self.git(["init", "--bare", str(self.origin)])
+        self.git(["config", "user.name", "test"])
+        self.git(["config", "user.email", "test@example.com"])
+        self.smoke.env["GIT_CONFIG_GLOBAL"] = str(self.smoke.root / "gitconfig")
+        self.git(["config", "--global", f"url.{self.origin}.insteadOf", f"https://github.com/{REPO}.git"])
+        self.commit("base.txt", "base\n")
+        self.git(["checkout", "-b", "pr1"])
+        self.commit("parent.txt", "parent one\n")
+        self.commit("parent.txt", "parent one\nparent two\n")
+        self.git(["checkout", "-b", "pr2"])
+        self.commit("parser.py", "result = 'broken'\n")
+        self.git(["remote", "add", "origin", str(self.origin)])
+        self.publish()
+        self.pr = copy.deepcopy(PR)
+        self.pr["base"]["ref"], self.pr["head"]["ref"] = "pr1", "pr2"
+        self.comments, self.checks, self.calls, self.dispatched, self.logs = [], [], [], [], []
+        for target, kwargs in (
+            ("github_token", {"return_value": "disposable-token"}),
+            ("check_proxy_model", {}),
+            ("github", {"side_effect": self.github}),
+            ("github_request", {"side_effect": self.request}),
+            ("dispatch", {"side_effect": self.dispatched.append}),
+            ("log", {"side_effect": lambda event, **fields: self.logs.append((event, fields))}),
+        ):
+            patcher = patch.object(runner, target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        environ = patch.dict(runner.os.environ, {"CLI_PROXY_API_KEY": "disposable-key"})
+        environ.start()
+        self.addCleanup(environ.stop)
+        process = patch.object(runner.subprocess, "run", side_effect=self.run_process)
+        process.start()
+        self.addCleanup(process.stop)
+
+    def git(self, args, cwd=None):
+        return self.smoke.git(args, cwd=cwd).stdout.strip()
+
+    def commit(self, filename, content):
+        (self.smoke.checkout / filename).write_text(content)
+        self.git(["add", filename])
+        self.git(["commit", "-m", f"update {filename}"])
+
+    def publish(self):
+        self.git(["push", "--force", "origin", "main", "pr1", "pr2", "pr2:refs/pull/42/head"])
+
+    def github(self, path):
+        if path.endswith("/permission"):
+            return {"permission": "write"}
+        if "/comments?" in path:
+            return copy.deepcopy(self.comments) if path.endswith("page=1") else []
+        if "/compare/" in path:
+            left, right = path.split("/compare/", 1)[1].split("?", 1)[0].split("...")
+            return {"merge_base_commit": {"sha": self.git(["merge-base", left, right], self.origin)}}
+        if path == f"repos/{REPO}/pulls/42":
+            pr = copy.deepcopy(self.pr)
+            for side in ("base", "head"):
+                pr[side]["sha"] = self.git(["rev-parse", pr[side]["ref"]], self.origin)
+            return pr
+        raise AssertionError(f"unexpected GitHub read: {path}")
+
+    def request(self, method, path, payload):
+        if "/check-runs" in path:
+            self.checks.append((method, path, copy.deepcopy(payload)))
+            return {"id": 88}
+        self.assertEqual((method, path), ("POST", f"repos/{REPO}/issues/42/comments"))
+        number = 777 + len(self.comments)
+        comment = {"id": number, "body": payload["body"],
+                   "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
+                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
+                   "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-{number}"}
+        self.comments.append(comment)
+        return copy.deepcopy(comment)
+
+    def run_process(self, args, **kwargs):
+        if args[0] == "git":
+            return self.smoke.run(args, **kwargs)
+        self.assertIn("--diff-file", args)
+        self.calls.append({"diff": Path(args[args.index("--diff-file") + 1]).read_text(),
+                           "instructions": kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"]})
+        Path(args[args.index("--output") + 1]).write_text("## PR Reviewer Guide\nP1 Wrong lookup")
+        Path(args[args.index("--json-output") + 1]).write_text(json.dumps(
+            {"review": {"key_issues_to_review": [ISSUES[0]]}}))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def review(self, previous=None, command=False):
+        if command:
+            job = runner.event_job(*comment_event("!kas review"))
+        else:
+            head = self.git(["rev-parse", "pr2"])
+            job = {"mode": "pr_review", "kind": "pull_request", "repo": REPO, "pr": 42,
+                   "head": head, "key": f"{REPO}:pr_review:42:{head}"}
+            if previous:
+                job.update(action="synchronize", previous_head=previous)
+        runner.pr_review.local(job)
+
+    def skipped_restack(self):
+        self.review()
+        first = runner.pr_agent_review_state(self.comments[0]["body"])
+        self.assertEqual(first["round"], 1)
+        self.assertTrue(first["patch"])
+        self.assertEqual(first["findings"][0]["severity"], "P1")
+        old_head = self.git(["rev-parse", "pr2"])
+        self.git(["checkout", "main"])
+        self.git(["merge", "--squash", "pr1"])
+        self.git(["commit", "-m", "squash parent"])
+        self.git(["rebase", "--onto", "main", "pr1", "pr2"])
+        self.publish()
+        self.pr["base"]["ref"] = "main"
+        restacked = self.git(["rev-parse", "pr2"])
+        self.assertNotEqual(old_head, restacked)
+        before = (len(self.calls), len(self.comments), len(self.dispatched))
+        self.review(previous=old_head)
+        self.assertEqual((len(self.calls), len(self.comments), len(self.dispatched)), before)
+        check = self.checks[-1][2]
+        self.assertEqual(check["conclusion"], "failure")
+        self.assertEqual(check["output"]["title"],
+                         f"diff unchanged since {first['head'][:7]}, review skipped · "
+                         + runner.review_conclusion(first["findings"])[1])
+        self.assertEqual(check["details_url"], self.comments[0]["html_url"])
+        self.assertIn("pr_review_skipped", [event for event, _ in self.logs])
+        next_round, _, latest = runner.pr_agent_history(REPO, 42)
+        self.assertEqual(next_round, 2)
+        self.assertEqual(latest["round"], 1)
+        self.assertEqual(latest["patch"], first["patch"])
+        return restacked, first
+
+    def test_restack_with_an_unchanged_diff_skips_review_but_kas_review_still_runs(self):
+        self.skipped_restack()
+        self.review(command=True)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.comments), 2)
+        self.assertEqual(runner.pr_agent_review_state(self.comments[-1]["body"])["round"], 2)
+
+    def test_one_line_push_after_a_skipped_restack_is_reviewed_from_the_restacked_head(self):
+        restacked, first = self.skipped_restack()
+        self.commit("parser.py", "result = 'broken'\nnew_line = True\n")
+        self.publish()
+        self.review(previous=restacked)
+        self.assertEqual(len(self.calls), 2)
+        diff = self.calls[-1]["diff"]
+        added = [line for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
+        removed = [line for line in diff.splitlines() if line.startswith("-") and not line.startswith("---")]
+        self.assertEqual(added, ["+new_line = True"])
+        self.assertEqual(removed, [])
+        self.assertNotIn("parent.txt", diff)
+        instructions = self.calls[-1]["instructions"]
+        self.assertIn("scoped re-review", instructions)
+        self.assertIn(json.dumps(first["findings"]), instructions)
+        latest = runner.pr_agent_review_state(self.comments[-1]["body"])
+        self.assertEqual(latest["round"], 2)
+        self.assertFalse(latest.get("restack"))
+        self.assertTrue(latest["patch"])
+        self.assertNotEqual(latest["patch"], first["patch"])
 
 
 class FixPublicationTests(unittest.TestCase):
