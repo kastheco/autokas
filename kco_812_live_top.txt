@@ -1,1 +1,2 @@
 disposable top fixture for the approved live stack verification.
+one-line push after the skipped restack.
