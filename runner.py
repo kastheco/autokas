@@ -304,8 +304,8 @@ comment for a !kas command, replace that comment's body with the full overall
 outcome, keeping its acknowledgment_marker. That edited comment is the single
 overall PR outcome, so don't post another one. Use gh api --method PATCH
 <acknowledgment.path> with the replacement body as JSON on stdin. Before editing,
-fetch the comment and verify its author against the GitHub user identified by
-trusted acknowledgment_author and its exact marker. For issue commands, verify
+fetch the comment and verify its author is the trusted bot_login account and its
+body has the exact acknowledgment_marker. For issue commands, verify
 issue_url matches https://api.github.com/repos/<repo>/issues/<pr>. For PR commands,
 verify its PR relationship. Never edit another author's comment. Read back an
 uncertain PATCH once rather than blindly repeating it. Post a new outcome comment
@@ -318,8 +318,8 @@ single overall PR outcome described below, and resolve only the exact targeted
 threads whose findings were actually fixed.
 Before reporting an obsolete finding, check whether an earlier runner job already
 published and reported its fix on this same PR. Read and paginate PR conversation
-comments and the source review thread replies; verify authors against the
-authenticated GitHub identity. A queued acknowledgment is not a fix outcome.
+comments and the source review thread replies; verify authors against the trusted
+bot_login account, never GET /user. A queued acknowledgment is not a fix outcome.
 Require a confirmed earlier fix outcome covering this exact source finding, a
 published commit reachable from the current PR head, and current code that still
 addresses the finding. A whole-review outcome can cover an inline finding only
@@ -332,13 +332,21 @@ outcome comment: <!-- omp-runner:fix {"commit":"<confirmed full SHA>","findings"
 use only the exact keys from trusted context finding_keys, and include only findings
 actually fixed by that commit. never add this marker for rejected or blocked work.
 for an already-handled exit, write {"outcome_comment_id":<earlier PR conversation
-comment ID>} to outcome_evidence_file before writing outcome_file. the earlier
-comment must have this marker covering every finding key. the host requires its
-own publication receipt binding every marker key to the publishing job's trusted
-finding_keys. it also verifies the comment's author, PR relationship, age and
-reachable commit, and requires the current Git tree to equal that fixed commit's
-tree. missing receipts or later tree changes leave verification unconfirmed.
-report that limit on the PR and finish uncertain instead.
+comment ID>} to outcome_evidence_file before writing outcome_file. if the earlier
+marker doesn't cover a current finding key, optionally include "duplicates":
+{"<current key>":["<original covered key>", ...]}. map every uncovered current key,
+including the job key and all target keys, only after reading the current finding,
+the original finding, the fix diff and the current checkout and confirming the
+same defect is fixed. shared paths, nearby lines, similar wording, resolved or
+outdated threads and third-party replies aren't enough. if any finding isn't
+clearly the same fixed defect, take the normal fix or blocked path, never partial
+reuse. map only uncovered current keys to nonempty lists of original marker keys.
+the host requires its own publication receipt binding every original marker key
+to the publishing job's trusted finding_keys. duplicate keys never expand that
+receipt or extend its seven-day lifetime. it also verifies the comment's author,
+PR relationship, age and reachable commit, and requires the current Git tree to
+equal that fixed commit's tree. missing receipts or later tree changes leave
+verification unconfirmed. report that limit on the PR and finish uncertain instead.
 If every finding is already fixed and covered by that verified runner outcome,
 stop without any PR comment, thread reply, commit or push. Record "already handled"
 and the existing outcome URL in your final local output. For a mixed event, link
@@ -470,7 +478,7 @@ COMMAND_RETRY_POLICY = """this is a reporting-only retry of a !kas command.
 these retry rules override COMMAND_POLICY and the PR-fix policy where they differ.
 the trusted context's command_resume contains the runner's publication evidence.
 never execute the original command again, edit repository files, commit or push.
-use GitHub reads to reconcile earlier outcome comments from the authenticated bot
+use GitHub reads to reconcile earlier outcome comments from the trusted bot_login
 for this exact command before posting. update the existing queued acknowledgment
 and resume missing outcome reporting, with the source and Modal run links. don't
 post another overall outcome if a verified earlier one already covers this command.
@@ -1338,8 +1346,17 @@ def already_handled_confirmed(job: dict[str, Any], pr: dict[str, Any], branch: s
         outcome = json.loads(markers[0])
         covered = outcome["findings"]
         commit = outcome["commit"]
-        if (not isinstance(covered, list) or not all(key in covered for key in finding_keys(job))
+        current_keys = finding_keys(job)
+        duplicates = evidence.get("duplicates", {})
+        if (not isinstance(covered, list) or not isinstance(duplicates, dict)
                 or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+            return False
+        for key, originals in duplicates.items():
+            if (key not in current_keys or key in covered or not isinstance(originals, list)
+                    or not originals or not all(isinstance(original, str) and original in covered
+                                                for original in originals)):
+                return False
+        if not all(key in covered or key in duplicates for key in current_keys):
             return False
         publication = CLAIMS.get(f"fix:{repo}:{number}:{commit}", None)
         if (not isinstance(publication, dict) or publication.get("branch") != branch
@@ -2692,6 +2709,7 @@ class PRWorker:
                 if call_id:
                     modal_run_links["Modal coding run"] = f"https://modal.com/id/{call_id}"
                 context = {"repo": repo, "pr": number, "branch": branch, "starting_head": head,
+                           "bot_login": CONFIG["git_author"]["name"],
                            "modal_run_links": modal_run_links,
                            "source_kind": job["kind"], "source_comment_id": job["comment"],
                            "target": job.get("target", "pr"),
@@ -2706,8 +2724,7 @@ class PRWorker:
                 started_at = time.time()
                 if job.get("mode") == "command":
                     context["command_commit_trailer"] = "Autokas-Command: " + hashlib.sha256(job["key"].encode()).hexdigest()
-                    context.update(acknowledgment_author=CONFIG["git_author"]["name"],
-                                   acknowledgment=job.get("acknowledgment"),
+                    context.update(acknowledgment=job.get("acknowledgment"),
                                    acknowledgment_marker="<!-- omp-runner:queued:"
                                    + hashlib.sha256(job["key"].encode()).hexdigest() + " -->")
                 else:
