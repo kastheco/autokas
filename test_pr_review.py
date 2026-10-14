@@ -1182,7 +1182,7 @@ class FixPublicationTests(unittest.TestCase):
         self.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", message], cwd)
 
     def run_fix(self, movement="restack", pr_changes=None, compare_error=None, code=0, prior_outcome=None,
-                write_evidence=True, commit_owner=None):
+                write_evidence=True, commit_owner=None, duplicate_evidence=None):
         self.dispatched, self.logs, self.labels = [], [], []
         comment = {"body": self.body, "user": {**runner.CONFIG[self.job["reviewer"]], "type": "Bot"},
                    "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
@@ -1234,7 +1234,8 @@ class FixPublicationTests(unittest.TestCase):
             context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
             Path(context["outcome_file"]).write_text("already handled\n" if movement == "handled" else "published\n")
             if movement == "handled" and write_evidence:
-                Path(context["outcome_evidence_file"]).write_text(json.dumps({"outcome_comment_id": 888}))
+                Path(context["outcome_evidence_file"]).write_text(json.dumps(
+                    {"outcome_comment_id": 888, **(duplicate_evidence or {})}))
             if movement not in {"no_change", "handled"}:
                 (cwd / "parser.py").write_text("result = 'fixed'\n")
                 self.commit(cwd, "fix: parser")
@@ -1362,6 +1363,61 @@ class FixPublicationTests(unittest.TestCase):
         self.assertEqual(self.labels, ["fixing", "fixed"])
         self.assertEqual(self.git(["rev-parse", f"refs/heads/{PR['head']['ref']}"], self.origin), self.fix_head)
         self.assertEqual(self.dispatched, [])
+
+    def published_duplicate(self):
+        self.run_fix("exact")
+        self.git(["update-ref", "refs/pull/42/head", self.fix_head], self.origin)
+        self.job.pop("head")
+        self.job.update(reviewer="coderabbit", key="second-source-review")
+        self.body = "<details>\n<summary>Prompt for AI Agents</summary>\n\n```\nfix the parser\n```\n\n</details>"
+        self.job["prompt"] = runner.agent_prompt(self.body)
+        self.job["targets"] = [{"comment": 779,
+                                "finding_url": f"https://github.com/{REPO}/pull/42#discussion_r779",
+                                "key": "second-source-inline"}]
+        return {"user": {"login": "autokas[bot]", "id": 334744567},
+                "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "body": "published.\n<!-- omp-runner:fix " + json.dumps({
+                    "commit": self.fix_head, "findings": ["publication-race"]}) + " -->"}
+
+    def test_second_source_duplicate_reuses_published_fix_without_push(self):
+        outcome = self.published_duplicate()
+        receipt_key = f"fix:{REPO}:42:{self.fix_head}"
+        receipt = copy.deepcopy(self.claims[receipt_key])
+        duplicates = {key: ["publication-race"] for key in runner.finding_keys(self.job)}
+        with patch.object(self.smoke, "git", wraps=self.smoke.git) as git:
+            self.run_fix("handled", prior_outcome=outcome, duplicate_evidence={"duplicates": duplicates})
+        self.assertEqual(self.labels, ["fixing", "fixed"])
+        self.assertEqual(self.remote_head, self.fix_head)
+        self.assertEqual(self.git(["show", f"{self.remote_head}:parser.py"], self.origin), "result = 'fixed'")
+        self.assertFalse(any(call.args[0][0] == "push" for call in git.call_args_list))
+        self.assertEqual(self.claims[receipt_key], receipt)
+        self.assertEqual(self.dispatched, [])
+
+    def test_second_source_without_duplicate_map_stays_blocked(self):
+        outcome = self.published_duplicate()
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(self.labels, ["fixing", "blocked"])
+
+    def test_invalid_duplicate_maps_stay_blocked(self):
+        outcome = self.published_duplicate()
+        valid = {key: ["publication-race"] for key in runner.finding_keys(self.job)}
+        cases = [None, [], {"second-source-review": ["publication-race"]},
+                 {**valid, "foreign-key": ["publication-race"]},
+                 {**valid, "second-source-inline": ["uncovered"]},
+                 *[{**valid, "second-source-inline": value} for value in ([], "publication-race", [1], None)]]
+        for duplicates in cases:
+            with self.subTest(duplicates=duplicates):
+                self.run_fix("handled", prior_outcome=outcome, duplicate_evidence={"duplicates": duplicates})
+                self.assertEqual(self.labels, ["fixing", "blocked"])
+                self.assertEqual(self.remote_head, self.fix_head)
+                self.assertEqual(self.dispatched, [])
+
+    def test_duplicate_map_cannot_remap_an_already_covered_key(self):
+        outcome = self.earlier_fix()
+        self.run_fix("handled", prior_outcome=outcome,
+                     duplicate_evidence={"duplicates": {self.job["key"]: ["inline-fingerprint"]}})
+        self.assertEqual(self.labels, ["fixing", "blocked"])
 
     def test_published_job_cannot_claim_an_unrelated_later_finding(self):
         self.run_fix("exact")
