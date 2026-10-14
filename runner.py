@@ -286,8 +286,8 @@ comment for a !kas command, replace that comment's body with the full overall
 outcome, keeping its acknowledgment_marker. That edited comment is the single
 overall PR outcome, so don't post another one. Use gh api --method PATCH
 <acknowledgment.path> with the replacement body as JSON on stdin. Before editing,
-fetch the comment and verify its author against the GitHub user identified by
-trusted acknowledgment_author and its exact marker. For issue commands, verify
+fetch the comment and verify its author is the trusted bot_login account and its
+body has the exact acknowledgment_marker. For issue commands, verify
 issue_url matches https://api.github.com/repos/<repo>/issues/<pr>. For PR commands,
 verify its PR relationship. Never edit another author's comment. Read back an
 uncertain PATCH once rather than blindly repeating it. Post a new outcome comment
@@ -300,8 +300,8 @@ single overall PR outcome described below, and resolve only the exact targeted
 threads whose findings were actually fixed.
 Before reporting an obsolete finding, check whether an earlier runner job already
 published and reported its fix on this same PR. Read and paginate PR conversation
-comments and the source review thread replies; verify authors against the
-authenticated GitHub identity. A queued acknowledgment is not a fix outcome.
+comments and the source review thread replies; verify authors against the trusted
+bot_login account, never GET /user. A queued acknowledgment is not a fix outcome.
 Require a confirmed earlier fix outcome covering this exact source finding, a
 published commit reachable from the current PR head, and current code that still
 addresses the finding. A whole-review outcome can cover an inline finding only
@@ -460,7 +460,7 @@ COMMAND_RETRY_POLICY = """this is a reporting-only retry of a !kas command.
 these retry rules override COMMAND_POLICY and the PR-fix policy where they differ.
 the trusted context's command_resume contains the runner's publication evidence.
 never execute the original command again, edit repository files, commit or push.
-use GitHub reads to reconcile earlier outcome comments from the authenticated bot
+use GitHub reads to reconcile earlier outcome comments from the trusted bot_login
 for this exact command before posting. update the existing queued acknowledgment
 and resume missing outcome reporting, with the source and Modal run links. don't
 post another overall outcome if a verified earlier one already covers this command.
@@ -2690,6 +2690,7 @@ class PRWorker:
                 if call_id:
                     modal_run_links["Modal coding run"] = f"https://modal.com/id/{call_id}"
                 context = {"repo": repo, "pr": number, "branch": branch, "starting_head": head,
+                           "bot_login": CONFIG["git_author"]["name"],
                            "modal_run_links": modal_run_links,
                            "source_kind": job["kind"], "source_comment_id": job["comment"],
                            "target": job.get("target", "pr"),
@@ -2704,8 +2705,7 @@ class PRWorker:
                 started_at = time.time()
                 if job.get("mode") == "command":
                     context["command_commit_trailer"] = "Autokas-Command: " + hashlib.sha256(job["key"].encode()).hexdigest()
-                    context.update(acknowledgment_author=CONFIG["git_author"]["name"],
-                                   acknowledgment=job.get("acknowledgment"),
+                    context.update(acknowledgment=job.get("acknowledgment"),
                                    acknowledgment_marker="<!-- omp-runner:queued:"
                                    + hashlib.sha256(job["key"].encode()).hexdigest() + " -->")
                 else:

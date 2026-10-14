@@ -1231,7 +1231,7 @@ class FixPublicationTests(unittest.TestCase):
 
         def capture_omp(args, *, cwd, **kwargs):
             policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
-            context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
+            context = self.context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
             Path(context["outcome_file"]).write_text("already handled\n" if movement == "handled" else "published\n")
             if movement == "handled" and write_evidence:
                 Path(context["outcome_evidence_file"]).write_text(json.dumps(
@@ -1393,6 +1393,7 @@ class FixPublicationTests(unittest.TestCase):
         self.assertFalse(any(call.args[0][0] == "push" for call in git.call_args_list))
         self.assertEqual(self.claims[receipt_key], receipt)
         self.assertEqual(self.dispatched, [])
+        self.assertEqual(self.context["bot_login"], "autokas[bot]")
 
     def test_second_source_without_duplicate_map_stays_blocked(self):
         outcome = self.published_duplicate()
