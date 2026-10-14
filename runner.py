@@ -666,7 +666,7 @@ def docs_path_allowed(path: str, folders: list[str]) -> bool:
 
 def log(event: str, **fields: Any) -> None:
     """Write operational evidence without comment bodies or credentials."""
-    digest = TEAM.get("repo_images", {}).get(str(fields.get("repo", "")).lower(), TEAM["image"])
+    digest = REPO_IMAGES.get(str(fields.get("repo", "")).lower(), TEAM["image"])
     print(json.dumps({"event": event, "revision": REVISION, "team_image": digest, **fields}), flush=True)
 
 
@@ -2477,9 +2477,6 @@ def linear_planner(job: dict[str, Any], checkout: bytes, proxy_key: str,
         return linear_rpc(args, worktree, env, job, job["prompt"], deadline, mark_finishing=False)
 
 
-linear_planner = app.function(image=IMAGE, secrets=[], retries=0, single_use_containers=True,
-                              timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192,
-                              name="linear_planner")(_linear_planner)
 
 
 def linear_plan(text: str) -> list[dict[str, str]]:

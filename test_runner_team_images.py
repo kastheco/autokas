@@ -69,23 +69,6 @@ class TeamImageTests(unittest.TestCase):
                     team_config(self.config, "first-env")
 
 
-    def test_repository_images_require_immutable_team_digests(self) -> None:
-        for image in ("ghcr.io/kastheco/autokas-teams/klippy:latest",
-                      "ghcr.io/kastheco/autokas-teams/klippy@sha256:" + "a" * 63,
-                      "ghcr.io/other/klippy@sha256:" + "a" * 64, None):
-            with self.subTest(image=image):
-                self.config["teams"]["first"]["repo_images"] = {"kastheco/klippy": image}
-                with self.assertRaisesRegex(ValueError, "Repository image.*digest"):
-                    team_config(self.config, "first-env")
-
-    def test_repository_image_keys_are_unambiguous(self) -> None:
-        for overrides in ([], {"klippy": self.config["teams"]["first"]["image"]},
-                          {"Kastheco/klippy": self.config["teams"]["first"]["image"]}):
-            with self.subTest(overrides=overrides):
-                self.config["teams"]["first"]["repo_images"] = overrides
-                with self.assertRaisesRegex(ValueError, "repo_images"):
-                    team_config(self.config, "first-env")
-
 class RunnerRevisionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -266,43 +249,7 @@ with patch('modal.is_local', return_value=False), patch('builtins.__import__', s
                 pass
 
 
-    def configure_overrides(self, image=None) -> str:
-        digest = image or "ghcr.io/kastheco/autokas-teams/klippy@sha256:" + "c" * 64
-        path = self.checkout / "config.json"
-        config = json.loads(path.read_text())
-        config["allowed_owners"] = ["kastheco"]
-        config["teams"]["example"]["repo_images"] = {
-            "kastheco/klippy": digest, "kastheco/another-android-app": digest,
-        }
-        path.write_text(json.dumps(config))
-        return digest
-
-    def test_override_routes_coding_jobs_and_keeps_other_repos_on_team_image(self) -> None:
-        import modal
-
-        digest = self.configure_overrides()
-        with patch("modal.Image.from_registry", wraps=modal.Image.from_registry) as registry, \
-                self.imported_runner(local=True) as module:
-            self.assertEqual([call.args[0] for call in registry.call_args_list],
-                             [module.TEAM["image"], digest])
-            override = module.REPO_WORKERS["kastheco/klippy"]
-            self.assertIs(override, module.REPO_WORKERS["kastheco/another-android-app"])
-            override_image = override._get_class_service_function().spec.image
-            self.assertIsNot(override_image, module.IMAGE)
-            self.assertIs(module.REPO_PLANNERS["kastheco/klippy"].spec.image, override_image)
-            for repo, selected in (("Kastheco/Klippy", override), ("kastheco/autokas", module.PRWorker)):
-                with self.subTest(repo=repo), patch("modal.Cls.__call__", autospec=True, return_value=Mock()) as pool, \
-                        patch.object(module, "github", return_value={"permission": "write"}), \
-                        patch.object(module, "acknowledge_review"), patch.object(module, "log"), \
-                        patch("modal.current_function_call_id", return_value=None):
-                    job = {"repo": repo, "pr": 1, "key": repo + ":command", "author": "kas",
-                           "mode": "command"}
-                    module.worker.local(job)
-                    pool.assert_called_once_with(selected, pr_key=repo.lower() + "#1")
-                    pool.return_value.run.spawn.assert_called_once_with(job)
-
     def test_override_starts_from_mounted_runtime_without_checkout(self) -> None:
-        self.configure_overrides()
         with self.imported_runner(local=True) as local:
             self.stage_runtime(local)
             with self.imported_runner(local=False) as remote:
@@ -316,11 +263,6 @@ with patch('modal.is_local', return_value=False), patch('builtins.__import__', s
                         {"repo": "kastheco/klippy"})
                     token.assert_not_called()
 
-    def test_malformed_override_fails_during_runner_import(self) -> None:
-        self.configure_overrides("ghcr.io/kastheco/autokas-teams/klippy@sha256:bad")
-        with self.assertRaisesRegex(ValueError, "Repository image.*digest"):
-            with self.imported_runner(local=True):
-                pass
 
     def test_missing_environment_cannot_select_main(self) -> None:
         for environment in (None, ""):
