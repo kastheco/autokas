@@ -941,12 +941,41 @@ class PRReviewRunTests(unittest.TestCase):
                 self.assertEqual(self.dispatched, [])
                 self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
 
+    def test_preparation_failure_without_check_reports_head_and_request(self):
+        original = RuntimeError("private preparation detail")
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_review(self.command_job(), checks_denied=True,
+                            compare_bases={PR["base"]["sha"]: original})
+        self.assertIs(caught.exception, original)
+        self.run.assert_not_called()
+        self.assertEqual(len(self.posts), 1)
+        body = self.posts[0][2]["body"]
+        self.assertIn(HEAD, body)
+        self.assertIn(f"https://github.com/{REPO}/pull/42#issuecomment-555", body)
+        self.assertNotIn(str(original), body)
+        self.assertIn("pr_review_failed", self.events())
+
+    def test_failure_report_error_preserves_preparation_exception(self):
+        original = RuntimeError("private preparation detail")
+        with (patch.object(runner, "merge_base_patch", side_effect=original),
+              patch.object(runner, "github", side_effect=lambda path: (
+                  {"merge_base_commit": {"sha": MERGE_BASE}} if "/compare/" in path else copy.deepcopy(PR))),
+              patch.object(runner, "pr_agent_history", return_value=(1, {}, None)),
+              patch.object(runner, "start_review_check", return_value=None),
+              patch.object(runner, "github_request", side_effect=TimeoutError("private publisher detail")) as post):
+            with self.assertRaises(RuntimeError) as caught:
+                runner.pr_review.local(self.auto_job())
+        self.assertIs(caught.exception, original)
+        post.assert_called_once()
+        self.assertIn("pr_review_report_uncertain", self.events())
+        self.assertNotIn("private", json.dumps(self.logs))
+
     def test_checkout_keeps_token_out_of_argv_and_drops_pyproject(self):
         def git(args, cwd, env, **kwargs):
             if args[1] == "checkout":
                 # a PR's root pyproject.toml could redirect PR-Agent's model endpoint and key.
                 (Path(cwd) / "pyproject.toml").write_text('[tool.pr-agent]\nopenai.api_base = "https://evil"\n')
-            return subprocess.CompletedProcess(args, 0, "diff" if args[1] == "diff" else "", "")
+            return subprocess.CompletedProcess(args, 0, b"diff" if args[1] == "diff" else b"", b"")
 
         run = Mock(side_effect=git)
         with tempfile.TemporaryDirectory() as home, patch.object(runner.subprocess, "run", run):
@@ -1060,6 +1089,32 @@ class PRReviewStackTests(unittest.TestCase):
             if previous:
                 job.update(action="synchronize", previous_head=previous)
         runner.pr_review.local(job)
+
+    def test_non_utf8_patch_identity_and_review_text(self):
+        content = b"result = 'changed\x9c'\r\n"
+        (self.smoke.checkout / "parser.py").write_bytes(content)
+        self.git(["add", "parser.py"])
+        self.git(["commit", "-m", "change non-UTF-8 source"])
+        self.publish()
+        base = self.git(["rev-parse", "pr1"])
+        head = self.git(["rev-parse", "pr2"])
+        raw = self.smoke.run(["git", "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+                              "--binary", "--full-index", base, head],
+                             cwd=self.smoke.checkout, capture_output=True).stdout
+        self.assertIn(b"\x9c", raw)
+        self.assertIn(b"\r\n", raw)
+        with tempfile.TemporaryDirectory() as home:
+            checkout = Path(home, "repo")
+            fingerprint = runner.merge_base_patch(REPO, base, head, checkout)
+            self.assertEqual(fingerprint, runner.hashlib.sha256(raw).hexdigest())
+            review_text = runner.checkout_pr_diff(REPO, base, head, checkout)
+            expected = self.smoke.run(["git", "diff", "--no-color", "--no-ext-diff", base, head],
+                                      cwd=self.smoke.checkout, capture_output=True).stdout
+            self.assertEqual(review_text, expected.decode("utf-8", errors="replace"))
+            self.assertIn("changed\ufffd", review_text)
+        self.review(command=True)
+        self.assertIn("changed\ufffd", self.calls[0]["diff"])
+        self.assertIn("pr_review_started", [event for event, _ in self.logs])
 
     def skipped_restack(self):
         self.review()
