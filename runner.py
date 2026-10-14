@@ -1866,15 +1866,14 @@ def pr_git(repo: str, checkout: Path):
 
 
 def merge_base_patch(repo: str, base: str, commit: str, checkout: Path) -> str:
-    """Identify the merge-base diff without checking out PR-controlled files."""
+    """Identify the exact merge-base diff, including edited locations and blob identities."""
     checkout.mkdir(exist_ok=True)
     git = pr_git(repo, checkout)
     if not (checkout / ".git").is_dir():
         git("init", "-q")
     git("fetch", "-q", "--depth=1", "--no-tags", f"https://github.com/{repo}.git", base, commit)
     diff = git("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", base, commit)
-    identity = git("patch-id", "--verbatim", input=diff).split()
-    return identity[0] if identity else ""
+    return hashlib.sha256(diff.encode()).hexdigest() if diff else ""
 
 
 def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> str:

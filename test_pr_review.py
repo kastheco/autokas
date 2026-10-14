@@ -1092,6 +1092,35 @@ class PRReviewStackTests(unittest.TestCase):
         self.assertEqual(latest["patch"], first["patch"])
         return restacked, first
 
+    def test_same_edit_moved_between_repeated_blocks_requires_review(self):
+        block = "before one\nbefore two\nbefore three\nvalue = 'old'\nafter one\nafter two\nafter three\n"
+        original = block + "separator\n" + block
+        self.git(["checkout", "pr1"])
+        self.commit("repeated.txt", original)
+        self.git(["checkout", "pr2"])
+        self.git(["merge", "pr1", "--no-edit"])
+        self.commit("repeated.txt", original.replace("value = 'old'", "value = 'new'", 1))
+        self.publish()
+        self.review()
+        old_head = self.git(["rev-parse", "pr2"])
+        base = self.git(["rev-parse", "pr1"])
+        first_diff = self.git(["diff", base, old_head])
+        (self.smoke.checkout / "repeated.txt").write_text(
+            block + "separator\n" + block.replace("value = 'old'", "value = 'new'"))
+        self.git(["add", "repeated.txt"])
+        self.git(["commit", "--amend", "--no-edit"])
+        second_diff = self.git(["diff", base, "pr2"])
+        identities = [self.smoke.run(["git", "patch-id", "--verbatim"],
+                                     cwd=self.smoke.checkout, input=diff, text=True,
+                                     capture_output=True, check=True).stdout.split()[0]
+                      for diff in (first_diff, second_diff)]
+        self.assertEqual(identities[0], identities[1])
+        self.publish()
+        self.review(previous=old_head)
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("@@ -9,7 +9,7 @@", self.calls[-1]["diff"])
+        self.assertNotIn("pr_review_skipped", [event for event, _ in self.logs])
+
     def test_restack_with_an_unchanged_diff_skips_review_but_kas_review_still_runs(self):
         self.skipped_restack()
         self.review(command=True)
