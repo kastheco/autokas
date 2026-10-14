@@ -314,13 +314,21 @@ outcome comment: <!-- omp-runner:fix {"commit":"<confirmed full SHA>","findings"
 use only the exact keys from trusted context finding_keys, and include only findings
 actually fixed by that commit. never add this marker for rejected or blocked work.
 for an already-handled exit, write {"outcome_comment_id":<earlier PR conversation
-comment ID>} to outcome_evidence_file before writing outcome_file. the earlier
-comment must have this marker covering every finding key. the host requires its
-own publication receipt binding every marker key to the publishing job's trusted
-finding_keys. it also verifies the comment's author, PR relationship, age and
-reachable commit, and requires the current Git tree to equal that fixed commit's
-tree. missing receipts or later tree changes leave verification unconfirmed.
-report that limit on the PR and finish uncertain instead.
+comment ID>} to outcome_evidence_file before writing outcome_file. if the earlier
+marker doesn't cover a current finding key, optionally include "duplicates":
+{"<current key>":["<original covered key>", ...]}. map every uncovered current key,
+including the job key and all target keys, only after reading the current finding,
+the original finding, the fix diff and the current checkout and confirming the
+same defect is fixed. shared paths, nearby lines, similar wording, resolved or
+outdated threads and third-party replies aren't enough. if any finding isn't
+clearly the same fixed defect, take the normal fix or blocked path, never partial
+reuse. map only uncovered current keys to nonempty lists of original marker keys.
+the host requires its own publication receipt binding every original marker key
+to the publishing job's trusted finding_keys. duplicate keys never expand that
+receipt or extend its seven-day lifetime. it also verifies the comment's author,
+PR relationship, age and reachable commit, and requires the current Git tree to
+equal that fixed commit's tree. missing receipts or later tree changes leave
+verification unconfirmed. report that limit on the PR and finish uncertain instead.
 If every finding is already fixed and covered by that verified runner outcome,
 stop without any PR comment, thread reply, commit or push. Record "already handled"
 and the existing outcome URL in your final local output. For a mixed event, link
@@ -1314,8 +1322,17 @@ def already_handled_confirmed(job: dict[str, Any], pr: dict[str, Any], branch: s
         outcome = json.loads(markers[0])
         covered = outcome["findings"]
         commit = outcome["commit"]
-        if (not isinstance(covered, list) or not all(key in covered for key in finding_keys(job))
+        current_keys = finding_keys(job)
+        duplicates = evidence.get("duplicates", {})
+        if (not isinstance(covered, list) or not isinstance(duplicates, dict)
                 or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+            return False
+        for key, originals in duplicates.items():
+            if (key not in current_keys or key in covered or not isinstance(originals, list)
+                    or not originals or not all(isinstance(original, str) and original in covered
+                                                for original in originals)):
+                return False
+        if not all(key in covered or key in duplicates for key in current_keys):
             return False
         publication = CLAIMS.get(f"fix:{repo}:{number}:{commit}", None)
         if (not isinstance(publication, dict) or publication.get("branch") != branch
