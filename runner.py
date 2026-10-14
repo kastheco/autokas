@@ -332,6 +332,8 @@ Except for that verified already-handled exit or a command acknowledgment whose
 edit is confirmed or uncertain, before every normal exit post one outcome
 comment on this job's PR using
 gh pr comment <pr> --repo <repo> --body-file - with your own summary on stdin.
+Append trusted context.outcome_marker to every new or rewritten overall outcome.
+Keep it outside code fences, including when updating a command acknowledgment.
 This reporting permission is separate from permission to edit or push code: rejected
 findings, disagreements, inability to assess a finding, missing approvals, unavailable
 consultation and failed checks must be visible on the PR, not only in terminal logs.
@@ -1335,6 +1337,58 @@ def already_handled_confirmed(job: dict[str, Any], pr: dict[str, Any], branch: s
     except Exception as error:
         log("already_handled_unconfirmed", key=job["key"], reason=type(error).__name__)
         return False
+
+
+def publish_missing_outcome(job: dict[str, Any], marker: str, body: str) -> None:
+    """Reconcile actual GitHub delivery before filling a missing agent outcome."""
+    repo, number = job["repo"], job["pr"]
+    queued_marker = "<!-- omp-runner:queued:" + hashlib.sha256(job["key"].encode()).hexdigest() + " -->"
+    acknowledgment = None
+    try:
+        account = github(f"users/{CONFIG['git_author']['name']}")
+
+        def owned(comment):
+            user = comment.get("user") or {}
+            return user.get("id") == account["id"] and user.get("login") == account["login"]
+
+        def delivered(comment):
+            text = comment.get("body") or ""
+            return owned(comment) and (marker in text or queued_marker in text) and bool(
+                re.match(r"^### (?:✅|🚫|⛔|❓|↩️) ", text))
+
+        receipt = job.get("acknowledgment")
+        if receipt:
+            category = "pulls" if job["kind"] == "pull_request_review_comment" else "issues"
+            path = f"repos/{repo}/{category}/comments/{int(receipt['id'])}"
+            try:
+                comment = github(path)
+            except urllib.error.HTTPError as error:
+                if error.code != 404:
+                    raise
+            else:
+                relationship = (comment.get("pull_request_url") if category == "pulls" else comment.get("issue_url"))
+                expected = f"https://api.github.com/repos/{repo}/{'pulls' if category == 'pulls' else 'issues'}/{number}"
+                if relationship == expected and owned(comment) and queued_marker in (comment.get("body") or ""):
+                    if delivered(comment):
+                        return
+                    acknowledgment = path
+        for page in range(1, 1000):
+            comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
+            if any(delivered(comment) for comment in comments):
+                return
+            if len(comments) < 100:
+                break
+        else:
+            raise RuntimeError("Outcome comment pagination exceeded its limit")
+    except Exception as error:
+        # A failed read cannot establish absence. Never duplicate an uncertain delivery.
+        log("outcome_delivery_uncertain", key=job["key"], reason=type(error).__name__)
+        return
+    body += "\n\n" + marker
+    if acknowledgment:
+        github_request("PATCH", acknowledgment, {"body": body + "\n\n" + queued_marker})
+    else:
+        github_request("POST", f"repos/{repo}/issues/{number}/comments", {"body": body})
 
 
 def stacked_on(repo: str, parent_head: str, parent_base: str, child_head: str) -> bool:
@@ -2640,6 +2694,8 @@ class PRWorker:
                            "upstack": stacked}
                 outcome_file = root / "outcome.txt"
                 evidence_file = root / "outcome-evidence.json"
+                outcome_marker = "<!-- omp-runner:outcome:" + hashlib.sha256(job["key"].encode()).hexdigest() + " -->"
+                context["outcome_marker"] = outcome_marker
                 started_at = time.time()
                 if job.get("mode") == "command":
                     context["command_commit_trailer"] = "Autokas-Command: " + hashlib.sha256(job["key"].encode()).hexdigest()
@@ -2742,6 +2798,13 @@ class PRWorker:
                     stop_job_processes(process, env)
                 if command_resume is not None:
                     log("command_reporting_exited", key=job["key"], exit_code=code)
+                    links = " · ".join(f"[{title}]({url})" for title, url in modal_run_links.items())
+                    reason = f" with {code}" if code else ""
+                    publish_missing_outcome(job, outcome_marker,
+                        f"### ⛔ blocked · fixer exited{reason} without an outcome · no changes\n\n"
+                        f"start head: `{head}` · end head: not inspected (reporting-only) · "
+                        "remote head: not inspected (reporting-only)"
+                        + (f"\n\n<sub>{links}</sub>" if links else ""))
                     if code:
                         raise RuntimeError(f"command reporting omp exited with {code}")
                     return
@@ -2771,6 +2834,7 @@ class PRWorker:
                     elif code == 0 and final_head == head and remote_head == head:
                         record["state"] = "completed"
                     CLAIMS.put("command:" + job["key"], record)
+                handled = False
                 if labeled:
                     outcome_missing = not outcome_file.is_file()
                     reported = "" if outcome_missing else outcome_file.read_text(encoding="utf-8", errors="replace").strip().lower()
@@ -2781,14 +2845,15 @@ class PRWorker:
                                and already_handled_confirmed(job, pr, branch, evidence_file, started_at))
                     set_fix_label(repo, number, fix_state(code, publication_confirmed, reported, handled), job["key"])
                     labeled = False
-                    if code == 0 and outcome_missing:
-                        change = ("no changes" if final_head == head else
-                                  f"[`{final_head[:7]}`](https://github.com/{repo}/commit/{final_head})")
-                        links = " · ".join(f"[{title}]({url})" for title, url in modal_run_links.items())
-                        github_request("POST", f"repos/{repo}/issues/{number}/comments", {
-                            "body": f"### ⛔ blocked · fixer exited without an outcome · {change}\n\n"
-                                    f"start head: `{head}` · end head: `{final_head}` · remote head: `{remote_head}`"
-                                    + (f"\n\n<sub>{links}</sub>" if links else "")})
+                if not handled:
+                    change = ("no changes" if final_head == head else
+                              f"[`{final_head[:7]}`](https://github.com/{repo}/commit/{final_head})")
+                    links = " · ".join(f"[{title}]({url})" for title, url in modal_run_links.items())
+                    reason = f" with {code}" if code else ""
+                    publish_missing_outcome(job, outcome_marker,
+                        f"### ⛔ blocked · fixer exited{reason} without an outcome · {change}\n\n"
+                        f"start head: `{head}` · end head: `{final_head}` · remote head: `{remote_head}`"
+                        + (f"\n\n<sub>{links}</sub>" if links else ""))
                 if job.get("reviewer") == "pr_agent" and publication_confirmed:
                     dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head))
                 if code:

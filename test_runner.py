@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
-from runner import CONFIG, POLICY, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, review_job, stop_job_processes, upstack
+from runner import CONFIG, POLICY, PRWorker, agent_prompt, bugbot_prompt, command_publication, docs_worker, event_job, publish_missing_outcome, review_job, stop_job_processes, upstack
 from smoke_helper import GitOmpSmoke
 
 def setUpModule():
@@ -526,6 +526,9 @@ class CommandInitializationTests(unittest.TestCase):
         self.git(["git", "update-ref", "refs/pull/142/head", self.head])
         self.values = {}
         self.interrupt_after_start = False
+        self.outcomes = []
+        self.exit_code = 0
+        self.requests = Mock()
         claims = Mock()
         claims.put.side_effect = self.put
         claims.get.side_effect = lambda key, default=None: copy.deepcopy(self.values.get(key, default))
@@ -558,6 +561,12 @@ class CommandInitializationTests(unittest.TestCase):
         observed = {}
 
         def read_github(path):
+            if path == f"users/{CONFIG['git_author']['name']}":
+                return {"login": CONFIG["git_author"]["name"], "id": 334744567}
+            if path.startswith(f"repos/{REPO}/issues/142/comments?"):
+                return self.outcomes
+            if path == f"repos/{REPO}/issues/comments/900":
+                return self.acknowledgment
             if path == f"repos/{REPO}/pulls/142":
                 return {"state": "open", "body": getattr(self, "pr_body", ""), "base": {"ref": "main", "repo": {"full_name": REPO}},
                         "head": {"sha": getattr(self, "remote_head", self.head), "ref": self.branch, "repo": {"full_name": REPO}}}
@@ -578,6 +587,7 @@ class CommandInitializationTests(unittest.TestCase):
             observed["prompt"] = Path(args[-1].removeprefix("@")).read_text()
             policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
             observed["context"] = json.loads(policy.split("\nTrusted job context:\n", 1)[1])
+            self.context = observed["context"]
             observed["has_checkout"] = (cwd / ".git").is_dir()
             observed["files"] = {path.name for path in cwd.iterdir()}
             if observed["has_checkout"]:
@@ -585,7 +595,7 @@ class CommandInitializationTests(unittest.TestCase):
                 observed["branch"] = self.git(["git", "branch", "--show-current"], cwd=cwd).stdout.strip()
             if agent:
                 agent(cwd)
-                return Mock(pid=-1, **{"wait.return_value": 0})
+                return Mock(pid=-1, **{"wait.return_value": self.exit_code})
             raise self.Interrupted
         self.smoke.on_omp = capture_omp
 
@@ -596,6 +606,8 @@ class CommandInitializationTests(unittest.TestCase):
               patch.dict(CONFIG, {"jarvis_owner": ""}),
               patch("runner.github_token", return_value="disposable-token"),
               patch("runner.github", side_effect=read_github),
+              patch("runner.github_request", self.requests),
+              patch("runner.modal.current_function_call_id", return_value="fc-command-outcome"),
               patch("runner.urllib.request.urlopen", return_value=StringIO(json.dumps({"data": [{"id": model}]}))),
               patch("runner.subprocess.run", side_effect=self.smoke.run),
               patch("runner.subprocess.Popen", side_effect=self.smoke.popen),
@@ -695,6 +707,109 @@ class CommandInitializationTests(unittest.TestCase):
                 else:
                     self.assert_reporting_launch(observed, "completed" if state == "completed" else "uncertain")
                     self.assertEqual(self.values["command:" + self.job["key"]], record)
+
+    def test_exit_zero_without_an_outcome_posts_one_blocked_comment(self):
+        self.job["modal_run_links"] = {"Modal dispatcher": "https://modal.com/id/fc-dispatch"}
+        self.launch(lambda cwd: None)
+        self.assertEqual(self.values["command:" + self.job["key"]]["state"], "completed")
+        self.requests.assert_called_once()
+        method, path, payload = self.requests.call_args.args
+        self.assertEqual((method, path), ("POST", f"repos/{REPO}/issues/142/comments"))
+        self.assertIn("fixer exited without an outcome", payload["body"])
+        for text in (self.head, "fc-command-outcome", "fc-dispatch"):
+            self.assertIn(text, payload["body"])
+
+    def test_published_command_outcome_is_not_duplicated(self):
+        def publish(cwd):
+            self.outcomes.append({"body": "### ✅ fixed · no changes\n\n" + self.context["outcome_marker"],
+                                  "user": {"login": CONFIG["git_author"]["name"], "id": 334744567}})
+        self.launch(publish)
+        self.requests.assert_not_called()
+
+    def test_rewritten_command_acknowledgment_is_not_duplicated(self):
+        marker = "<!-- omp-runner:queued:" + hashlib.sha256(self.job["key"].encode()).hexdigest() + " -->"
+        self.job["acknowledgment"] = {"id": 900}
+        self.acknowledgment = {"body": "### ✅ fixed · no changes\n\n" + marker,
+                               "user": {"login": CONFIG["git_author"]["name"], "id": 334744567},
+                               "issue_url": f"https://api.github.com/repos/{REPO}/issues/142"}
+        self.launch(lambda cwd: None)
+        self.requests.assert_not_called()
+
+    def test_queued_acknowledgment_is_replaced_with_missing_outcome(self):
+        marker = "<!-- omp-runner:queued:" + hashlib.sha256(self.job["key"].encode()).hexdigest() + " -->"
+        self.job["acknowledgment"] = {"id": 900}
+        self.acknowledgment = {"body": "### ⏳ queued\n\n" + marker,
+                               "user": {"login": CONFIG["git_author"]["name"], "id": 334744567},
+                               "issue_url": f"https://api.github.com/repos/{REPO}/issues/142"}
+        self.launch(lambda cwd: None)
+        self.requests.assert_called_once()
+        method, path, payload = self.requests.call_args.args
+        self.assertEqual((method, path), ("PATCH", f"repos/{REPO}/issues/comments/900"))
+        self.assertIn("fixer exited without an outcome", payload["body"])
+        self.assertIn(marker, payload["body"])
+
+    def test_reporting_only_exit_still_reports_missing_outcome(self):
+        self.values["started:" + self.job["key"]] = "started"
+        self.values["command:" + self.job["key"]] = {"state": "completed", "starting_head": self.head,
+                                                    "branch": self.branch}
+        observed = self.launch(lambda cwd: None)
+        self.assertFalse(observed["has_checkout"])
+        self.requests.assert_called_once()
+        self.assertIn("reporting-only", self.requests.call_args.args[2]["body"])
+
+    def test_failed_command_posts_outcome_and_still_raises(self):
+        self.exit_code = 1
+        with self.assertRaisesRegex(RuntimeError, "omp exited with 1"):
+            self.launch(lambda cwd: None)
+        self.requests.assert_called_once()
+        self.assertIn("fixer exited with 1 without an outcome", self.requests.call_args.args[2]["body"])
+
+
+class OutcomeDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.job = {"repo": REPO, "pr": 142, "key": "delivery", "kind": "issue_comment"}
+        self.marker = "<!-- omp-runner:outcome:delivery -->"
+        self.account = {"login": CONFIG["git_author"]["name"], "id": 334744567}
+        self.outcome = {"user": self.account, "body": "### ✅ fixed · no changes\n\n" + self.marker}
+
+    def deliver(self, pages):
+        def read(path):
+            if path.startswith("users/"):
+                return self.account
+            return pages[int(path.rsplit("=", 1)[1]) - 1]
+        with patch("runner.github", side_effect=read), patch("runner.github_request") as request:
+            publish_missing_outcome(self.job, self.marker, "### ⛔ blocked · missing outcome")
+        return request
+
+    def test_published_outcome_on_later_page_prevents_duplicate(self):
+        request = self.deliver([[{"user": self.account, "body": "unrelated"}] * 100, [self.outcome]])
+        request.assert_not_called()
+
+    def test_other_author_or_job_cannot_suppress_missing_outcome(self):
+        for comment in ({**self.outcome, "user": {**self.account, "id": 1}},
+                        {**self.outcome, "user": {**self.account, "login": "outsider"}},
+                        {**self.outcome, "body": "### ✅ fixed · no changes\n\n<!-- omp-runner:outcome:other -->"}):
+            with self.subTest(comment=comment):
+                request = self.deliver([[comment]])
+                request.assert_called_once()
+                self.assertEqual(request.call_args.args[:2], ("POST", f"repos/{REPO}/issues/142/comments"))
+
+    def test_uncertain_github_read_does_not_post_a_duplicate(self):
+        with (patch("runner.github", side_effect=HTTPError("comments", 503, "unavailable", {}, None)),
+              patch("runner.github_request") as request, patch("runner.log")):
+            publish_missing_outcome(self.job, self.marker, "### ⛔ blocked · missing outcome")
+        request.assert_not_called()
+
+    def test_acknowledgment_from_another_pr_is_never_edited(self):
+        self.job["acknowledgment"] = {"id": 900}
+        queued = "<!-- omp-runner:queued:" + hashlib.sha256(self.job["key"].encode()).hexdigest() + " -->"
+        comment = {"user": self.account, "body": "### ⏳ queued\n\n" + queued,
+                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/999"}
+        with (patch("runner.github", side_effect=[self.account, comment, []]),
+              patch("runner.github_request") as request):
+            publish_missing_outcome(self.job, self.marker, "### ⛔ blocked · missing outcome")
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args[:2], ("POST", f"repos/{REPO}/issues/142/comments"))
 
 
 class StackTests(unittest.TestCase):
