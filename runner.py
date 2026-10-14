@@ -707,11 +707,14 @@ def pr_agent_findings(review: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
-def pr_agent_marker(head: str, round_: int, findings: list[dict[str, Any]], restack: bool = False) -> str:
+def pr_agent_marker(head: str, round_: int, findings: list[dict[str, Any]], restack: bool = False,
+                    patch: str = "") -> str:
     """Record the reviewed head, round and findings; restack reviews do not advance the budget."""
     state = {"head": head, "round": round_, "findings": findings}
     if restack:
         state["restack"] = True
+    if patch:
+        state["patch"] = patch
     data = json.dumps(state, separators=(",", ":"))
     return "<!-- autokas:pr-agent " + data.replace("<", "\\u003c").replace(">", "\\u003e") + " -->"
 
@@ -758,7 +761,7 @@ def depth_note(round_: int, comment_id: int) -> str:
 
 
 def pr_agent_comment(review: dict[str, Any], repo: str, head: str, round_: int, findings: list[dict[str, Any]],
-                     restack: bool = False, note: str = "") -> str:
+                     restack: bool = False, note: str = "", patch: str = "") -> str:
     """Render PR-Agent's structured review and its state into one comment, measured in UTF-8 bytes.
     The glance lines and `note` stay whole; only the details fold is trimmed. The state marker trims
     content, then headers, while preserving every finding's severity and location.
@@ -788,13 +791,13 @@ def pr_agent_comment(review: dict[str, Any], repo: str, head: str, round_: int, 
     sub = f"\n\n<sub>{notes}</sub>\n\n"
     marker_limit = min(GITHUB_COMMENT_LIMIT // 2,
                        GITHUB_COMMENT_LIMIT - len(sub.encode()) - len(REVIEW_TRIMMED.encode()))
-    marker = pr_agent_marker(head, round_, findings, restack)
+    marker = pr_agent_marker(head, round_, findings, restack, patch)
     for field in ("content", "header"):
         cap = max((len(finding[field].encode()) for finding in findings), default=0)
         while len(marker.encode()) > marker_limit and cap:
             cap //= 2
             findings = [{**finding, field: utf8_cut(finding[field], cap)} for finding in findings]
-            marker = pr_agent_marker(head, round_, findings, restack)
+            marker = pr_agent_marker(head, round_, findings, restack, patch)
     footer = sub + marker
     room = GITHUB_COMMENT_LIMIT - len(prefix.encode()) - len(footer.encode()) - wrapper_size
     if room < len(REVIEW_TRIMMED.encode()):
@@ -819,10 +822,11 @@ def pr_agent_review_state(body: str) -> dict[str, Any] | None:
     return state if isinstance(state, dict) and isinstance(state.get("findings"), list) else None
 
 
-def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, list[dict[str, Any]]]]:
-    """Read the next counted round and completed heads in latest-review order from bot-authored comments."""
+def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, list[dict[str, Any]]], dict[str, Any] | None]:
+    """Read the next counted round, reviewed heads and latest state from bot-authored comments."""
     highest = 0
     reviews: dict[str, list[dict[str, Any]]] = {}
+    latest = None
     for page in range(1, 1000):
         batch = github(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
         for comment in batch:
@@ -836,11 +840,12 @@ def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, list[dict[s
             if isinstance(head, str) and re.fullmatch(r"[0-9a-fA-F]{40}", head):
                 reviews.pop(head, None)
                 reviews[head] = state["findings"]
+                latest = {**state, "html_url": comment.get("html_url")}
             round_ = state.get("round")
             if not state.get("restack") and type(round_) is int and round_ > highest:
                 highest = round_
         if len(batch) < 100:
-            return highest + 1, reviews
+            return highest + 1, reviews, latest
     raise RuntimeError("PR-Agent review history exceeds the comment pagination limit")
 
 
@@ -1840,8 +1845,8 @@ def pr_agent_env(home: str, instructions: str = "", model: str | None = None) ->
     return env
 
 
-def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> str:
-    """Check out the exact head and return its diff from diff_base. the token stays in git's env."""
+def pr_git(repo: str, checkout: Path):
+    """Return an authenticated git runner, keeping credentials in the environment."""
     token = github_token(repo)
     header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     env = {"PATH": os.environ["PATH"], "HOME": str(checkout.parent), "GIT_TERMINAL_PROMPT": "0",
@@ -1849,14 +1854,32 @@ def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> st
            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
            "GIT_CONFIG_VALUE_0": f"Authorization: Basic {header}"}
 
-    def git(*args: str) -> str:
-        result = subprocess.run(["git", *args], cwd=checkout, env=env, capture_output=True, text=True, timeout=120)
+    def git(*args: str, input: str | None = None) -> str:
+        result = subprocess.run(["git", *args], cwd=checkout, env=env, input=input,
+                                capture_output=True, text=True, timeout=120)
         if result.returncode:
             detail = redact(result.stderr.strip(), (token, header))
             raise RuntimeError(f"git {args[0]} failed ({result.returncode}): {detail[-2000:]}")
         return result.stdout
 
-    checkout.mkdir()
+    return git
+
+
+def merge_base_patch(repo: str, base: str, commit: str, checkout: Path) -> str:
+    """Identify the exact merge-base diff, including edited locations and blob identities."""
+    checkout.mkdir(exist_ok=True)
+    git = pr_git(repo, checkout)
+    if not (checkout / ".git").is_dir():
+        git("init", "-q")
+    git("fetch", "-q", "--depth=1", "--no-tags", f"https://github.com/{repo}.git", base, commit)
+    diff = git("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", base, commit)
+    return hashlib.sha256(diff.encode()).hexdigest() if diff else ""
+
+
+def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> str:
+    """Check out the exact head and return its diff from diff_base. the token stays in git's env."""
+    git = pr_git(repo, checkout)
+    checkout.mkdir(exist_ok=True)
     git("init", "-q")
     git("fetch", "-q", "--depth=1", "--no-tags", f"https://github.com/{repo}.git", diff_base, head)
     git("checkout", "-q", "--detach", head)
@@ -1896,48 +1919,63 @@ def pr_review(job: dict[str, Any]) -> None:
     try:
         merge_base = github(f"repos/{repo}/compare/{pr['base']['sha']}...{head}?per_page=1")["merge_base_commit"]["sha"]
         pushed = job.get("action") == "synchronize"
-        next_round, reviews = pr_agent_history(repo, number)
-        round_ = max(job.get("round", 1), next_round)
-        diff_base = merge_base
-        restack = False
-        previous_is_ancestor = False
-        previous_findings = None
-        if (job["kind"] == "fix" or pushed) and job.get("previous_head"):
-            previous = job["previous_head"]
-            try:
-                compared = github(f"repos/{repo}/compare/{previous}...{head}?per_page=1")
-            except urllib.error.HTTPError as error:
-                if error.code != 404:
-                    raise
-                # a force-push can make the old reviewed commit unavailable.
-            else:
-                previous_is_ancestor = compared["merge_base_commit"]["sha"] == previous
-                if previous_is_ancestor and job["kind"] == "fix":
-                    diff_base = previous
-            restack = pushed and not previous_is_ancestor
-        if pushed and not restack:
-            # the event's before head may never have completed a review. cover every push
-            # since the latest reviewed ancestor and keep that review's unresolved findings.
-            for reviewed_head, findings in reversed(reviews.items()):
-                if reviewed_head == job.get("previous_head"):
-                    ancestor = previous_is_ancestor
-                else:
-                    try:
-                        compared = github(f"repos/{repo}/compare/{reviewed_head}...{head}?per_page=1")
-                    except urllib.error.HTTPError as error:
-                        if error.code != 404:
-                            raise
-                        continue
-                    ancestor = compared["merge_base_commit"]["sha"] == reviewed_head
-                if ancestor:
-                    diff_base, previous_findings = reviewed_head, findings
-                    break
-        if restack:
-            round_ = next_round - 1
-        model = CONFIG["pr_review"]["restack_model" if restack else "model"]
-        check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
+        next_round, reviews, latest = pr_agent_history(repo, number)
         with tempfile.TemporaryDirectory(prefix="pr-agent-") as home:
             checkout, diff_file = Path(home, "repo"), Path(home, "pr.diff")
+            patch = merge_base_patch(repo, merge_base, head, checkout)
+            if pushed and latest and latest.get("patch") and patch == latest["patch"]:
+                conclusion, counts = review_conclusion(latest["findings"])
+                finish_review_check(repo, check, job["key"], conclusion,
+                                    f"diff unchanged since {latest['head'][:7]}, review skipped · {counts}",
+                                    details_url=latest.get("html_url"))
+                log("pr_review_skipped", repo=repo, pr=number, key=job["key"], head=head,
+                    reviewed_head=latest["head"], round=latest.get("round"))
+                return
+            round_ = max(job.get("round", 1), next_round)
+            diff_base = merge_base
+            restack = False
+            previous_is_ancestor = False
+            previous_findings = None
+            if (job["kind"] == "fix" or pushed) and job.get("previous_head"):
+                previous = job["previous_head"]
+                try:
+                    compared = github(f"repos/{repo}/compare/{previous}...{head}?per_page=1")
+                except urllib.error.HTTPError as error:
+                    if error.code != 404:
+                        raise
+                    # a force-push can make the old reviewed commit unavailable.
+                else:
+                    previous_is_ancestor = compared["merge_base_commit"]["sha"] == previous
+                    if previous_is_ancestor and job["kind"] == "fix":
+                        diff_base = previous
+                restack = pushed and not previous_is_ancestor
+            if pushed and not restack:
+                # the event's before head may never have completed a review. cover every push
+                # since the latest reviewed ancestor and keep that review's unresolved findings.
+                for reviewed_head, findings in reversed(reviews.items()):
+                    if reviewed_head == job.get("previous_head"):
+                        ancestor = previous_is_ancestor
+                    else:
+                        try:
+                            compared = github(f"repos/{repo}/compare/{reviewed_head}...{head}?per_page=1")
+                        except urllib.error.HTTPError as error:
+                            if error.code != 404:
+                                raise
+                            continue
+                        ancestor = compared["merge_base_commit"]["sha"] == reviewed_head
+                    if ancestor:
+                        diff_base, previous_findings = reviewed_head, findings
+                        break
+                if previous_is_ancestor and previous_findings is None and latest and latest.get("patch"):
+                    previous_base = github(
+                        f"repos/{repo}/compare/{pr['base']['sha']}...{previous}?per_page=1"
+                    )["merge_base_commit"]["sha"]
+                    if merge_base_patch(repo, previous_base, previous, checkout) == latest["patch"]:
+                        diff_base, previous_findings = previous, latest["findings"]
+            if restack:
+                round_ = next_round - 1
+            model = CONFIG["pr_review"]["restack_model" if restack else "model"]
+            check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
             output, structured = Path(home, "review.md"), Path(home, "review.json")
             diff = checkout_pr_diff(repo, diff_base, head, checkout)
             if not diff.strip():
@@ -1989,7 +2027,7 @@ def pr_review(job: dict[str, Any]) -> None:
             finish_review_check(repo, check, job["key"], "cancelled", "the PR head moved during the review")
             return
         comment = github_request("POST", f"repos/{repo}/issues/{number}/comments", {
-            "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack)})
+            "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, patch=patch)})
     except Exception:
         finish_review_check(repo, check, job["key"], "neutral", "the review didn't finish")
         raise
@@ -2001,7 +2039,7 @@ def pr_review(job: dict[str, Any]) -> None:
         note = depth_note(round_, comment["id"])
         try:
             comment = {**comment, **github_request("PATCH", f"repos/{repo}/issues/comments/{comment['id']}", {
-                "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, note=note)})}
+                "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, note=note, patch=patch)})}
         except Exception as error:
             log("fix_limit_note_uncertain", key=job["key"], reason=type(error).__name__,
                 status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
