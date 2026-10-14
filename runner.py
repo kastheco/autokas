@@ -45,8 +45,17 @@ def team_config(config: dict[str, Any], environment: str) -> dict[str, Any]:
     if len(matches) != 1:
         raise ValueError("Configure exactly one team for the current Modal environment")
     team = matches[0]
-    if not re.fullmatch(r"ghcr\.io/kastheco/autokas-teams/[a-z0-9-]+@sha256:[0-9a-f]{64}", team.get("image", "")):
+    image_pattern = r"ghcr\.io/kastheco/autokas-teams/[a-z0-9-]+@sha256:[0-9a-f]{64}"
+    if not isinstance(team.get("image"), str) or not re.fullmatch(image_pattern, team["image"]):
         raise ValueError("Team image must be a ghcr.io/kastheco/autokas-teams digest")
+    repo_images = team.get("repo_images", {})
+    if not isinstance(repo_images, dict):
+        raise ValueError("Team repo_images must map lowercase owner/repo names to image digests")
+    for repo, image in repo_images.items():
+        if not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", repo):
+            raise ValueError("Team repo_images keys must be lowercase owner/repo names")
+        if not isinstance(image, str) or not re.fullmatch(image_pattern, image):
+            raise ValueError(f"Repository image for {repo} must be a ghcr.io/kastheco/autokas-teams digest")
     if team.get("pull_secret") != "autokas-ghcr-pull" or not team.get("worker_secret"):
         raise ValueError("Team pull and worker secret names are required")
     return team
@@ -120,11 +129,16 @@ def with_runner_files(image: modal.Image) -> modal.Image:
 
 
 BASE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi==0.135.1")
-IMAGE = with_runner_files(modal.Image.from_registry(
-    TEAM["image"], add_python="3.12", setup_dockerfile_commands=["USER root"],
-    secret=modal.Secret.from_name(TEAM["pull_secret"], environment_name=TEAM["modal_environment"],
-                                  required_keys=["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]),
-).pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1").dockerfile_commands("USER node"))
+def coding_image(digest: str) -> modal.Image:
+    """Use the team's pull credentials and runtime overlay for every coding image."""
+    return with_runner_files(modal.Image.from_registry(
+        digest, add_python="3.12", setup_dockerfile_commands=["USER root"],
+        secret=modal.Secret.from_name(TEAM["pull_secret"], environment_name=TEAM["modal_environment"],
+                                      required_keys=["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]),
+    ).pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1").dockerfile_commands("USER node"))
+
+
+IMAGE = coding_image(TEAM["image"])
 
 def image_settings() -> dict[str, Any]:
     """Overlay runtime settings on team defaults, then let callers set job model roles."""
@@ -648,7 +662,8 @@ def docs_path_allowed(path: str, folders: list[str]) -> bool:
 
 def log(event: str, **fields: Any) -> None:
     """Write operational evidence without comment bodies or credentials."""
-    print(json.dumps({"event": event, "revision": REVISION, "team_image": TEAM["image"], **fields}), flush=True)
+    digest = TEAM.get("repo_images", {}).get(str(fields.get("repo", "")).lower(), TEAM["image"])
+    print(json.dumps({"event": event, "revision": REVISION, "team_image": digest, **fields}), flush=True)
 
 
 def agent_prompt(body: str) -> str:
@@ -2168,7 +2183,8 @@ def worker(job: dict[str, Any]) -> None:
     job["modal_run_links"] = {"Modal dispatcher": f"https://modal.com/id/{call_id}"} if call_id else {}
     pr_key = (f"{job['repo'].lower()}#docs:{job['base_branch']}" if job.get("mode") == "docs_update"
               else f"{job['repo'].lower()}#{job['pr']}")
-    call = PRWorker(pr_key=pr_key).run.spawn(job)
+    pool = REPO_WORKERS.get(job["repo"].lower(), PRWorker)
+    call = pool(pr_key=pr_key).run.spawn(job)
     log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
 
 
@@ -2426,9 +2442,7 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
             process.stdin.close()
 
 
-@app.function(image=IMAGE, secrets=[], retries=0, single_use_containers=True,
-              timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192)
-def linear_planner(job: dict[str, Any], checkout: bytes, proxy_key: str,
+def _linear_planner(job: dict[str, Any], checkout: bytes, proxy_key: str,
                    expires_at: float) -> tuple[int, str]:
     """Run outside the credential worker's filesystem and process namespace."""
     deadline = time.monotonic() + linear_intake.remaining_timeout(expires_at)
@@ -2457,6 +2471,11 @@ def linear_planner(job: dict[str, Any], checkout: bytes, proxy_key: str,
                 "--config", str(settings), "--tools", "read,grep,glob", "--approval-mode", "yolo",
                 "--append-system-prompt", str(policy), "--max-time", str(max(1, int(deadline - time.monotonic()) - 10))]
         return linear_rpc(args, worktree, env, job, job["prompt"], deadline, mark_finishing=False)
+
+
+linear_planner = app.function(image=IMAGE, secrets=[], retries=0, single_use_containers=True,
+                              timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192,
+                              name="linear_planner")(_linear_planner)
 
 
 def linear_plan(text: str) -> list[dict[str, str]]:
@@ -2502,9 +2521,7 @@ def linear_finish(job: dict[str, Any], summary: str, publication: dict[str, Any]
 
 
 
-@app.cls(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
-         single_use_containers=True, timeout=CONFIG["timeout_seconds"], cpu=4, memory=8192)
-class PRWorker:
+class _PRWorker:
     pr_key: str = modal.parameter()
 
     @modal.method()
@@ -2653,9 +2670,10 @@ class PRWorker:
                     checkout = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=worktree,
                                               env=env, capture_output=True, check=True,
                                               timeout=max(1, deadline - time.monotonic())).stdout
-                    code, summary = linear_planner.remote(linear_intake.stored_job(job), checkout,
-                                                          env["CLI_PROXY_API_KEY"],
-                                                          time.time() + max(1, deadline - time.monotonic()))
+                    planner = REPO_PLANNERS.get(repo.lower(), linear_planner)
+                    code, summary = planner.remote(linear_intake.stored_job(job), checkout,
+                                                   env["CLI_PROXY_API_KEY"],
+                                                   time.time() + max(1, deadline - time.monotonic()))
                     if code:
                         raise RuntimeError(f"omp RPC exited with {code}")
                     if not summary.strip():
@@ -2845,6 +2863,35 @@ class PRWorker:
                     set_fix_label(job["repo"], job["pr"], "blocked", job["key"])
                 log("stopped", repo=job["repo"], pr=job["pr"], reason=str(error))
                 raise
+
+
+def coding_worker(image: modal.Image, name: str) -> modal.Cls:
+    """Bind the shared job flow to one image without changing PR queue keys."""
+    cls = type(name, (_PRWorker,), {"__module__": __name__, "__annotations__": {"pr_key": str},
+                                   "pr_key": modal.parameter()})
+    return app.cls(image=image, secrets=[WORKER_SECRET], max_containers=1, retries=0,
+                   single_use_containers=True, timeout=CONFIG["timeout_seconds"], cpu=4, memory=8192)(cls)
+
+
+PRWorker = coding_worker(IMAGE, "PRWorker")
+REPO_WORKERS: dict[str, modal.Cls] = {}
+REPO_PLANNERS: dict[str, modal.Function] = {}
+for digest in sorted(set(TEAM.get("repo_images", {}).values())):
+    if digest == TEAM["image"]:
+        pool, planner = PRWorker, linear_planner
+    else:
+        suffix = hashlib.sha256(digest.encode()).hexdigest()
+        override_image = coding_image(digest)
+        name = "PRWorker_" + suffix
+        pool = coding_worker(override_image, name)
+        globals()[name] = pool
+        planner = app.function(image=override_image, secrets=[], retries=0, single_use_containers=True,
+                               timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192,
+                               name="linear_planner_" + suffix)(_linear_planner)
+    for repo, configured_digest in TEAM.get("repo_images", {}).items():
+        if configured_digest == digest:
+            REPO_WORKERS[repo] = pool
+            REPO_PLANNERS[repo] = planner
 
 
 linear_intake.register(sys.modules[__name__])

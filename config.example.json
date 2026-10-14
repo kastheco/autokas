@@ -4,6 +4,7 @@
   "teams": {
     "example": {
       "image": "ghcr.io/kastheco/autokas-teams/example@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "repo_images": {},
       "modal_environment": "main",
       "pull_secret": "autokas-ghcr-pull",
       "worker_secret": "omp-runner-worker"

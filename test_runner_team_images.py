@@ -1,11 +1,13 @@
 """Environment isolation and immutable team image selection."""
 
+import builtins
+from types import SimpleNamespace
 import copy
 import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import PosixPath as Path
 import shutil
 import sys
 import subprocess
@@ -14,7 +16,7 @@ import time
 import tempfile
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from runner import CONFIG, team_config
 
 
@@ -47,6 +49,23 @@ class TeamImageTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "digest"):
                     team_config(self.config, "first-env")
 
+
+    def test_repository_images_require_immutable_team_digests(self) -> None:
+        for image in ("ghcr.io/kastheco/autokas-teams/klippy:latest",
+                      "ghcr.io/kastheco/autokas-teams/klippy@sha256:" + "a" * 63,
+                      "ghcr.io/other/klippy@sha256:" + "a" * 64, None):
+            with self.subTest(image=image):
+                self.config["teams"]["first"]["repo_images"] = {"kastheco/klippy": image}
+                with self.assertRaisesRegex(ValueError, "Repository image.*digest"):
+                    team_config(self.config, "first-env")
+
+    def test_repository_image_keys_are_unambiguous(self) -> None:
+        for overrides in ([], {"klippy": self.config["teams"]["first"]["image"]},
+                          {"Kastheco/klippy": self.config["teams"]["first"]["image"]}):
+            with self.subTest(overrides=overrides):
+                self.config["teams"]["first"]["repo_images"] = overrides
+                with self.assertRaisesRegex(ValueError, "repo_images"):
+                    team_config(self.config, "first-env")
 
 class RunnerRevisionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -82,10 +101,17 @@ class RunnerRevisionTests(unittest.TestCase):
         root = self.checkout if local else self.runtime
         spec = importlib.util.spec_from_file_location(name, root / "runner.py")
         module = importlib.util.module_from_spec(spec)
+        original_import = builtins.__import__
+
+        def runtime_import(import_name, globals=None, locals=None, fromlist=(), level=0):
+            if import_name == "pathlib" and globals and globals.get("__name__") == name:
+                return SimpleNamespace(Path=runtime_path)
+            return original_import(import_name, globals, locals, fromlist, level)
+
         with patch.dict(sys.modules, {name: module}), \
                 patch.dict(os.environ, {"MODAL_ENVIRONMENT": environment or ""}), \
                 patch("modal.is_local", return_value=local), \
-                patch("pathlib.Path", side_effect=runtime_path):
+                patch("builtins.__import__", side_effect=runtime_import):
             if environment is None:
                 os.environ.pop("MODAL_ENVIRONMENT")
             spec.loader.exec_module(module)
@@ -121,14 +147,21 @@ class RunnerRevisionTests(unittest.TestCase):
         # Modal loads the entry module separately from the explicitly mounted files.
         script = f"""
 import json
-from pathlib import Path
+import builtins
+from types import SimpleNamespace
+from pathlib import PosixPath as Path
 from unittest.mock import patch
 import modal
 runtime = Path({str(self.runtime)!r})
 def runtime_path(*parts):
     path = Path(*parts)
     return runtime if path == Path('/opt/autokas/runner') else path
-with patch('modal.is_local', return_value=False), patch('pathlib.Path', side_effect=runtime_path):
+original_import = builtins.__import__
+def runtime_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == 'pathlib' and globals and globals.get('__name__') == 'runner':
+        return SimpleNamespace(Path=runtime_path)
+    return original_import(name, globals, locals, fromlist, level)
+with patch('modal.is_local', return_value=False), patch('builtins.__import__', side_effect=runtime_import):
     import runner
     print(json.dumps({{'revision': runner.REVISION, 'intake': runner.linear_intake.__file__}}))
 """
@@ -141,6 +174,63 @@ with patch('modal.is_local', return_value=False), patch('pathlib.Path', side_eff
         startup = json.loads(result.stdout)
         self.assertEqual(startup["revision"], runner.REVISION)
         self.assertEqual(Path(startup["intake"]), self.runtime / "linear_intake.py")
+
+
+    def configure_overrides(self, image=None) -> str:
+        digest = image or "ghcr.io/kastheco/autokas-teams/klippy@sha256:" + "c" * 64
+        path = self.checkout / "config.json"
+        config = json.loads(path.read_text())
+        config["allowed_owners"] = ["kastheco"]
+        config["teams"]["example"]["repo_images"] = {
+            "kastheco/klippy": digest, "kastheco/another-android-app": digest,
+        }
+        path.write_text(json.dumps(config))
+        return digest
+
+    def test_override_routes_coding_jobs_and_keeps_other_repos_on_team_image(self) -> None:
+        import modal
+
+        digest = self.configure_overrides()
+        with patch("modal.Image.from_registry", wraps=modal.Image.from_registry) as registry, \
+                self.imported_runner(local=True) as module:
+            self.assertEqual([call.args[0] for call in registry.call_args_list],
+                             [module.TEAM["image"], digest])
+            override = module.REPO_WORKERS["kastheco/klippy"]
+            self.assertIs(override, module.REPO_WORKERS["kastheco/another-android-app"])
+            override_image = override._get_class_service_function().spec.image
+            self.assertIsNot(override_image, module.IMAGE)
+            self.assertIs(module.REPO_PLANNERS["kastheco/klippy"].spec.image, override_image)
+            for repo, selected in (("Kastheco/Klippy", override), ("kastheco/autokas", module.PRWorker)):
+                with self.subTest(repo=repo), patch("modal.Cls.__call__", autospec=True, return_value=Mock()) as pool, \
+                        patch.object(module, "github", return_value={"permission": "write"}), \
+                        patch.object(module, "acknowledge_review"), patch.object(module, "log"), \
+                        patch("modal.current_function_call_id", return_value=None):
+                    job = {"repo": repo, "pr": 1, "key": repo + ":command", "author": "kas",
+                           "mode": "command"}
+                    module.worker.local(job)
+                    pool.assert_called_once_with(selected, pr_key=repo.lower() + "#1")
+                    pool.return_value.run.spawn.assert_called_once_with(job)
+
+    def test_override_starts_from_mounted_runtime_without_checkout(self) -> None:
+        self.configure_overrides()
+        with self.imported_runner(local=True) as local:
+            self.stage_runtime(local)
+            with self.imported_runner(local=False) as remote:
+                self.assertEqual(remote.REVISION, local.REVISION)
+                self.assertIn("kastheco/klippy", remote.REPO_WORKERS)
+                self.assertIn("kastheco/klippy", remote.REPO_PLANNERS)
+                self.assertEqual(remote.image_settings()["teamOnly"], True)
+                with patch.dict(remote.CONFIG, allowed_owners=[]), \
+                        patch.object(remote, "github_token") as token:
+                    remote.REPO_WORKERS["kastheco/klippy"](pr_key="kastheco/klippy#1").run.local(
+                        {"repo": "kastheco/klippy"})
+                    token.assert_not_called()
+
+    def test_malformed_override_fails_during_runner_import(self) -> None:
+        self.configure_overrides("ghcr.io/kastheco/autokas-teams/klippy@sha256:bad")
+        with self.assertRaisesRegex(ValueError, "Repository image.*digest"):
+            with self.imported_runner(local=True):
+                pass
 
     def test_missing_environment_cannot_select_main(self) -> None:
         for environment in (None, ""):

@@ -131,6 +131,10 @@ coding jobs never build their image at deploy time. they pull a pinned image fro
 
 private `config.json` maps each Modal environment to its team under `teams`: `image` (an `autokas-teams` digest), `modal_environment`, `pull_secret` and `worker_secret`. `MODAL_ENVIRONMENT` must be set before importing the runner, and exactly one entry must match it. a missing or empty value fails instead of defaulting to `main`. the example entry is a shape for tests only.
 
+optional `repo_images` inside that same team entry maps lowercase `owner/repo` names to specialized images. every value must match `ghcr.io/kastheco/autokas-teams/<name>@sha256:<64 lowercase hex>`, just like `image`. coding jobs and Linear planning for listed repos use that image. other repos keep the team image, and PR-Agent reviews keep their separate review image. overrides reuse the team's pull secret, worker secret and settings overlay. each distinct override image gets a Modal coding class with the existing PR-scoped queue and a credential-free planner function, not a new service or queue.
+
+for klippy, kas adds `teams.kas.repo_images["kastheco/klippy"]` to `AUTOKAS_CONFIG_JSON` with the real published klippy digest. the example config leaves overrides empty. no secret values or deployment changes are needed in this checkout.
+
 workers overlay `omp_settings` from the config onto the baked settings by top-level key, then add their per-job model roles. a configured object replaces the whole baked object, and anything absent keeps the team default. checkouts and agent homes live in a unique temporary job directory under `/state`, so they're removed when the job ends, including on failure. registry credentials authenticate the pull and never reach the coding process.
 
 ## where it runs
