@@ -1,0 +1,1 @@
+disposable top fixture for the approved live stack verification.
