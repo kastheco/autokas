@@ -1,11 +1,12 @@
 """Environment isolation and immutable team image selection."""
 
+import builtins
 import copy
 import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import PosixPath as Path
 import shutil
 import sys
 import subprocess
@@ -13,8 +14,9 @@ import tarfile
 import time
 import tempfile
 import unittest
+from types import SimpleNamespace
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from runner import CONFIG, team_config
 
 
@@ -47,6 +49,25 @@ class TeamImageTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "digest"):
                     team_config(self.config, "first-env")
 
+    def test_override_images_require_immutable_team_digests(self) -> None:
+        for image in ("ghcr.io/kastheco/autokas-teams/klippy:latest",
+                      "ghcr.io/kastheco/autokas-teams/klippy@sha256:" + "a" * 63,
+                      "ghcr.io/kastheco/autokas-teams/klippy@sha256:" + "g" * 64,
+                      "ghcr.io/another/klippy@sha256:" + "a" * 64, None):
+            with self.subTest(image=image):
+                self.config["teams"]["first"]["repo_images"] = {"kastheco/klippy": image}
+                with self.assertRaisesRegex(ValueError, "Repository image.*digest"):
+                    team_config(self.config, "first-env")
+
+    def test_override_map_and_repository_names_are_validated(self) -> None:
+        image = self.config["teams"]["first"]["image"]
+        for overrides in (None, [], {"klippy": image},
+                          {"kastheco/klippy": image, "KASTHECO/KLIPPY": image}):
+            with self.subTest(overrides=overrides):
+                self.config["teams"]["first"]["repo_images"] = overrides
+                with self.assertRaisesRegex(ValueError, "repo_images"):
+                    team_config(self.config, "first-env")
+
 
 class RunnerRevisionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -68,6 +89,14 @@ class RunnerRevisionTests(unittest.TestCase):
         for name in ("runner.py", "linear_intake.py", "consult.py", "kas-voice-profile.md"):
             shutil.copyfile(source / name, self.checkout / name)
         shutil.copyfile(source / "config.example.json", self.checkout / "config.json")
+        config_path = self.checkout / "config.json"
+        config = json.loads(config_path.read_text())
+        self.override_image = "ghcr.io/kastheco/autokas-teams/klippy@sha256:" + "d" * 64
+        config["teams"]["example"]["repo_images"] = {
+            "kastheco/klippy": self.override_image,
+            "kastheco/android-tools": self.override_image,
+        }
+        config_path.write_text(json.dumps(config))
 
     @contextmanager
     def imported_runner(self, local: bool, environment: str | None = "main"):
@@ -79,13 +108,27 @@ class RunnerRevisionTests(unittest.TestCase):
                     Path("/workspace/repo"): self.workspace}.get(path, path)
 
         name = "revision_local" if local else "revision_remote"
+        original_import = builtins.__import__
+
+        def runtime_import(module_name, globals=None, locals=None, fromlist=(), level=0):
+            if module_name == "pathlib" and globals and globals.get("__name__") == name:
+                return SimpleNamespace(Path=runtime_path)
+            return original_import(module_name, globals, locals, fromlist, level)
+
         root = self.checkout if local else self.runtime
         spec = importlib.util.spec_from_file_location(name, root / "runner.py")
         module = importlib.util.module_from_spec(spec)
+        original_import = builtins.__import__
+
+        def runtime_import(import_name, globals=None, locals=None, fromlist=(), level=0):
+            if import_name == "pathlib" and globals and globals.get("__name__") == name:
+                return SimpleNamespace(Path=runtime_path)
+            return original_import(import_name, globals, locals, fromlist, level)
+
         with patch.dict(sys.modules, {name: module}), \
                 patch.dict(os.environ, {"MODAL_ENVIRONMENT": environment or ""}), \
                 patch("modal.is_local", return_value=local), \
-                patch("pathlib.Path", side_effect=runtime_path):
+                patch("builtins.__import__", side_effect=runtime_import):
             if environment is None:
                 os.environ.pop("MODAL_ENVIRONMENT")
             spec.loader.exec_module(module)
@@ -101,8 +144,6 @@ class RunnerRevisionTests(unittest.TestCase):
         shutil.copyfile(local.CONFIG_SOURCE, self.runtime / "config.json")
 
     def test_container_startup_imports_mounted_modules_without_checkout(self) -> None:
-        import runner
-
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
 
         class MountedImage:
@@ -114,23 +155,32 @@ class RunnerRevisionTests(unittest.TestCase):
                 shutil.copyfile(source, self.runtime / Path(destination).name)
                 return image
 
-        runner.with_runner_files(MountedImage())
+        with self.imported_runner(local=True) as runner:
+            runner.with_runner_files(MountedImage())
         entry = self.root / "modal-entry"
         entry.mkdir()
         shutil.copyfile(self.runtime / "runner.py", entry / "runner.py")
         # Modal loads the entry module separately from the explicitly mounted files.
         script = f"""
 import json
-from pathlib import Path
+import builtins
+from types import SimpleNamespace
+from pathlib import PosixPath as Path
 from unittest.mock import patch
 import modal
 runtime = Path({str(self.runtime)!r})
 def runtime_path(*parts):
     path = Path(*parts)
     return runtime if path == Path('/opt/autokas/runner') else path
-with patch('modal.is_local', return_value=False), patch('pathlib.Path', side_effect=runtime_path):
+original_import = builtins.__import__
+def runtime_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == 'pathlib' and globals and globals.get('__name__') == 'runner':
+        return SimpleNamespace(Path=runtime_path)
+    return original_import(name, globals, locals, fromlist, level)
+with patch('modal.is_local', return_value=False), patch('builtins.__import__', side_effect=runtime_import):
     import runner
-    print(json.dumps({{'revision': runner.REVISION, 'intake': runner.linear_intake.__file__}}))
+    print(json.dumps({{'revision': runner.REVISION, 'intake': runner.linear_intake.__file__,
+                      'overrides': list(runner.REPO_WORKERS)}}))
 """
         # Redirect only the mount root, keeping Python's real import search behavior.
         environment["PYTHONPATH"] = environment.get("PYTHONPATH", "").replace(
@@ -141,6 +191,78 @@ with patch('modal.is_local', return_value=False), patch('pathlib.Path', side_eff
         startup = json.loads(result.stdout)
         self.assertEqual(startup["revision"], runner.REVISION)
         self.assertEqual(Path(startup["intake"]), self.runtime / "linear_intake.py")
+        self.assertEqual(startup["overrides"], ["kastheco/klippy", "kastheco/android-tools"])
+
+    def test_override_worker_routing_preserves_default_and_pr_keys(self) -> None:
+        import modal
+        bindings = {}
+        original_cls = modal.App.cls
+        original_function = modal.App.function
+
+        def record(original):
+            def decorate(app, **options):
+                registration = original(app, **options)
+                def register(implementation):
+                    bound = registration(implementation)
+                    bindings[bound] = options
+                    return bound
+                return register
+            return decorate
+
+        with patch.object(modal.App, "cls", record(original_cls)), \
+                patch.object(modal.App, "function", record(original_function)), \
+                self.imported_runner(local=True) as runner:
+            override = runner.REPO_WORKERS["kastheco/klippy"]
+            self.assertIs(override, runner.REPO_WORKERS["kastheco/android-tools"])
+            self.assertIsNot(override, runner.PRWorker)
+            self.assertIs(bindings[override]["image"], runner.OVERRIDE_IMAGES[self.override_image])
+            self.assertEqual(bindings[override]["secrets"], [runner.WORKER_SECRET])
+            self.assertIs(bindings[runner.PRWorker]["image"], runner.IMAGE)
+            planner = runner.REPO_PLANNERS["kastheco/klippy"]
+            self.assertIs(bindings[planner]["image"], runner.OVERRIDE_IMAGES[self.override_image])
+            self.assertEqual(bindings[planner]["secrets"], [])
+            for repo in ("kastheco/klippy", "KASTHECO/KLIPPY", "kastheco/autokas"):
+                selected = MagicMock()
+                selected.return_value.run.spawn.return_value.object_id = "local-call"
+                other = MagicMock()
+                job = {"repo": repo, "pr": 12, "kind": "pull_request", "key": repo + ":12"}
+                overrides = {"kastheco/klippy": selected}
+                default = other
+                if repo.lower() == "kastheco/autokas":
+                    overrides, default = {"kastheco/klippy": other}, selected
+                with self.subTest(repo=repo), patch.object(runner, "REPO_WORKERS", overrides), \
+                        patch.object(runner, "PRWorker", default), \
+                        patch.object(runner, "allowed_repository", return_value=True), \
+                        patch.object(runner.modal, "current_function_call_id", return_value=None):
+                    runner.worker.local(job)
+                    selected.assert_called_once_with(pr_key=repo.lower() + "#12")
+                    selected.return_value.run.spawn.assert_called_once_with(job)
+                    other.assert_not_called()
+
+    def test_malformed_override_digest_stops_runner_import(self) -> None:
+        path = self.checkout / "config.json"
+        config = json.loads(path.read_text())
+        config["teams"]["example"]["repo_images"]["kastheco/klippy"] = self.override_image[:-1]
+        path.write_text(json.dumps(config))
+        with self.assertRaisesRegex(ValueError, "Repository image.*digest"):
+            with self.imported_runner(local=True):
+                pass
+
+
+    def test_override_starts_from_mounted_runtime_without_checkout(self) -> None:
+        with self.imported_runner(local=True) as local:
+            self.stage_runtime(local)
+            with self.imported_runner(local=False) as remote:
+                self.assertEqual(remote.REVISION, local.REVISION)
+                self.assertIn("kastheco/klippy", remote.REPO_WORKERS)
+                self.assertIn("kastheco/klippy", remote.REPO_PLANNERS)
+                self.assertEqual(remote.image_settings()["teamOnly"], True)
+                with patch.dict(remote.CONFIG, allowed_owners=[]), \
+                        patch.object(remote, "github_token") as token:
+                    remote.REPO_WORKERS["kastheco/klippy"](pr_key="kastheco/klippy#1").run.local(
+                        {"repo": "kastheco/klippy"})
+                    token.assert_not_called()
+
 
     def test_missing_environment_cannot_select_main(self) -> None:
         for environment in (None, ""):

@@ -131,6 +131,8 @@ coding jobs never build their image at deploy time. they pull a pinned image fro
 
 private `config.json` maps each Modal environment to its team under `teams`: `image` (an `autokas-teams` digest), `modal_environment`, `pull_secret` and `worker_secret`. `MODAL_ENVIRONMENT` must be set before importing the runner, and exactly one entry must match it. a missing or empty value fails instead of defaulting to `main`. the example entry is a shape for tests only.
 
+an optional `repo_images` object inside the team entry maps `owner/repo` to an image digest, using the same `ghcr.io/kastheco/autokas-teams/<image>@sha256:<64 lowercase hex>` rule as `image`. repository names match case-insensitively and duplicates are rejected. listed repositories use that image for coding, docs and secret-free Linear planning, while other repositories keep the team image. each distinct override binds a separate per-PR worker pool and planner at import time, with the same secrets, settings overlay and job flow. intake and PR-Agent review keep their existing images.
+
 workers overlay `omp_settings` from the config onto the baked settings by top-level key, then add their per-job model roles. a configured object replaces the whole baked object, and anything absent keeps the team default. checkouts and agent homes live in a unique temporary job directory under `/state`, so they're removed when the job ends, including on failure. registry credentials authenticate the pull and never reach the coding process.
 
 ## where it runs
