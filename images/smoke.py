@@ -55,7 +55,7 @@ def inventory() -> dict[str, list[str]]:
                 findings["secrets"].append(str(path))
             if name in auth or name in {".ssh", ".aws", ".azure", ".kube"}:
                 findings["auth"].append(str(path))
-            if path.suffix in {".sqlite", ".sqlite3", ".sqlite-wal", ".sqlite-shm"}:
+            if not stat.S_ISDIR(mode) and path.suffix in {".sqlite", ".sqlite3", ".sqlite-wal", ".sqlite-shm"}:
                 findings["sqlite"].append(str(path))
             elif path.suffix == ".db" and stat.S_ISREG(mode):
                 with path.open("rb") as handle:
