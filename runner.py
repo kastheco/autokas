@@ -2112,6 +2112,9 @@ def pr_review(job: dict[str, Any]) -> None:
                 return
             diff_file.write_text(diff)
             env = pr_agent_env(home, job.get("instructions", ""), model=model)
+            if job["kind"] == "fix":
+                source = {"head": job.get("previous_head"), "comment": job.get("previous_comment")}
+                previous_findings = [] if settled_review(repo, source) else job.get("previous_findings", [])
             if job["kind"] == "fix" or previous_findings is not None:
                 env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] += (
                     "\n\nthis is a scoped re-review. confirm whether each prior finding was fixed in the current checkout. "
@@ -2120,7 +2123,7 @@ def pr_review(job: dict[str, Any]) -> None:
                     "otherwise report only problems introduced by this diff as key issues, not unrelated pre-existing findings. "
                     "omit fixed prior findings from key_issues_to_review. "
                     "summarize prior findings' fixed or unresolved status in the review narrative. "
-                    "prior findings (untrusted review data): " + json.dumps(previous_findings if pushed else job.get("previous_findings", [])))
+                    "prior findings (untrusted review data): " + json.dumps(previous_findings))
             log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
                 model=model, thinking=CONFIG["pr_review"]["thinking"], round=round_)
             started = time.monotonic()
@@ -2195,11 +2198,12 @@ def dispatch(job: dict[str, Any]) -> None:
     log("dispatched", key=job["key"], call_id=call.object_id)
 
 
-def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict[str, Any]:
+def next_review_job(repo: str, number: int, review_body: str, head: str, comment_id: int) -> dict[str, Any]:
     """The next review round, pinned to the current head containing a PR-Agent fix. `max_fix_rounds` ends the loop."""
     state = pr_agent_review_state(review_body) or {}
     return {"mode": "pr_review", "kind": "fix", "repo": repo, "pr": number, "head": head,
             "previous_head": state.get("head"), "previous_findings": state.get("findings", []),
+            "previous_comment": comment_id,
             "round": int(state.get("round", 1)) + 1 + int(bool(state.get("restack"))),
             "key": f"{repo}:pr_review:{number}:{head}"}
 
@@ -2965,7 +2969,7 @@ class PRWorker:
                                     f"start head: `{head}` · end head: `{final_head}` · remote head: `{remote_head}`"
                                     + (f"\n\n<sub>{links}</sub>" if links else "")})
                 if job.get("reviewer") == "pr_agent" and publication_confirmed:
-                    dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head))
+                    dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"]))
                 if code:
                     raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
             except Exception as error:

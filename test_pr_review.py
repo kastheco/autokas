@@ -171,7 +171,7 @@ class PRReviewIntakeTests(unittest.TestCase):
             job = runner.event_job("pull_request", pr_event("synchronize"))
             runner.dispatch(job)
             runner.dispatch(copy.deepcopy(job))
-            runner.dispatch(runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD))
+            runner.dispatch(runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD, 777))
             self.assertEqual(worker.spawn.call_count, 1)
 
     def test_ineligible_prs_are_not_reviewed(self):
@@ -550,7 +550,7 @@ class PRReviewRunTests(unittest.TestCase):
         state = runner.pr_agent_review_state(body)
         self.assertEqual((state["round"], state["restack"]), (2, True))
         self.assertIn("fix round 3", self.dispatched[0]["prompt"])
-        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40)["round"], 4)
+        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40, 777)["round"], 4)
         comments[1].append({"body": body, "user": runner.CONFIG["pr_agent"]})
         self.run_review(self.command_job(), comments=comments)
         self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 3)
@@ -569,7 +569,7 @@ class PRReviewRunTests(unittest.TestCase):
         state = runner.pr_agent_review_state(body)
         self.assertEqual((state["round"], state["restack"]), (0, True))
         self.assertIn("fix round 1", self.dispatched[0]["prompt"])
-        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40)["round"], 2)
+        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40, 777)["round"], 2)
 
     def test_restack_markers_do_not_count_even_with_a_higher_stored_round(self):
         comments = [{"body": runner.pr_agent_marker(HEAD, 2, []), "user": runner.CONFIG["pr_agent"]},
@@ -586,17 +586,29 @@ class PRReviewRunTests(unittest.TestCase):
     def test_fix_review_limits_diff_to_the_previous_review(self):
         previous = "c" * 40
         findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
-        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker(previous, 1, findings), HEAD)
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker(previous, 1, findings), HEAD, 777)
         self.run_review(job)
         self.assertEqual(self.checkout.call_args.args[:3], (REPO, previous, HEAD))
 
+    def test_fix_follow_up_drops_only_its_settled_source_findings(self):
+        previous = "c" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker(previous, 1, findings), HEAD, 777)
+        check = {"id": 87, "name": runner.REVIEW_CHECK, "head_sha": previous,
+                 "app": {"slug": runner.CONFIG["github_app"]["name"]}}
+        for external_id, expected in (("settled:777", []), ("settled:778", findings), ("review", findings)):
+            with self.subTest(external_id=external_id):
+                run = self.run_review(job, review_checks=[{**check, "external_id": external_id}])
+                instructions = run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"]
+                self.assertEqual(json.loads(instructions.split("prior findings (untrusted review data): ")[1]), expected)
+
     def test_force_pushed_fix_review_falls_back_to_the_pr_merge_base(self):
-        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD)
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD, 777)
         self.run_review(job, prior_merge_base="d" * 40)
         self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
 
     def test_unavailable_previous_head_falls_back_but_other_compare_errors_fail(self):
-        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD)
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD, 777)
         missing = runner.urllib.error.HTTPError("compare", 404, "not found", {}, None)
         self.run_review(job, prior_merge_base=missing)
         self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
@@ -751,7 +763,7 @@ class PRReviewRunTests(unittest.TestCase):
         rounds = runner.CONFIG["pr_review"]["max_fix_rounds"]
         body = runner.pr_agent_marker(HEAD, 1, runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}}))
         for round_ in range(1, rounds + 2):
-            job = runner.next_review_job(REPO, 42, body, "f" * 40)
+            job = runner.next_review_job(REPO, 42, body, "f" * 40, 777)
             self.assertEqual((job["kind"], job["head"], job["round"]), ("fix", "f" * 40, round_ + 1))
             self.assertEqual(job["key"], f"{REPO}:pr_review:42:{'f' * 40}")
             body = runner.pr_agent_marker("f" * 40, job["round"], runner.pr_agent_findings(
