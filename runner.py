@@ -1269,7 +1269,7 @@ def finish_review_check(repo: str, check: int | None, key: str, conclusion: str,
         log("check_uncertain", key=key, reason=type(error).__name__,
             status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
 
-def latest_review_check(repo: str, head: str) -> dict[str, Any] | None:
+def latest_review_check(repo: str, head: str, *, exclude_check: int | None = None) -> dict[str, Any] | None:
     """Select the newest review run from this app, not another app's same-name check."""
     latest = None
     for page in range(1, 1000):
@@ -1278,6 +1278,7 @@ def latest_review_check(repo: str, head: str) -> dict[str, Any] | None:
             if (check.get("name") == REVIEW_CHECK
                     and check.get("app", {}).get("slug") == CONFIG["github_app"]["name"]
                     and check.get("head_sha") == head
+                    and check["id"] != exclude_check
                     and (latest is None or check["id"] > latest["id"])):
                 latest = check
         if len(batch) < 100:
@@ -1285,11 +1286,11 @@ def latest_review_check(repo: str, head: str) -> dict[str, Any] | None:
     raise RuntimeError("review checks exceed the pagination limit")
 
 
-def settled_review(repo: str, state: dict[str, Any]) -> dict[str, Any] | None:
+def settled_review(repo: str, state: dict[str, Any], *, exclude_check: int | None = None) -> dict[str, Any] | None:
     """The latest same-app check settles only the exact source review comment."""
     if state.get("comment") is None:
         return None
-    check = latest_review_check(repo, state["head"])
+    check = latest_review_check(repo, state["head"], exclude_check=exclude_check)
     return check if check and check.get("external_id") == f"settled:{state['comment']}" else None
 
 
@@ -2037,7 +2038,7 @@ def pr_review(job: dict[str, Any]) -> None:
             checkout, diff_file = Path(home, "repo"), Path(home, "pr.diff")
             patch = merge_base_patch(repo, merge_base, head, checkout)
             if pushed and latest and latest.get("patch") and patch == latest["patch"]:
-                settlement = settled_review(repo, latest)
+                settlement = settled_review(repo, latest, exclude_check=check)
                 conclusion, counts = review_conclusion(latest["findings"])
                 title = f"diff unchanged since {latest['head'][:7]}, review skipped · {counts}"
                 if settlement:

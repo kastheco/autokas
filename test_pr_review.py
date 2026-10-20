@@ -1168,6 +1168,39 @@ class PRReviewStackTests(unittest.TestCase):
         self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
         self.assertEqual(len(self.comments), 2)
 
+    def test_return_to_settled_head_ignores_the_current_review_check(self):
+        self.review()
+        first = self.comments[0]
+        original = self.git(["rev-parse", "pr2"])
+        title = "adjudicated false positive by @kas · 1 P1, fix threshold P2"
+        settlement = {"id": 89, "name": runner.REVIEW_CHECK, "head_sha": original,
+                      "app": {"slug": runner.CONFIG["github_app"]["name"]},
+                      "external_id": f"settled:{first['id']}", "output": {"title": title}}
+        self.review_checks = [settlement]
+        self.git(["commit", "--amend", "-m", "equivalent head"])
+        equivalent = self.git(["rev-parse", "pr2"])
+        self.publish()
+        self.review(previous=original)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+        self.git(["checkout", "-B", "pr2", original])
+        self.publish()
+        request = self.request
+
+        def record_check(method, path, payload):
+            result = request(method, path, payload)
+            if method == "POST" and path.endswith("/check-runs"):
+                result = {"id": 90}
+                self.review_checks.append({**settlement, **payload, **result, "output": {}})
+            return result
+
+        with patch.object(runner, "github_request", side_effect=record_check):
+            self.review(previous=equivalent)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+        self.assertEqual(self.checks[-1][2]["output"]["title"], title)
+        self.assertEqual(self.checks[-1][2]["details_url"], first["html_url"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.comments), 1)
+
     def test_restack_with_an_unchanged_diff_skips_review_but_kas_review_still_runs(self):
         self.skipped_restack()
         self.review(command=True)
