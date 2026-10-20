@@ -1175,7 +1175,7 @@ class PRReviewStackTests(unittest.TestCase):
         self.assertIn("@@ -9,7 +9,7 @@", self.calls[-1]["diff"])
         self.assertNotIn("pr_review_skipped", [event for event, _ in self.logs])
 
-    def test_settled_unchanged_patch_stays_neutral_until_a_real_review(self):
+    def test_settled_unchanged_patch_keeps_merge_gate_until_a_real_review(self):
         self.review()
         first = self.comments[0]
         state = runner.pr_agent_review_state(first["body"])
@@ -1191,7 +1191,7 @@ class PRReviewStackTests(unittest.TestCase):
         self.publish()
         self.pr["base"]["ref"] = "main"
         self.review(previous=old_head)
-        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
         self.assertEqual(self.checks[-1][2]["output"]["title"], title)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(self.comments), 1)
@@ -1216,7 +1216,7 @@ class PRReviewStackTests(unittest.TestCase):
         equivalent = self.git(["rev-parse", "pr2"])
         self.publish()
         self.review(previous=original)
-        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
         self.git(["checkout", "-B", "pr2", original])
         self.publish()
         request = self.request
@@ -1233,13 +1233,13 @@ class PRReviewStackTests(unittest.TestCase):
 
         with patch.object(runner, "github_request", side_effect=record_check):
             self.review(previous=equivalent)
-        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
         self.assertEqual(self.checks[-1][2]["output"]["title"], title)
         self.assertEqual(self.checks[-1][2]["details_url"], first["html_url"])
         self.git(["checkout", "-B", "pr2", equivalent])
         self.publish()
         self.review(previous=original)
-        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
         self.assertEqual(self.checks[-1][2]["output"]["title"], title)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(self.comments), 1)
@@ -1921,7 +1921,7 @@ class ReviewSettlementTests(unittest.TestCase):
         method, path, data = self.writes[0]
         self.assertEqual((method, path), ("POST", f"repos/{REPO}/check-runs"))
         self.assertEqual((data["head_sha"], data["conclusion"], data["status"], data["external_id"]),
-                         (HEAD, "neutral", "completed", "settled:777"))
+                         (HEAD, "failure", "completed", "settled:777"))
         self.assertEqual(data["details_url"], f"https://github.com/{REPO}/pull/42#issuecomment-555")
         self.assertEqual(data["name"], "autokas review")
         self.assertEqual(data["output"]["title"],
@@ -1930,6 +1930,9 @@ class ReviewSettlementTests(unittest.TestCase):
             self.assertIn(text, data["output"]["summary"])
         self.assertEqual(self.comment, original_comment)
         self.assertEqual(self.check, original_check)
+        with patch.object(runner, "github", side_effect=self.github):
+            latest = runner.latest_review_check(REPO, HEAD)
+        self.assertEqual(latest["conclusion"], "failure")
         self.assertEqual(self.claims, {f"{REPO}:settle:command:555"})
 
     def test_refuses_invalid_authority_review_pr_and_check_without_writes(self):
@@ -1989,6 +1992,7 @@ class ReviewSettlementTests(unittest.TestCase):
     def test_settlement_title_keeps_threshold_when_fixes_were_disabled_since_review(self):
         with patch.dict(runner.CONFIG["pr_review"], fix_severity=None):
             self.deliver()
+        self.assertEqual(self.writes[0][2]["conclusion"], "failure")
         self.assertEqual(self.writes[0][2]["output"]["title"],
                          "adjudicated false positive by @kas · 1 P1, 1 P3, fix threshold None")
 

@@ -1340,8 +1340,9 @@ def settle_review(job: dict[str, Any]) -> None:
     reason = "\n".join("> " + line for line in job["reason"].splitlines())
     summary = (f"[review]({comment['html_url']}) adjudicated false positive by @{job['author']}.\n\n"
                f"[original failed run]({check['html_url']}) · [settlement command]({job['source_url']})\n\n{reason}")
+    # Neutral passes required checks. adjudication must not clear the merge gate.
     github_request("POST", f"repos/{repo}/check-runs", {
-        "name": REVIEW_CHECK, "head_sha": state["head"], "status": "completed", "conclusion": "neutral",
+        "name": REVIEW_CHECK, "head_sha": state["head"], "status": "completed", "conclusion": "failure",
         "external_id": f"settled:{job['comment']}", "details_url": job["source_url"],
         "output": {"title": title, "summary": summary}})
     log("review_settled", key=job["key"], head=state["head"], comment=job["comment"])
@@ -2050,7 +2051,7 @@ def pr_review(job: dict[str, Any]) -> None:
                 conclusion, counts = review_conclusion(latest["findings"])
                 title = f"diff unchanged since {latest['head'][:7]}, review skipped · {counts}"
                 if settlement:
-                    conclusion, title = "neutral", settlement["output"]["title"]
+                    conclusion, title = "failure", settlement["output"]["title"]
                 finish_review_check(repo, check, job["key"], conclusion, title,
                                     details_url=latest.get("html_url"),
                                     external_id=settlement["external_id"] if settlement else None)
