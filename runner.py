@@ -1272,7 +1272,8 @@ def finish_review_check(repo: str, check: int | None, key: str, conclusion: str,
         log("check_uncertain", key=key, reason=type(error).__name__,
             status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
 
-def latest_review_check(repo: str, head: str, *, exclude_check: int | None = None) -> dict[str, Any] | None:
+def latest_review_check(repo: str, head: str, *, exclude_check: int | None = None,
+                        ignore_unknown_settlement: bool = False) -> dict[str, Any] | None:
     """Select the newest review run from this app, not another app's same-name check."""
     latest = None
     for page in range(1, 1000):
@@ -1282,6 +1283,8 @@ def latest_review_check(repo: str, head: str, *, exclude_check: int | None = Non
                     and check.get("app", {}).get("slug") == CONFIG["github_app"]["name"]
                     and check.get("head_sha") == head
                     and check["id"] != exclude_check
+                    and not (ignore_unknown_settlement
+                             and (check.get("external_id") or "").startswith("settlement-unknown:"))
                     and (latest is None or check["id"] > latest["id"])):
                 latest = check
         if len(batch) < 100:
@@ -1294,7 +1297,8 @@ def settled_review(repo: str, state: dict[str, Any], *, exclude_check: int | Non
     if state.get("comment") is None:
         return False
     try:
-        check = latest_review_check(repo, state["head"], exclude_check=exclude_check)
+        check = latest_review_check(repo, state["head"], exclude_check=exclude_check,
+                                    ignore_unknown_settlement=True)
     except Exception as error:
         log("settlement_uncertain", repo=repo, head=state["head"], reason=type(error).__name__,
             status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
@@ -2057,7 +2061,8 @@ def pr_review(job: dict[str, Any]) -> None:
                     title = f"settlement status unknown, prior failure retained · {counts}"
                 finish_review_check(repo, check, job["key"], conclusion, title,
                                     details_url=latest.get("html_url"),
-                                    external_id=settlement["external_id"] if settlement else None)
+                                    external_id=(settlement["external_id"] if settlement else
+                                                 f"settlement-unknown:{latest['comment']}" if settlement is None else None))
                 log("pr_review_skipped", repo=repo, pr=number, key=job["key"], head=head,
                     reviewed_head=latest["head"], round=latest.get("round"))
                 return
