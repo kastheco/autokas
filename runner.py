@@ -1253,13 +1253,16 @@ def start_review_check(repo: str, head: str, key: str) -> int | None:
 
 
 def finish_review_check(repo: str, check: int | None, key: str, conclusion: str, title: str,
-                        details_url: str | None = None, fix_comment: int | None = None) -> None:
+                        details_url: str | None = None, fix_comment: int | None = None,
+                        *, external_id: str | None = None) -> None:
     if check is None:
         return
     payload: dict[str, Any] = {"status": "completed", "conclusion": conclusion,
                                "output": {"title": title, "summary": title}}
     if details_url:
         payload["details_url"] = details_url
+    if external_id is not None:
+        payload["external_id"] = external_id
     if fix_comment is not None:
         payload["actions"] = [{"label": "fix anyway", "description": "Run one fixer beyond the depth limit",
                                "identifier": f"fix:{fix_comment}"}]
@@ -2049,7 +2052,8 @@ def pr_review(job: dict[str, Any]) -> None:
                 if settlement:
                     conclusion, title = "neutral", settlement["output"]["title"]
                 finish_review_check(repo, check, job["key"], conclusion, title,
-                                    details_url=latest.get("html_url"))
+                                    details_url=latest.get("html_url"),
+                                    external_id=settlement["external_id"] if settlement else None)
                 log("pr_review_skipped", repo=repo, pr=number, key=job["key"], head=head,
                     reviewed_head=latest["head"], round=latest.get("round"))
                 return

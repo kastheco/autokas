@@ -1191,7 +1191,7 @@ class PRReviewStackTests(unittest.TestCase):
         self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
         self.assertEqual(len(self.comments), 2)
 
-    def test_return_to_settled_head_ignores_the_current_review_check(self):
+    def test_return_to_settled_head_preserves_settlement_on_the_next_push(self):
         self.review()
         first = self.comments[0]
         original = self.git(["rev-parse", "pr2"])
@@ -1214,6 +1214,9 @@ class PRReviewStackTests(unittest.TestCase):
             if method == "POST" and path.endswith("/check-runs"):
                 result = {"id": 90}
                 self.review_checks.append({**settlement, **payload, **result, "output": {}})
+            elif method == "PATCH" and "/check-runs/" in path:
+                check_id = int(path.rsplit("/", 1)[1])
+                next(check for check in self.review_checks if check["id"] == check_id).update(payload)
             return result
 
         with patch.object(runner, "github_request", side_effect=record_check):
@@ -1221,6 +1224,11 @@ class PRReviewStackTests(unittest.TestCase):
         self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
         self.assertEqual(self.checks[-1][2]["output"]["title"], title)
         self.assertEqual(self.checks[-1][2]["details_url"], first["html_url"])
+        self.git(["checkout", "-B", "pr2", equivalent])
+        self.publish()
+        self.review(previous=original)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+        self.assertEqual(self.checks[-1][2]["output"]["title"], title)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(self.comments), 1)
 
