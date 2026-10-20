@@ -1290,7 +1290,12 @@ def settled_review(repo: str, state: dict[str, Any], *, exclude_check: int | Non
     """The latest same-app check settles only the exact source review comment."""
     if state.get("comment") is None:
         return None
-    check = latest_review_check(repo, state["head"], exclude_check=exclude_check)
+    try:
+        check = latest_review_check(repo, state["head"], exclude_check=exclude_check)
+    except Exception as error:
+        log("settlement_uncertain", repo=repo, head=state["head"], reason=type(error).__name__,
+            status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
+        return None
     return check if check and check.get("external_id") == f"settled:{state['comment']}" else None
 
 

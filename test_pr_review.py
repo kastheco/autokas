@@ -265,6 +265,8 @@ class PRReviewRunTests(unittest.TestCase):
             if path.endswith("/permission"):
                 return {"permission": permission}
             if "/check-runs?" in path:
+                if isinstance(review_checks, Exception):
+                    raise review_checks
                 return {"check_runs": review_checks or []}
             if "/comments?" in path:
                 return (comments or {}).get(int(path.rsplit("page=", 1)[1]), [])
@@ -461,6 +463,27 @@ class PRReviewRunTests(unittest.TestCase):
                 self.assertEqual(self.checkout.call_args.args[:3], (REPO, previous, HEAD))
                 instructions = run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"]
                 self.assertEqual(json.loads(instructions.split("prior findings (untrusted review data): ")[1]), expected)
+
+    def test_scoped_push_keeps_prior_findings_when_settlement_lookup_fails(self):
+        previous = "c" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        comments = {1: [{"id": 777, "body": runner.pr_agent_marker(previous, 2, findings),
+                         "user": runner.CONFIG["pr_agent"]}]}
+        errors = [runner.urllib.error.HTTPError("checks", status, "private response", {}, None)
+                  for status in (403, 503)] + [TimeoutError("private timeout")]
+        for error in errors:
+            with self.subTest(error=error):
+                self.logs.clear()
+                run = self.run_review(self.push_job(), comments=comments, review_checks=error)
+                instructions = run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"]
+                self.assertEqual(json.loads(instructions.split("prior findings (untrusted review data): ")[1]), findings)
+                state = runner.pr_agent_review_state(self.posts[0][2]["body"])
+                self.assertEqual((state["round"], state["findings"]), (3, findings))
+                self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+                self.assertEqual(len(self.dispatched), 1)
+                fields = next(fields for event, fields in self.logs if event == "settlement_uncertain")
+                self.assertEqual(fields, {"repo": REPO, "head": previous, "reason": type(error).__name__,
+                                          "status_code": error.code if isinstance(error, runner.urllib.error.HTTPError) else None})
 
     def test_consecutive_pushes_after_cancelled_review_use_the_reviewed_ancestor(self):
         reviewed, intermediate = "d" * 40, "c" * 40
