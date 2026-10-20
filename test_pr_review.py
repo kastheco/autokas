@@ -1175,6 +1175,29 @@ class PRReviewStackTests(unittest.TestCase):
         self.assertIn("@@ -9,7 +9,7 @@", self.calls[-1]["diff"])
         self.assertNotIn("pr_review_skipped", [event for event, _ in self.logs])
 
+    def test_unchanged_patch_fails_when_settlement_is_unknown_after_threshold_change(self):
+        self.review()
+        old_head = self.git(["rev-parse", "pr2"])
+        self.git(["commit", "--amend", "-m", "equivalent head"])
+        self.publish()
+        github = self.github
+
+        def unavailable_checks(path):
+            if "/check-runs?" in path:
+                raise TimeoutError("private timeout")
+            return github(path)
+
+        with patch.dict(runner.CONFIG["pr_review"], fix_severity=None):
+            with patch.object(runner, "github", side_effect=unavailable_checks):
+                self.review(previous=old_head)
+            self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+            self.assertEqual(self.checks[-1][2]["details_url"], self.comments[0]["html_url"])
+            self.assertIn("settlement_uncertain", [event for event, _ in self.logs])
+            self.review(previous=old_head)
+            self.assertEqual(self.checks[-1][2]["conclusion"], "success")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.comments), 1)
+
     def test_settled_unchanged_patch_keeps_merge_gate_until_a_real_review(self):
         self.review()
         first = self.comments[0]
@@ -2001,11 +2024,11 @@ class ReviewSettlementTests(unittest.TestCase):
         state = {"head": HEAD, "comment": 777}
         with patch.object(runner, "github", side_effect=self.github):
             self.assertEqual(runner.settled_review(REPO, state)["external_id"], "settled:777")
-            self.assertIsNone(runner.settled_review(REPO, {**state, "comment": 778}))
+            self.assertIs(runner.settled_review(REPO, {**state, "comment": 778}), False)
             self.checks.append({**self.check, "id": 90, "app": {"slug": "other-app"}})
             self.assertIsNotNone(runner.settled_review(REPO, state))
             self.checks.append({**self.check, "id": 91})
-            self.assertIsNone(runner.settled_review(REPO, state))
+            self.assertIs(runner.settled_review(REPO, state), False)
 
 
 if __name__ == "__main__":

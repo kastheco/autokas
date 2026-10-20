@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import modal
 import linear_intake
@@ -1289,17 +1289,17 @@ def latest_review_check(repo: str, head: str, *, exclude_check: int | None = Non
     raise RuntimeError("review checks exceed the pagination limit")
 
 
-def settled_review(repo: str, state: dict[str, Any], *, exclude_check: int | None = None) -> dict[str, Any] | None:
-    """The latest same-app check settles only the exact source review comment."""
+def settled_review(repo: str, state: dict[str, Any], *, exclude_check: int | None = None) -> dict[str, Any] | Literal[False] | None:
+    """Return the settlement, False for confirmed absence, or None when the lookup fails."""
     if state.get("comment") is None:
-        return None
+        return False
     try:
         check = latest_review_check(repo, state["head"], exclude_check=exclude_check)
     except Exception as error:
         log("settlement_uncertain", repo=repo, head=state["head"], reason=type(error).__name__,
             status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
         return None
-    return check if check and check.get("external_id") == f"settled:{state['comment']}" else None
+    return check if check and check.get("external_id") == f"settled:{state['comment']}" else False
 
 
 def settle_review(job: dict[str, Any]) -> None:
@@ -2052,6 +2052,9 @@ def pr_review(job: dict[str, Any]) -> None:
                 title = f"diff unchanged since {latest['head'][:7]}, review skipped · {counts}"
                 if settlement:
                     conclusion, title = "failure", settlement["output"]["title"]
+                elif settlement is None:
+                    conclusion = "failure"
+                    title = f"settlement status unknown, prior failure retained · {counts}"
                 finish_review_check(repo, check, job["key"], conclusion, title,
                                     details_url=latest.get("html_url"),
                                     external_id=settlement["external_id"] if settlement else None)
