@@ -1999,9 +1999,14 @@ class ReviewSettlementTests(unittest.TestCase):
     def test_malformed_settlement_never_becomes_a_coding_job(self):
         for text in ("settle", "settle review", "settle review 777", "settle review 777   ",
                      "settle review nope reason", "settle review -1 reason", "settle review 0 reason",
-                     "settle review 1.0 reason", "settle review: 777 reason", "settle-review 777 reason"):
+                     "settle review 1.0 reason", "settle review: 777 reason", "settle-review 777 reason",
+                     "settle_review 777 reason", "SeTtLe_ReViEw 777 reason", "settle__review 777 reason"):
             for prefix in ("!kas", "@AUTOKAS"):
-                self.assertIsNone(self.deliver(f"{prefix} {text}"))
+                for event in ("issue_comment", "pull_request_review_comment"):
+                    with self.subTest(text=text, prefix=prefix, event=event):
+                        body = f"{prefix} {text}"
+                        self.assertIsNone(runner.event_job(*comment_event(body, event=event)))
+                        self.assertIsNone(self.deliver(body, event=event))
         self.assertEqual(self.writes, [])
         for event in ("issue_comment", "pull_request_review_comment"):
             self.assertIsNone(runner.event_job(*trusted_comment("!kas settle review 777 reason", event=event)))

@@ -557,7 +557,7 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     target_kind = "issue" if event == "issue_comment" and "pull_request" not in target else "pr"
     review = REVIEW_COMMAND.match(instruction) if target_kind == "pr" else None
     fix_review = re.fullmatch(r"fix review ([1-9][0-9]*)", instruction, re.IGNORECASE) if target_kind == "pr" else None
-    if re.match(r"settle\b", instruction, re.IGNORECASE):
+    if re.match(r"settle(?:\b|_)", instruction, re.IGNORECASE):
         settle = re.fullmatch(r"settle\s+review\s+([1-9][0-9]*)\s+(\S[\s\S]*)", instruction, re.IGNORECASE)
         if target_kind != "pr" or author.get("type") != "User" or not settle:
             return None
