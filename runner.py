@@ -1346,9 +1346,9 @@ def unresolved_review_findings(repo: str, number: int) -> bool:
 
 
 def review_fixes_pending(repo: str, number: int, *, exclude_receipt: str | None = None,
-                         pr: dict[str, Any] | None = None) -> bool:
+                         pr: dict[str, Any] | None = None, recover: bool = True) -> bool:
     """Require positive evidence before allowing a review's success."""
-    if exclude_receipt is None and retained_fix_work(repo, number):
+    if recover and exclude_receipt is None and retained_fix_work(repo, number):
         worker.remote({"repo": repo, "pr": number, "mode": "fix_reconcile",
                        "key": f"{repo}:fix_reconcile:{number}"})
         pr = None  # Re-read labels after serialized recovery.
@@ -1561,7 +1561,7 @@ def finish_review_check(repo: str, check: int | None, key: str, conclusion: str,
                         details_url: str | None = None, fix_comment: int | None = None,
                         *, external_id: str | None = None, number: int | None = None,
                         exclude_receipt: str | None = None, strict: bool = False,
-                        pr: dict[str, Any] | None = None) -> None:
+                        pr: dict[str, Any] | None = None, recover: bool = True) -> None:
     if check is None:
         return
     desired = {"status": "completed", "conclusion": conclusion,
@@ -1571,7 +1571,7 @@ def finish_review_check(repo: str, check: int | None, key: str, conclusion: str,
     held_key = f"held-review:{repo}:{number}:{check}"
     if conclusion in {"success", "neutral", "skipped"} and number is not None:
         try:
-            pending = review_fixes_pending(repo, number, exclude_receipt=exclude_receipt, pr=pr)
+            pending = review_fixes_pending(repo, number, exclude_receipt=exclude_receipt, pr=pr, recover=recover)
         except Exception as error:
             log("fix_gate_uncertain", key=key, reason=type(error).__name__)
             pending = True
@@ -2424,7 +2424,7 @@ def pr_review(job: dict[str, Any]) -> None:
                                     details_url=latest.get("html_url"),
                                     external_id=(settlement["external_id"] if settlement else
                                                  f"settlement-unknown:{latest['comment']}" if settlement is None else None),
-                                    number=number)
+                                    number=number, recover=not job.get("review_only"))
                 log("pr_review_skipped", repo=repo, pr=number, key=job["key"], head=head,
                     reviewed_head=latest["head"], round=latest.get("round"))
                 return
@@ -2479,7 +2479,8 @@ def pr_review(job: dict[str, Any]) -> None:
             diff = checkout_pr_diff(repo, diff_base, head, checkout)
             if not diff.strip():
                 log("pr_review_empty", key=job["key"], head=head)
-                finish_review_check(repo, check, job["key"], "skipped", "no diff to review", number=number)
+                finish_review_check(repo, check, job["key"], "skipped", "no diff to review", number=number,
+                                    recover=not job.get("review_only"))
                 return
             diff_file.write_text(diff)
             env = pr_agent_env(home, job.get("instructions", ""), model=model)
@@ -2536,7 +2537,8 @@ def pr_review(job: dict[str, Any]) -> None:
         if not review_started:
             log("pr_review_failed", repo=repo, pr=number, key=job["key"], head=head,
                 reason=type(error).__name__)
-        finish_review_check(repo, check, job["key"], "neutral", "the review didn't finish", number=number)
+        finish_review_check(repo, check, job["key"], "neutral", "the review didn't finish", number=number,
+                            recover=not job.get("review_only"))
         if check is None:
             body = f"autokas couldn't finish the review of `{head}`. no review result was produced."
             if job.get("comment"):
@@ -2549,7 +2551,8 @@ def pr_review(job: dict[str, Any]) -> None:
         raise
     exhausted = bool(pr_agent_prompt(comment["body"], bypass_depth=True)) and not pr_agent_prompt(comment["body"])
     finish_review_check(repo, check, job["key"], *review_conclusion(findings), details_url=comment.get("html_url"),
-                        fix_comment=comment["id"] if exhausted else None, number=number)
+                        fix_comment=comment["id"] if exhausted else None, number=number,
+                        recover=not job.get("review_only"))
     if exhausted:
         # the fallback command names this review, so the note is added once its ID exists.
         note = depth_note(round_, comment["id"])
@@ -2561,6 +2564,8 @@ def pr_review(job: dict[str, Any]) -> None:
                 status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
+    if job.get("review_only"):
+        return
     # automatic intake only: delivered reviews never start a fix without an authorized bypass request.
     fix = event_job("pull_request_review", {
         "action": "submitted", "repository": {"full_name": repo}, "sender": comment["user"], "review": comment,
@@ -2648,7 +2653,8 @@ def worker(job: dict[str, Any]) -> None:
             record = CLAIMS.get(receipt, None)
             if isinstance(record, dict) and record.pop("launch", None):
                 CLAIMS.put(receipt, record)  # This worker's acceptance is now observed.
-        recover_fix_work(job["repo"], job["pr"])
+        if not job.get("review_only"):
+            recover_fix_work(job["repo"], job["pr"])
         transferred = route_worker(job)
     except Exception:
         failed = True
@@ -3446,8 +3452,11 @@ class PRWorker:
                         if isinstance(publication, dict):
                             publication.setdefault("state", state)
                             CLAIMS.put(job["fix_receipt"], publication)
-                    if job.get("reviewer") == "pr_agent" and publication_confirmed:
-                        followup = next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"])
+                    if publication_confirmed:
+                        followup = (next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"])
+                                    if job.get("reviewer") == "pr_agent" else
+                                    {"mode": "pr_review", "kind": "pull_request", "repo": repo, "pr": number,
+                                     "head": remote_head, "key": f"{repo}:pr_review:{number}:{remote_head}"})
                         try:
                             dispatch(followup)
                         except Exception as error:

@@ -400,6 +400,32 @@ class PRReviewRunTests(unittest.TestCase):
         self.run.assert_not_called()
         self.assertEqual(self.checks, [])
 
+    def test_review_only_posts_native_result_without_entering_fixer_intake(self):
+        job = {**self.auto_job(), "review_only": True}
+        with patch.object(runner, "event_job", side_effect=AssertionError("fix intake reached")):
+            self.run_review(job)
+        self.assertEqual([path for method, path, _ in self.posts if method == "POST"],
+                         [f"repos/{REPO}/pulls/42/reviews"])
+        self.assertEqual(self.posts[0][2]["commit_id"], HEAD)
+        self.assertEqual(self.checks[-1][2]["status"], "completed")
+        self.assertEqual(self.dispatched, [])
+
+    def test_review_only_leaves_retained_fixers_untouched_at_intake_and_check_completion(self):
+        job = {**self.auto_job(), "review_only": True}
+        with (patch.object(runner, "recover_fix_work", side_effect=AssertionError("fix recovery reached")),
+              patch.object(runner, "PRWorker", side_effect=AssertionError("coding worker reached")),
+              patch.object(runner, "pr_review") as review):
+            review.spawn.return_value = Mock(object_id="review-only")
+            runner.worker.local(job)
+        with (patch.object(runner, "retained_fix_work", return_value=[{"launch": "uncertain"}]),
+              patch.object(runner, "pending_fix_jobs", return_value=True),
+              patch.object(runner, "github", return_value=PR),
+              patch.object(runner.worker, "remote", side_effect=AssertionError("fix reconciliation reached")),
+              patch.object(runner, "github_request") as request):
+            runner.finish_review_check(REPO, 88, job["key"], "success", "clean", number=42, recover=False)
+        self.assertEqual(request.call_args.args[2]["conclusion"], "failure")
+        self.assertEqual(request.call_args.args[2]["output"]["title"], "review fixes pending or unresolved")
+
     def test_automatic_review_skips_moved_head(self):
         run = self.run_review(self.auto_job(head="c" * 40))
         run.assert_not_called()
@@ -1615,6 +1641,42 @@ class FixPublicationTests(unittest.TestCase):
               patch.object(runner, "set_fix_label", side_effect=lambda repo, pr, state, key: self.labels.append(state)),
               patch.object(runner, "log", side_effect=lambda event, **fields: self.logs.append((event, fields)))):
             runner.PRWorker(pr_key=f"{REPO}#42").run.local(self.job)
+
+    def external_review(self):
+        self.body = "<details><summary>Prompt for AI Agents</summary>\n\n```\nFix parser validation.\n```\n</details>"
+        self.job.update(reviewer="coderabbit", prompt=runner.agent_prompt(self.body))
+
+    def test_external_published_fix_reviews_exact_head_without_native_source_metadata(self):
+        self.external_review()
+        self.run_fix("exact")
+        self.assertEqual(self.dispatched, [{
+            "mode": "pr_review", "kind": "pull_request", "repo": REPO, "pr": 42,
+            "head": self.fix_head, "key": f"{REPO}:pr_review:42:{self.fix_head}",
+        }])
+        self.assertEqual(self.labels, ["fixing", "fixed"])
+        claims = {}
+
+        def claim(key, value, skip_if_exists=False):
+            if skip_if_exists and key in claims:
+                return False
+            claims[key] = value
+            return True
+
+        with (patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim),
+                                                get=Mock(side_effect=lambda key, default=None: claims.get(key, default)))),
+              patch.object(runner, "worker") as worker):
+            worker.spawn.return_value = Mock(object_id="external-followup")
+            runner.dispatch(self.dispatched[0])
+            runner.dispatch(self.dispatched[0])
+        self.assertEqual(worker.spawn.call_count, 1)
+
+
+    def test_external_unpublished_or_unchanged_fix_does_not_dispatch_review(self):
+        self.external_review()
+        for movement in ("unpublished", "no_change"):
+            with self.subTest(movement=movement):
+                self.run_fix(movement)
+                self.assertEqual(self.dispatched, [])
 
     def test_publication_record_failure_does_not_start_followup(self):
         with self.assertRaisesRegex(RuntimeError, "record unavailable"):

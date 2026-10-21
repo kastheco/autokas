@@ -41,6 +41,8 @@ each finding is tagged `[P0]` to `[P3]`. P0 is a security hole, data loss or an 
 
 the loop ends when a review has nothing at or above the threshold, a fix pushes nothing, someone else pushes during a round, or the PR reaches `pr_review.max_fix_rounds` (default `3`). the last review is still posted. every review continues from the highest counted round in the PR's bot-authored markers, so a manual `!kas review` never resets the budget. set `fix_severity` to `null` to keep reviews and turn off fixes. PRs marked `autokas:ignore` and generated docs PRs get no automatic fixes.
 
+a `review_only` job publishes the native review and its check, but skips automatic fixer intake, pushes and thread resolution.
+
 when actionable findings arrive after the round cap, the review body says no fixer was queued and offers a **fix anyway** checkbox. tick it in the review to authorize one fixer for that review's findings on the same head without resetting the cap. it requires a human with write or admin access. the edit arrives as `pull_request_review.edited`; the runner verifies the unchecked-to-checked transition and unchanged state marker, then updates the review body with `queued by @user`, or a stale-head notice if the PR moved. unticking, re-ticking and redelivery don't launch another fixer. the note also has `!kas fix review <review-id>` in a fenced block for copying and posting as a new issue comment, which also accepts an exact `trusted_reviewers` bot. the id is the native review's id. the failed review check keeps its **fix anyway** button, but that button needs the App's `check_run` subscription. all three paths reject stale heads and share one finding claim.
 
 the review body is built from PR-Agent's structured output, not its markdown: a heading with the round, finding count and reviewed commit, one line per finding with its severity and a link to its lines, then the full finding text in a collapsed section.
@@ -65,6 +67,8 @@ a fix job starts from CodeRabbit or Cursor findings, or from an autokas review's
 4. one `PRWorker` per repo and PR pulls the team image, clones the repo into a temporary job directory, checks out the PR head, verifies its SHA and starts omp with the job's model profile.
 5. omp fixes what's still valid, commits as `autokas[bot]` in Conventional Commits form, pushes and posts one outcome comment covering every finding.
 6. the container exits, and the job directory goes with it.
+
+a confirmed fix publication from any supported reviewer—coderabbit, cursor bugbot, cursor security reviewer or autokas—schedules a native review pinned to the exact confirmed head. external-reviewer fixes use an ordinary review; autokas fixes preserve the pr-agent round and prior-finding metadata.
 
 every outcome comment uses one layout: a heading with a status icon (✅ fixed, 🚫 rejected, ⛔ blocked, ❓ uncertain, ↩️ already fixed) and the commit, one line per finding, a **needs you** line when the owner has to decide something, then checks and reasoning in collapsed sections.
 
