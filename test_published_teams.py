@@ -19,6 +19,20 @@ class MergePublishedTest(unittest.TestCase):
         self.assertEqual("autokas-ghcr-pull", merged["pull_secret"])
         self.assertEqual("omp-runner-worker", merged["worker_secret"])
 
+    def test_published_repo_images_replace_or_clear_stale_overrides(self):
+        secret = {"kas": {"image": OLD, "repo_images": {"o/stale": OLD, "o/current": OLD}}}
+        for overrides in ({"o/current": APP}, {}):
+            with self.subTest(overrides=overrides):
+                merged = merge_published(secret, {"kas": {"repo_images": overrides}})
+                self.assertEqual(overrides, merged["kas"]["repo_images"])
+                self.assertEqual(OLD, secret["kas"]["repo_images"]["o/stale"])
+
+    def test_absent_published_repo_images_preserve_secret_overrides(self):
+        secret = {"kas": {"image": OLD, "repo_images": {"o/r": APP}}}
+        merged = merge_published(secret, {"kas": {"image": NEW}})
+        self.assertEqual({"o/r": APP}, merged["kas"]["repo_images"])
+        self.assertEqual(NEW, merged["kas"]["image"])
+
     def test_matches_by_environment_when_names_differ(self):
         merged = merge_published({"prod": {"image": OLD, "modal_environment": "main"}},
                                  {"kas": {"image": NEW, "modal_environment": "main"}})

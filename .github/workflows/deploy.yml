@@ -49,11 +49,13 @@ jobs:
               config.update({key: private[key] for key in PRIVATE_KEYS if key in private})
           except Exception:
               sys.exit("AUTOKAS_CONFIG_JSON is missing, invalid, or still the example config")
+          secret_teams = private.get("teams") or {}
+          config["teams"] = secret_teams
           # Image digests come from autokas-teams, which records them after each publish, so a new
           # image never needs a secret edit. The secret still wins for every non-image team field.
           try:
               from published_teams import fetch_published, merge_published
-              config["teams"] = merge_published(config.get("teams") or {}, fetch_published(os.environ["TEAMS_TOKEN"]))
+              config["teams"] = merge_published(secret_teams, fetch_published(os.environ["TEAMS_TOKEN"]))
           except Exception as error:
               # Don't print the body: it names private repositories and this log is public.
               print(f"published team images unavailable ({type(error).__name__}); using the secret's teams")

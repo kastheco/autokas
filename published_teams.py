@@ -37,8 +37,7 @@ def merge_published(teams: dict, published: dict) -> dict:
         updated = dict(entry)
         if source.get("image"):
             updated["image"] = source["image"]
-        repo_images = {**(entry.get("repo_images") or {}), **(source.get("repo_images") or {})}
-        if repo_images:
-            updated["repo_images"] = repo_images
+        if "repo_images" in source:
+            updated["repo_images"] = dict(source["repo_images"])
         merged[name] = updated
     return merged
