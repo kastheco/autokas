@@ -1588,6 +1588,18 @@ class FixPublicationTests(unittest.TestCase):
         self.assertEqual([call.args[0]["fix_state"] for call in finalize.call_args_list], ["fixed"])
         self.assertIn(f"fix:{REPO}:42:{self.fix_head}", self.claims)
 
+    def test_followup_dispatch_failure_preserves_publication_and_fixed_outcome(self):
+        receipt = f"pending-fix:{REPO}:42:{self.job['key']}"
+        self.job["fix_receipt"] = receipt
+        self.claims[receipt] = {"head": self.starting_head, "job": copy.deepcopy(self.job)}
+        finalized = []
+        with patch.object(runner.worker, "remote", side_effect=lambda job: finalized.append(copy.deepcopy(job))):
+            self.run_fix("exact", dispatch_error=RuntimeError("dispatch unavailable"))
+        self.assertIn(f"fix:{REPO}:42:{self.fix_head}", self.claims)
+        self.assertEqual(finalized[0]["fix_state"], "fixed")
+        self.assertEqual(self.claims[receipt]["state"], "fixed")
+        self.assertTrue(any(key.startswith("followup-review:") for key in self.claims))
+
     def test_explicit_depth_bypass_revalidates_and_publishes_one_fix(self):
         self.body = runner.pr_agent_marker(self.starting_head, 7, runner.pr_agent_findings(
             {"review": {"key_issues_to_review": ISSUES}}))

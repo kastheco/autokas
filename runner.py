@@ -1168,8 +1168,7 @@ async def webhook(request: Request) -> JSONResponse:
         call = await worker.spawn.aio(job)
     except Exception:
         if job.get("fix_receipt"):
-            await CLAIMS.pop.aio(job["fix_receipt"], None)
-            await CLAIMS.pop.aio(job["key"], None)
+            await retain_uncertain_launch_async(job)
         log("dispatch_uncertain", key=job["key"])
         raise HTTPException(503, "dispatch uncertain; inspect Modal logs, do not replay") from None
     log("dispatched", key=job["key"], call_id=call.object_id)
@@ -1258,6 +1257,55 @@ def pending_fix_jobs(repo: str, number: int, *, exclude_receipt: str | None = No
                for key in CLAIMS.keys())
 
 
+def retain_fix_reconciliation(repo: str, number: int) -> None:
+    # This marker is never cleared: concurrent uncertain webhook launches must
+    # not lose their wake-up when the serialized worker finishes another job.
+    CLAIMS.put(f"fix-reconcile:{repo}:{number}", True)
+
+
+def retained_fix_work(repo: str, number: int) -> list[dict[str, Any]]:
+    if CLAIMS.get(f"fix-reconcile:{repo}:{number}", None) is not True:
+        return []
+    prefixes = tuple(f"{kind}:{repo}:{number}:" for kind in ("finalize-fix", "intake-fix", "pending-fix", "followup-review"))
+    records = []
+    for key in list(CLAIMS.keys()):
+        if isinstance(key, str) and key.startswith(prefixes):
+            record = CLAIMS.get(key, None)
+            if isinstance(record, dict) and (key.startswith("finalize-fix:") or record.get("launch") == "uncertain" or record.get("followup")):
+                records.append(record)
+    return records
+
+
+def recover_fix_work(repo: str, number: int) -> None:
+    """Run in the serialized worker on every kind of PR delivery or gate decision."""
+    for record in retained_fix_work(repo, number):
+        job = record["job"]
+        if record.get("followup"):
+            try:
+                if CLAIMS.get("review-started:" + job["key"], None) is None:
+                    CLAIMS.pop(job["key"], None)
+                    dispatch(job)
+                CLAIMS.pop(f"followup-review:{repo}:{number}:{job['key']}", None)
+            except Exception as error:
+                log("followup_dispatch_uncertain", key=job["key"], reason=type(error).__name__)
+        elif record.get("launch") == "uncertain":
+            try:
+                if job["fix_receipt"].startswith("intake-fix:"):
+                    worker.spawn(job)
+                elif CLAIMS.get("started:" + job["key"], None) is None:
+                    pool = REPO_WORKERS.get(repo.lower(), PRWorker)
+                    pool(pr_key=f"{repo.lower()}#{number}").run.spawn(job)
+                    record.pop("launch", None)
+                    CLAIMS.put(job["fix_receipt"], record)
+                else:
+                    record.pop("launch", None)
+                    CLAIMS.put(job["fix_receipt"], record)
+            except Exception as error:
+                log("fix_launch_uncertain", key=job["key"], reason=type(error).__name__)
+        else:
+            reconcile_fix_work(job, record["state"])
+
+
 def unresolved_review_findings(repo: str, number: int) -> bool:
     """Check unresolved root findings from the reviewers whose fixes we own."""
     owner, name = repo.split("/")
@@ -1297,6 +1345,10 @@ def unresolved_review_findings(repo: str, number: int) -> bool:
 def review_fixes_pending(repo: str, number: int, *, exclude_receipt: str | None = None,
                          pr: dict[str, Any] | None = None) -> bool:
     """Require positive evidence before allowing a review's success."""
+    if exclude_receipt is None and retained_fix_work(repo, number):
+        worker.remote({"repo": repo, "pr": number, "mode": "fix_reconcile",
+                       "key": f"{repo}:fix_reconcile:{number}"})
+        pr = None  # Re-read labels after serialized recovery.
     pr = pr if pr is not None else github(f"repos/{repo}/pulls/{number}")
     return (any(label["name"] == "autokas:fixing" for label in pr.get("labels", []))
             or pending_fix_jobs(repo, number, exclude_receipt=exclude_receipt)
@@ -1359,6 +1411,27 @@ def recover_expired_fix_work(repo: str, number: int) -> None:
             set_fix_label(repo, number, "blocked", "fix-recovery", pr=pr, strict=True)
 
 
+def retain_uncertain_launch(job: dict[str, Any]) -> None:
+    """A lost spawn reply isn't proof that the queued job doesn't exist."""
+    receipt = job["fix_receipt"]
+    record = CLAIMS.get(receipt, None)
+    if not isinstance(record, dict):
+        return  # An accepted worker may already have transferred or finished it.
+    record.update(launch="uncertain", job=dict(job))
+    CLAIMS.put(receipt, record)
+    retain_fix_reconciliation(job["repo"], job["pr"])
+
+
+async def retain_uncertain_launch_async(job: dict[str, Any]) -> None:
+    receipt = job["fix_receipt"]
+    record = await CLAIMS.get.aio(receipt, None)
+    if not isinstance(record, dict):
+        return
+    record.update(launch="uncertain", job=dict(job))
+    await CLAIMS.put.aio(receipt, record)
+    await CLAIMS.put.aio(f"fix-reconcile:{job['repo']}:{job['pr']}", True)
+
+
 def queue_fix_work(job: dict[str, Any], pr: dict[str, Any]) -> None:
     """Open one check only after the serialized router has consolidated a review."""
     intake = job.get("fix_receipt")
@@ -1398,28 +1471,46 @@ def finish_fix_work(job: dict[str, Any], state: str) -> None:
     receipt = job.get("fix_receipt")
     if not receipt:
         return
+    repo, number = job["repo"], job["pr"]
     if receipt.startswith("intake-fix:"):
         CLAIMS.pop(receipt, None)
+        if not pending_fix_jobs(repo, number, include_finalizing=False):
+            outcome = CLAIMS.get(f"fix-outcome:{repo}:{number}", None)
+            if isinstance(outcome, dict):
+                previous = outcome["job"]
+                CLAIMS.put(f"finalize-fix:{repo}:{number}:{previous['key']}", outcome)
+                retain_fix_reconciliation(repo, number)
+                finish_fix_work(previous, outcome["state"])
         return
-    repo, number = job["repo"], job["pr"]
     finalizing = f"finalize-fix:{repo}:{number}:{job['key']}"
     record = CLAIMS.get(finalizing, None) or CLAIMS.get(receipt, None)
     if not isinstance(record, dict):
         return
     state = record.setdefault("state", state)
+    record.pop("launch", None)  # An observed outcome settles any uncertain launch.
     CLAIMS.put(finalizing, record)
+    retain_fix_reconciliation(repo, number)
     CLAIMS.pop(receipt, None)
     pr = github(f"repos/{repo}/pulls/{number}")
     pending = pending_fix_jobs(repo, number, include_finalizing=False)
+    superseded = record["head"] != pr["head"]["sha"]
     label = "fixing" if pending else state
-    set_fix_label(repo, number, label, job["key"], pr=pr, strict=True)
+    if not pending and superseded and state in {"blocked", "rejected"}:
+        for item in pr.get("labels", []):
+            if item["name"] in {f"autokas:{name}" for name in FIX_LABELS}:
+                github_request("DELETE", f"repos/{repo}/issues/{number}/labels/"
+                               + urllib.parse.quote(item["name"], safe=""))
+        label = None
+    else:
+        set_fix_label(repo, number, label, job["key"], pr=pr, strict=True)
     pr = {**pr, "labels": [item for item in pr.get("labels", [])
                           if item["name"] not in {f"autokas:{name}" for name in FIX_LABELS}]
-          + [{"name": f"autokas:{label}"}]}
+          + ([{"name": f"autokas:{label}"}] if label else [])}
     finish_review_check(repo, record.get("check"), job["key"],
                         "success" if state == "fixed" else "failure",
                         "fix published" if state == "fixed" else f"fix {state}", number=number,
                         exclude_receipt=finalizing, pr=pr, strict=True)
+    CLAIMS.put(f"fix-outcome:{repo}:{number}", record)
     if not pending:
         reconcile_held_checks(repo, number, pr, state, finalizing, record.get("head"))
     CLAIMS.pop(finalizing, None)
@@ -1433,6 +1524,9 @@ def finalize_fix_work(job: dict[str, Any], state: str) -> None:
     if isinstance(record, dict):
         state = record.setdefault("state", state)
         CLAIMS.put(job["fix_receipt"], record)
+    execution = CLAIMS.get("started:" + job["key"], None)
+    if isinstance(execution, dict):
+        CLAIMS.put("started:" + job["key"], {**execution, "state": "finished"})
     request = {**job, "mode": "fix_finalize", "fix_state": state}
     try:
         worker.remote(request)
@@ -1549,6 +1643,7 @@ def settle_review(job: dict[str, Any]) -> None:
     if access.get("permission") not in {"admin", "write"}:
         log("command_unauthorized", key=job["key"])
         return
+    recover_fix_work(repo, number)
     try:
         comment = github(f"repos/{repo}/issues/comments/{job['comment']}")
     except urllib.error.HTTPError as error:
@@ -2268,6 +2363,13 @@ def pr_review(job: dict[str, Any]) -> None:
     if not allowed_repository(job.get("repo")):
         return
     repo, number = job["repo"], job["pr"]
+    if job.get("kind") == "fix":
+        call_id = modal.current_function_call_id()
+        if not CLAIMS.put("review-started:" + job["key"], {"call": call_id}, skip_if_exists=True):
+            previous = CLAIMS.get("review-started:" + job["key"], None)
+            if isinstance(previous, dict) and previous.get("call") != call_id:
+                log("duplicate_followup_review", key=job["key"])
+                return
     # automatic: a PR became ready (`pull_request`) or an autokas fix landed (`fix`). anything else is a command.
     automatic = job["kind"] in {"pull_request", "fix"}
     if not automatic and not trusted_reviewer({"login": job.get("author"), "id": job.get("author_id")}):
@@ -2470,8 +2572,9 @@ def dispatch(job: dict[str, Any]) -> None:
         call = worker.spawn(job)
     except Exception:
         if job.get("fix_receipt"):
-            CLAIMS.pop(job["fix_receipt"], None)
-        CLAIMS.pop(job["key"], None)
+            retain_uncertain_launch(job)
+        else:
+            CLAIMS.pop(job["key"], None)
         raise
     log("dispatched", key=job["key"], call_id=call.object_id)
 
@@ -2517,27 +2620,31 @@ def worker(job: dict[str, Any]) -> None:
     if job.get("mode") == "fix_recover":
         recover_expired_fix_work(job["repo"], job["pr"])
         return
-    if job.get("mode") == "fix_finalize":
-        reconcile_fix_work(job, job["fix_state"])
+    if job.get("mode") in {"fix_finalize", "fix_reconcile"}:
+        if job["mode"] == "fix_finalize":
+            reconcile_fix_work(job, job["fix_state"])
+        else:
+            recover_fix_work(job["repo"], job["pr"])
         return
     transferred = False
     failed = False
     try:
-        prefix = f"finalize-fix:{job['repo']}:{job['pr']}:"
-        for key in list(CLAIMS.keys()) if job.get("fix_receipt") else []:
-            if isinstance(key, str) and key.startswith(prefix):
-                record = CLAIMS.get(key)
-                reconcile_fix_work(record["job"], record["state"])
+        receipt = job.get("fix_receipt", "")
+        if receipt.startswith("intake-fix:"):
+            record = CLAIMS.get(receipt, None)
+            if isinstance(record, dict) and record.pop("launch", None):
+                CLAIMS.put(receipt, record)  # This worker's acceptance is now observed.
+        recover_fix_work(job["repo"], job["pr"])
         transferred = route_worker(job)
     except Exception:
         failed = True
-        if job.get("fix_receipt"):
+        if job.get("fix_receipt") and not job.get("launch_uncertain"):
             CLAIMS.pop(job.get("intake_key", job["key"]), None)
             if job.get("routing_claim"):
                 CLAIMS.pop(job["routing_claim"], None)
         raise
     finally:
-        if not transferred and job.get("fix_receipt"):
+        if not transferred and job.get("fix_receipt") and not job.get("launch_uncertain"):
             reconcile_fix_work(job, "blocked")
         if job.get("intake_key") and not failed:
             CLAIMS.put(job["intake_key"], {"state": "routed" if transferred else "finished",
@@ -2642,7 +2749,13 @@ def route_worker(job: dict[str, Any]) -> bool | None:
     pr_key = (f"{job['repo'].lower()}#docs:{job['base_branch']}" if job.get("mode") == "docs_update"
               else f"{job['repo'].lower()}#{job['pr']}")
     pool = REPO_WORKERS.get(job["repo"].lower(), PRWorker)
-    call = pool(pr_key=pr_key).run.spawn(job)
+    try:
+        call = pool(pr_key=pr_key).run.spawn(job)
+    except Exception:
+        if job.get("fix_receipt"):
+            retain_uncertain_launch(job)
+            job["launch_uncertain"] = True
+        raise
     log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
     return True
 
@@ -2992,7 +3105,15 @@ class PRWorker:
         # Modal can redeliver preempted inputs even with retries=0. Commands need
         # their own publication evidence before another agent may execute them.
         start_value = "command_started_v2" if job.get("mode") == "command" else "started"
+        call_id = modal.current_function_call_id()
+        if job.get("fix_receipt"):
+            start_value = {"call": call_id, "state": "started"}
         first_start = CLAIMS.put("started:" + job["key"], start_value, skip_if_exists=True)
+        if not first_start and job.get("fix_receipt"):
+            previous = CLAIMS.get("started:" + job["key"], None)
+            if isinstance(previous, dict) and (previous.get("call") != call_id or previous.get("state") == "finished"):
+                log("duplicate_fixer", key=job["key"])
+                return
         if not first_start:
             log("preempted_retry", repo=job["repo"], pr=job["pr"], key=job["key"])
         if plan_only and not first_start:
@@ -3297,16 +3418,23 @@ class PRWorker:
                     if code == 0 and publication_confirmed and reported == "published":
                         CLAIMS.put(f"fix:{repo}:{number}:{final_head}", {
                             "branch": branch, "findings": finding_keys(job)}, skip_if_exists=True)
-                if job.get("reviewer") == "pr_agent" and publication_confirmed:
-                    try:
-                        dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"]))
-                    except Exception as error:
-                        log("fix_review_dispatch_uncertain", key=job["key"], head=remote_head,
-                            reason=type(error).__name__)
-                if labeled:
                     handled = (code == 0 and reported == "already handled" and final_head == head
                                and already_handled_confirmed(job, pr, branch, evidence_file, started_at))
                     state = fix_state(code, publication_confirmed, reported, handled)
+                    if job.get("fix_receipt"):
+                        publication = CLAIMS.get(job["fix_receipt"], None)
+                        if isinstance(publication, dict):
+                            publication.setdefault("state", state)
+                            CLAIMS.put(job["fix_receipt"], publication)
+                    if job.get("reviewer") == "pr_agent" and publication_confirmed:
+                        followup = next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"])
+                        try:
+                            dispatch(followup)
+                        except Exception as error:
+                            CLAIMS.put(f"followup-review:{repo}:{number}:{followup['key']}",
+                                       {"job": followup, "followup": True})
+                            retain_fix_reconciliation(repo, number)
+                            log("followup_dispatch_uncertain", key=job["key"], reason=type(error).__name__)
                     if job.get("fix_receipt"):
                         finalize_fix_work(job, state)
                     else:

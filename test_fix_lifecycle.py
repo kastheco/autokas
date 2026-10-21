@@ -141,11 +141,18 @@ class FixLifecycleTests(unittest.TestCase):
                     with patch.object(self.store, "put", side_effect=fail_route):
                         with self.assertRaises(RuntimeError):
                             self.deliver()
-                    self.assertFalse(runner.pending_fix_jobs(REPO, 42))
-                    self.assertTrue(all(check["status"] == "completed" for check in self.api.checks.values()))
                     self.pool.return_value.run.spawn.side_effect = self.capture_job
-                    self.deliver()
-                    self.assertTrue(runner.pending_fix_jobs(REPO, 42))
+                    if stage == "spawn":
+                        self.assertTrue(runner.pending_fix_jobs(REPO, 42))
+                        self.assertEqual(self.api.checks[501]["status"], "in_progress")
+                        runner.worker.local({"repo": REPO, "pr": 42, "mode": "fix_reconcile", "key": "recover"})
+                        self.finalize(self.jobs[-1])
+                        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+                    else:
+                        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+                        self.assertTrue(all(check["status"] == "completed" for check in self.api.checks.values()))
+                        self.deliver()
+                        self.assertTrue(runner.pending_fix_jobs(REPO, 42))
 
     def test_outdated_canonical_review_releases_intake_without_a_check(self):
         self.api.review["state"] = "DISMISSED"
@@ -291,6 +298,112 @@ class FixLifecycleTests(unittest.TestCase):
         self.assertFalse(runner.pending_fix_jobs(REPO, 42))
         self.assertEqual(self.api.checks[501]["conclusion"], "success")
 
+    def exhaust_finalization(self):
+        self.deliver()
+        job = self.jobs[-1]
+        for attempt in range(3):
+            self.api.failures[("DELETE", f"repos/{REPO}/issues/42/labels/autokas%3Afixing")] = RuntimeError("502")
+            if attempt == 0:
+                self.finalize(job)
+            else:
+                runner.worker.local(self.finalizers.pop(0))
+        self.assertEqual(self.finalizers, [])
+        self.assertTrue(runner.pending_fix_jobs(REPO, 42))
+        return job
+
+    def test_clean_gate_recovers_after_immediate_retries_are_exhausted(self):
+        self.exhaust_finalization()
+        with patch.object(runner.worker, "remote", side_effect=lambda job: runner.worker.local(job)):
+            self.assertFalse(runner.review_fixes_pending(REPO, 42))
+        self.assertEqual(self.api.pr["labels"], [{"name": "autokas:fixed"}])
+        self.assertEqual(self.api.checks[501]["conclusion"], "success")
+
+    def test_settlement_recovers_after_immediate_retries_are_exhausted(self):
+        self.exhaust_finalization()
+        head = self.api.pr["head"]["sha"]
+        comment = {"id": 777, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
+                   "body": runner.pr_agent_marker(head, 1, [{"severity": "P1"}]),
+                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
+                   "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+        github = runner.github
+        def read(path):
+            if path.endswith("/permission"):
+                return {"permission": "write"}
+            if path.endswith("/issues/comments/777"):
+                return comment
+            return github(path)
+        check = {"status": "completed", "conclusion": "failure", "details_url": comment["html_url"],
+                 "html_url": "https://example/check"}
+        with patch.object(runner, "github", side_effect=read), \
+                patch.object(runner, "latest_review_check", return_value=check):
+            runner.settle_review({"repo": REPO, "pr": 42, "key": "settle", "author": "kas",
+                                 "author_type": "User", "comment": 777, "reason": "verified",
+                                 "source_url": "https://example/settlement"})
+        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+        self.assertEqual(self.api.pr["labels"], [{"name": "autokas:fixed"}])
+
+    def assert_last_intake_reconciles(self, outdated):
+        self.deliver()
+        first = self.jobs[-1]
+        raw = runner.event_job("pull_request_review_comment",
+                               event("pull_request_review_comment", self.api.findings[0]))
+        runner.register_fix_intake(raw)
+        self.finalize(first)
+        self.assertEqual(self.api.checks[501]["conclusion"], "failure")
+        self.assertIn({"name": "autokas:fixing"}, self.api.pr["labels"])
+        if outdated:
+            self.api.review["state"] = "DISMISSED"
+        runner.worker.local(raw)
+        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+        self.assertNotIn({"name": "autokas:fixing"}, self.api.pr["labels"])
+        self.assertEqual(self.api.checks[501]["conclusion"], "success")
+
+    def test_dropping_the_last_outdated_intake_reconciles_the_gate(self):
+        self.assert_last_intake_reconciles(True)
+
+    def test_dropping_the_last_folded_intake_reconciles_the_gate(self):
+        self.assert_last_intake_reconciles(False)
+
+    def test_old_head_blocked_and_rejected_do_not_overwrite_a_clean_new_head(self):
+        for state in ("blocked", "rejected"):
+            with self.subTest(state=state):
+                self.store.values.clear()
+                self.api = GateGitHub()
+                with patch.object(runner.urllib.request, "urlopen", self.api):
+                    self.deliver()
+                    old_job = self.jobs[-1]
+                    self.api.pr["head"]["sha"] = "c" * 40
+                    current = runner.start_review_check(REPO, "c" * 40, "current")
+                    runner.finish_review_check(REPO, current, "current", "success", "no findings", number=42)
+                    self.finalize(old_job, state)
+                    self.assertEqual(self.api.checks[501]["conclusion"], "failure")
+                    self.assertEqual(self.api.checks[current]["conclusion"], "success")
+                    self.assertEqual(self.api.pr["labels"], [])
+
+    def test_pool_spawn_with_lost_reply_stays_pending_and_the_actual_fixer_can_finish_fixed(self):
+        def accepted_then_lost(job):
+            self.capture_job(job)
+            raise RuntimeError("reply lost")
+        self.pool.return_value.run.spawn.side_effect = accepted_then_lost
+        with self.assertRaises(RuntimeError):
+            self.deliver()
+        actual = self.jobs[-1]
+        self.assertTrue(runner.pending_fix_jobs(REPO, 42))
+        self.assertEqual(self.api.checks[501]["status"], "in_progress")
+        self.finalize(actual, "fixed")
+        self.assertEqual(self.api.checks[501]["conclusion"], "success")
+        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+
+    def test_two_accepted_pool_launches_execute_the_fixer_only_once(self):
+        self.deliver()
+        job = self.jobs[-1]
+        self.store.put("started:" + job["key"], {"call": "first-call", "state": "started"})
+        with patch.object(runner.modal, "current_function_call_id", return_value="duplicate-call"), \
+                patch.object(runner, "check_proxy_model") as proxy:
+            runner.PRWorker(pr_key=f"{REPO}#42").run.local(job)
+        proxy.assert_not_called()
+        self.assertTrue(runner.pending_fix_jobs(REPO, 42))
+
 
 class WebhookIntakeTests(unittest.IsolatedAsyncioTestCase):
     async def test_webhook_has_no_github_calls_and_failed_spawn_can_be_redelivered(self):
@@ -303,6 +416,7 @@ class WebhookIntakeTests(unittest.IsolatedAsyncioTestCase):
         claims.put.side_effect = AssertionError("blocking write in async webhook")
         claims.put.aio = AsyncMock(side_effect=store.put)
         claims.get.aio = AsyncMock(side_effect=store.get)
+        claims.get.side_effect = store.get
         claims.pop.aio = AsyncMock(side_effect=store.pop)
         with patch.dict(os.environ, GITHUB_WEBHOOK_SECRET="test-secret"), \
                 patch.dict(runner.CONFIG, allowed_owners=[REPO.split("/")[0]]), \
@@ -311,7 +425,9 @@ class WebhookIntakeTests(unittest.IsolatedAsyncioTestCase):
             spawn.aio = AsyncMock(side_effect=[RuntimeError("spawn unavailable"), Mock(object_id="call")])
             with self.assertRaises(runner.HTTPException):
                 await runner.webhook.local(request)
-            self.assertEqual(store.values, {})
+            pending = [value for key, value in store.values.items() if key.startswith("intake-fix:")]
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["launch"], "uncertain")
             # A process can die after claiming but before registering/spawning.
             key = runner.event_job("pull_request_review", payload)["key"]
             store.put(key, "claimed")
