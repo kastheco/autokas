@@ -290,7 +290,7 @@ class PRReviewRunTests(unittest.TestCase):
                 if isinstance(review_checks, Exception):
                     raise review_checks
                 return {"check_runs": review_checks or []}
-            if "/comments?" in path:
+            if "/reviews?" in path:
                 return (comments or {}).get(int(path.rsplit("page=", 1)[1]), [])
             if "/compare/" in path:
                 left = path.split("/compare/", 1)[1].split("...", 1)[0]
@@ -320,12 +320,13 @@ class PRReviewRunTests(unittest.TestCase):
                     raise runner.urllib.error.HTTPError(path, 403, "Resource not accessible by integration", {}, None)
                 self.checks.append((method, path, payload))
                 return {"id": 88}
-            if method == "PATCH" and note_error is not None:
+            if method == "PUT" and note_error is not None:
                 raise note_error
             self.posts.append((method, path, payload))
             return {"id": 777, "body": payload["body"], "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
-                    "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
-                    "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+                    "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
+                    "state": "COMMENTED", "commit_id": head_after,
+                    "html_url": f"https://github.com/{REPO}/pull/42#pullrequestreview-777"}
 
         self.run = Mock(side_effect=pr_agent)
         self.checkout = Mock(return_value=diff)
@@ -662,9 +663,54 @@ class PRReviewRunTests(unittest.TestCase):
     def test_review_queues_one_fix_for_findings_at_or_above_the_threshold(self):
         self.run_review(self.command_job())
         [fix] = self.dispatched
-        self.assertEqual((fix["reviewer"], fix["kind"], fix["comment"]), ("pr_agent", "issue_comment", 777))
+        self.assertEqual((fix["reviewer"], fix["kind"], fix["comment"]), ("pr_agent", "pull_request_review", 777))
         self.assertIn("[P1] Wrong lookup (parser.py, lines 7-9)\ndrops the last day", fix["prompt"])
         self.assertNotIn("Naming", fix["prompt"])
+        method, path, payload = self.posts[0]
+        self.assertEqual((method, path), ("POST", f"repos/{REPO}/pulls/42/reviews"))
+        self.assertEqual(set(payload), {"commit_id", "body", "event"})
+        self.assertEqual((payload["commit_id"], payload["event"]), (HEAD, "COMMENT"))
+        self.assertEqual(fix["head"], HEAD)
+        self.assertEqual(self.checks[-1][2]["details_url"],
+                         f"https://github.com/{REPO}/pull/42#pullrequestreview-777")
+
+    def test_review_history_uses_only_paginated_reviews(self):
+        old = {"id": 1, "body": runner.pr_agent_marker(HEAD, 99, []),
+               "user": runner.CONFIG["pr_agent"]}
+        review = {"id": 777, "body": runner.pr_agent_marker(HEAD, 2, []),
+                  "user": runner.CONFIG["pr_agent"]}
+        paths = {
+            f"repos/{REPO}/issues/42/comments?per_page=100&page=1": [old],
+            f"repos/{REPO}/pulls/42/reviews?per_page=100&page=1": [{"user": {}}] * 100,
+            f"repos/{REPO}/pulls/42/reviews?per_page=100&page=2": [review],
+        }
+        with patch.object(runner, "github", side_effect=paths.__getitem__) as github:
+            round_, heads, latest = runner.pr_agent_history(REPO, 42)
+        self.assertEqual((round_, heads[HEAD]["comment"], latest["comment"]), (3, 777, 777))
+        self.assertEqual([call.args[0] for call in github.call_args_list],
+                         [f"repos/{REPO}/pulls/42/reviews?per_page=100&page={page}" for page in (1, 2)])
+        with patch.object(runner, "github", return_value=[]) as github:
+            self.assertEqual(runner.pr_agent_round(REPO, 42), 1)
+        github.assert_called_once_with(f"repos/{REPO}/pulls/42/reviews?per_page=100&page=1")
+
+    def test_router_revalidates_the_posted_review_without_losing_fix_context(self):
+        self.run_review(self.auto_job())
+        [fix] = self.dispatched
+        review = {"id": 777, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
+                  "body": self.posts[0][2]["body"], "state": "COMMENTED", "commit_id": HEAD,
+                  "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
+                  "html_url": f"https://github.com/{REPO}/pull/42#pullrequestreview-777"}
+        for changed in ({}, {"state": "DISMISSED"}, {"commit_id": "c" * 40},
+                        {"body": runner.pr_agent_marker("c" * 40, 1, [])}):
+            with self.subTest(changed=changed), patch.object(runner, "github", return_value={**review, **changed}) as github:
+                canonical = runner.review_job(fix, PR)
+                github.assert_called_once_with(f"repos/{REPO}/pulls/42/reviews/777")
+                if changed:
+                    self.assertIsNone(canonical)
+                else:
+                    self.assertEqual((canonical["head"], canonical["key"], canonical["review_prompt"]),
+                                     (HEAD, fix["key"], fix["prompt"]))
+                    self.assertEqual(canonical["targets"], [])
 
     def test_no_fix_below_threshold_when_off_or_after_the_last_round(self):
         rounds = runner.CONFIG["pr_review"]["max_fix_rounds"]
@@ -677,7 +723,7 @@ class PRReviewRunTests(unittest.TestCase):
                 self.assertEqual(self.dispatched, [])
                 if name == "last round":
                     self.assertEqual([(method, path) for method, path, _ in self.posts[1:]],
-                                     [("PATCH", f"repos/{REPO}/issues/comments/777")])
+                                     [("PUT", f"repos/{REPO}/pulls/42/reviews/777")])
                     notice = self.posts[1][2]["body"]
                     self.assertEqual(runner.pr_agent_review_state(notice)["round"], rounds + 1)
                     self.assertIn(runner.FIX_ANYWAY_UNCHECKED, notice)
@@ -793,21 +839,27 @@ class PRReviewRunTests(unittest.TestCase):
                 {"review": {"key_issues_to_review": ISSUES}}))
             self.assertEqual(bool(runner.pr_agent_prompt(body)), job["round"] <= rounds)
 
-    def test_only_the_posted_review_starts_a_fix_never_a_delivered_comment(self):
-        # coding jobs comment as autokas[bot] too, so a delivered comment carrying the marker must not start work.
+    def test_only_the_posted_review_starts_a_fix_never_a_delivery(self):
         self.run_review(self.auto_job())
         body = self.posts[0][2]["body"]
         autokas = {**runner.CONFIG["pr_agent"], "type": "Bot"}
         for user in ({"login": "kas", "id": 1, "type": "User"}, {**runner.CONFIG["coderabbit"], "type": "Bot"},
                      {"login": "autokas[bot]", "id": 1, "type": "Bot"}, autokas):
-            comment = {"id": 778, "body": body, "user": user, "issue_url": f"https://api.github.com/repos/{REPO}/issues/42"}
-            for action, posted in (("created", False), ("edited", False), ("created", True)):
+            review = {"id": 778, "body": body, "user": user, "state": "COMMENTED", "commit_id": HEAD,
+                      "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42"}
+            for action, posted in (("submitted", False), ("edited", False), ("submitted", True)):
                 with self.subTest(user=user["login"], id=user["id"], action=action, posted=posted):
-                    job = runner.event_job("issue_comment", {
-                        "action": action, "repository": {"full_name": REPO}, "sender": user, "comment": comment,
-                        "issue": {"number": 42, "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/42"}}},
-                        posted_review=posted)
+                    job = runner.event_job("pull_request_review", {
+                        "action": action, "repository": {"full_name": REPO}, "sender": user,
+                        "review": review, "pull_request": copy.deepcopy(PR)}, posted_review=posted)
                     self.assertEqual(job is not None, user is autokas and posted)
+            # Coding outcomes remain issue comments, even if their text contains a review marker.
+            for posted in (False, True):
+                self.assertIsNone(runner.event_job("issue_comment", {
+                    "action": "created", "repository": {"full_name": REPO}, "sender": user,
+                    "comment": {**review, "issue_url": f"https://api.github.com/repos/{REPO}/issues/42"},
+                    "issue": {"number": 42, "pull_request": {
+                        "url": f"https://api.github.com/repos/{REPO}/pulls/42"}}}, posted_review=posted))
 
     def test_head_moved_during_review_posts_nothing(self):
         for job in (self.auto_job(), self.command_job()):
@@ -868,11 +920,12 @@ class PRReviewRunTests(unittest.TestCase):
         self.run_review(self.auto_job())
         [fix] = self.dispatched
         comment = {"body": self.posts[0][2]["body"], "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
-                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42"}
+                   "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
+                   "state": "COMMENTED", "commit_id": HEAD}
         moved = {**PR, "head": {**PR["head"], "sha": "c" * 40}}
 
         def github(path):
-            if path == f"repos/{REPO}/issues/comments/777":
+            if path == f"repos/{REPO}/pulls/42/reviews/777":
                 return comment
             if path == f"repos/{REPO}/pulls/42":
                 return moved
@@ -899,8 +952,9 @@ class PRReviewRunTests(unittest.TestCase):
         self.run_review(self.auto_job())
         [fix] = self.dispatched
         comment = {"body": self.posts[0][2]["body"], "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
-                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
-                   "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+                   "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
+                   "state": "COMMENTED", "commit_id": HEAD,
+                   "html_url": f"https://github.com/{REPO}/pull/42#pullrequestreview-777"}
         pushed = "f" * 40
         cases = (("pushed", 0, True, "published", "fixed"),
                  ("pushed without outcome", 0, True, None, "blocked"),
@@ -922,7 +976,7 @@ class PRReviewRunTests(unittest.TestCase):
                 def github(path):
                     if "/pulls?" in path:
                         return []
-                    return comment if path.endswith("/issues/comments/777") else copy.deepcopy(next(pulls))
+                    return comment if path.endswith("/pulls/42/reviews/777") else copy.deepcopy(next(pulls))
 
                 def run(args, **kwargs):
                     return subprocess.CompletedProcess(args, 0, next(heads) if args[1:2] == ["rev-parse"] else "", "")
@@ -1122,7 +1176,7 @@ class PRReviewStackTests(unittest.TestCase):
             return {"permission": "write"}
         if "/check-runs?" in path:
             return {"check_runs": getattr(self, "review_checks", [])}
-        if "/comments?" in path:
+        if "/reviews?" in path:
             return copy.deepcopy(self.comments) if path.endswith("page=1") else []
         if "/compare/" in path:
             left, right = path.split("/compare/", 1)[1].split("?", 1)[0].split("...")
@@ -1138,12 +1192,15 @@ class PRReviewStackTests(unittest.TestCase):
         if "/check-runs" in path:
             self.checks.append((method, path, copy.deepcopy(payload)))
             return {"id": 88}
-        self.assertEqual((method, path), ("POST", f"repos/{REPO}/issues/42/comments"))
+        self.assertEqual((method, path), ("POST", f"repos/{REPO}/pulls/42/reviews"))
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload["commit_id"], self.git(["rev-parse", "pr2"], self.origin))
         number = 777 + len(self.comments)
         comment = {"id": number, "body": payload["body"],
                    "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
-                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
-                   "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-{number}"}
+                   "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
+                   "state": "COMMENTED", "commit_id": payload["commit_id"],
+                   "html_url": f"https://github.com/{REPO}/pull/42#pullrequestreview-{number}"}
         self.comments.append(comment)
         return copy.deepcopy(comment)
 
@@ -1445,7 +1502,7 @@ class FixPublicationTests(unittest.TestCase):
         self.commit(self.parent, "parent change")
         self.body = runner.pr_agent_marker(self.starting_head, 1, runner.pr_agent_findings(
             {"review": {"key_issues_to_review": ISSUES}}))
-        self.job = {"repo": REPO, "pr": 42, "comment": 777, "kind": "issue_comment",
+        self.job = {"repo": REPO, "pr": 42, "comment": 777, "kind": "pull_request_review",
                     "reviewer": "pr_agent", "head": self.starting_head,
                     "prompt": runner.pr_agent_prompt(self.body), "key": "publication-race"}
         self.claims = {}
@@ -1462,8 +1519,9 @@ class FixPublicationTests(unittest.TestCase):
                 receipt_error=None):
         self.dispatched, self.logs, self.labels = [], [], []
         comment = {"body": self.body, "user": {**runner.CONFIG[self.job["reviewer"]], "type": "Bot"},
-                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
-                   "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+                   "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
+                   "state": "COMMENTED", "commit_id": self.starting_head,
+                   "html_url": f"https://github.com/{REPO}/pull/42#pullrequestreview-777"}
         self.launched = False
 
         def claim(key, value, skip_if_exists=False):
@@ -1488,7 +1546,7 @@ class FixPublicationTests(unittest.TestCase):
                 return {"sha": sha, "commit": {"tree": {"sha": tree}},
                         "committer": {"id": 334744567 if commit_owner is None else commit_owner},
                         "parents": [{"sha": parent} for parent in parents.split()]}
-            if path == f"repos/{REPO}/issues/comments/777":
+            if path == f"repos/{REPO}/pulls/42/reviews/777":
                 return comment
             if path == f"repos/{REPO}/pulls/42":
                 pr = copy.deepcopy(PR)
@@ -1844,8 +1902,9 @@ class ReviewFixBypassTests(unittest.TestCase):
         self.comment = {"id": 777, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
                         "body": runner.pr_agent_marker(HEAD, 7, runner.pr_agent_findings(
                             {"review": {"key_issues_to_review": ISSUES}})),
-                        "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
-                        "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+                        "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
+                        "state": "COMMENTED", "commit_id": HEAD,
+                        "html_url": f"https://github.com/{REPO}/pull/42#pullrequestreview-777"}
         self.check = {"id": 88, "name": runner.REVIEW_CHECK, "app": {"slug": runner.CONFIG["github_app"]["name"]},
                       "head_sha": HEAD, "details_url": self.comment["html_url"],
                       "status": "completed", "conclusion": "failure"}
@@ -1862,8 +1921,8 @@ class ReviewFixBypassTests(unittest.TestCase):
         self.comment["body"] = before.replace(runner.FIX_ANYWAY_UNCHECKED, runner.FIX_ANYWAY_CHECKED)
         return {"action": "edited", "repository": {"full_name": REPO},
                 "sender": {"login": "kas", "id": 1, "type": "User"},
-                "issue": {"number": 42, "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/42"}},
-                "comment": copy.deepcopy(self.comment), "changes": {"body": {"from": before}}}
+                "pull_request": copy.deepcopy(self.pr),
+                "review": copy.deepcopy(self.comment), "changes": {"body": {"from": before}}}
 
     def run_checkbox(self, payload):
         def claim(key, value, **kwargs):
@@ -1873,7 +1932,7 @@ class ReviewFixBypassTests(unittest.TestCase):
             return True
 
         def update(method, path, data):
-            self.assertEqual((method, path), ("PATCH", f"repos/{REPO}/issues/comments/777"))
+            self.assertEqual((method, path), ("PUT", f"repos/{REPO}/pulls/42/reviews/777"))
             self.comment.update(data)
             return self.comment
 
@@ -1887,7 +1946,7 @@ class ReviewFixBypassTests(unittest.TestCase):
               patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim),
                                                  get=Mock(side_effect=self.claims.get))),
               patch.object(runner.worker, "spawn", side_effect=spawn), patch.object(runner, "log")):
-            job = runner.event_job("issue_comment", payload)
+            job = runner.event_job("pull_request_review", payload)
             if job:
                 runner.worker.local(job)
 
@@ -1903,12 +1962,22 @@ class ReviewFixBypassTests(unittest.TestCase):
         self.assertNotIn(runner.FIX_ANYWAY_CHECKED, self.comment["body"])
         self.run_checkbox(payload)  # redelivery reads the consumed source
         untick = copy.deepcopy(payload)
-        untick["changes"]["body"]["from"] = payload["comment"]["body"]
-        untick["comment"]["body"] = payload["changes"]["body"]["from"]
+        untick["changes"]["body"]["from"] = payload["review"]["body"]
+        untick["review"]["body"] = payload["changes"]["body"]["from"]
         self.run_checkbox(untick)
-        self.comment["body"] = payload["comment"]["body"]  # restore and tick again
+        self.comment["body"] = payload["review"]["body"]  # restore and tick again
         self.run_checkbox(payload)
         self.assertEqual(len(self.queued), 1)
+
+    def test_reconcile_submitted_review_does_not_consume_checked_checkbox(self):
+        payload = self.checkbox_event()
+        payload["action"] = "submitted"
+        payload["sender"] = dict(self.comment["user"])
+        before = self.comment["body"]
+        self.run_checkbox(payload)
+        self.assertEqual(self.queued, [])
+        self.assertEqual(self.claims, {})
+        self.assertEqual(self.comment["body"], before)
 
     def test_checkbox_rejects_unauthorized_author_and_unrelated_edits(self):
         original = copy.deepcopy(self.comment)
@@ -1918,19 +1987,19 @@ class ReviewFixBypassTests(unittest.TestCase):
                 self.permission = "read" if case == "read" else "write"
                 payload = self.checkbox_event()
                 if case == "author":
-                    payload["comment"]["user"] = {"login": "kas", "type": "User"}
+                    payload["review"]["user"] = {"login": "kas", "type": "User"}
                 elif case == "sender":
                     payload["sender"] = dict(TRUSTED_BOT)
                 elif case == "unchanged":
-                    payload["changes"]["body"]["from"] = payload["comment"]["body"]
+                    payload["changes"]["body"]["from"] = payload["review"]["body"]
                 elif case == "marker":
-                    payload["comment"]["body"] = runner.FIX_ANYWAY_CHECKED
+                    payload["review"]["body"] = runner.FIX_ANYWAY_CHECKED
                 elif case == "head":
-                    payload["comment"]["body"] = payload["comment"]["body"].replace(HEAD, "bad")
+                    payload["review"]["body"] = payload["review"]["body"].replace(HEAD, "bad")
                 elif case == "identity":
-                    payload["comment"]["user"]["id"] = 1
+                    payload["review"]["user"]["id"] = 1
                 elif case == "issue":
-                    payload["issue"].pop("pull_request")
+                    payload["pull_request"].pop("base")
                 self.run_checkbox(payload)
                 self.assertEqual(self.queued, [])
 
@@ -1956,7 +2025,7 @@ class ReviewFixBypassTests(unittest.TestCase):
         if path.endswith("/permission"):
             return {"permission": self.permission}
         return {f"repos/{REPO}/pulls/42": self.pr,
-                f"repos/{REPO}/issues/comments/777": self.comment,
+                f"repos/{REPO}/pulls/42/reviews/777": self.comment,
                 f"repos/{REPO}/check-runs/88": self.check}[path]
 
     def resolve(self):
@@ -2030,9 +2099,19 @@ class ReviewFixBypassTests(unittest.TestCase):
         self.assertIsNone(self.resolve())
         self.assertEqual(self.reads, [f"repos/{REPO}/collaborators/kas/permission"])
 
+    def test_depth_bypass_survives_review_router_revalidation(self):
+        fix = self.resolve()
+        with patch.object(runner, "github", return_value=self.comment) as github:
+            canonical = runner.review_job(fix, self.pr)
+        github.assert_called_once_with(f"repos/{REPO}/pulls/42/reviews/777")
+        self.assertEqual((canonical["key"], canonical["head"], canonical["bypass_depth"], canonical["author"]),
+                         (fix["key"], HEAD, True, "kas"))
+        self.assertEqual(canonical["review_prompt"], fix["prompt"])
+
     def test_bypass_rejects_moved_head_forged_review_and_wrong_pr(self):
         for field, replacement in (("head", "c" * 40), ("user", {"login": "outsider", "type": "User"}),
-                                   ("issue_url", f"https://api.github.com/repos/{REPO}/issues/43")):
+                                   ("pull_request_url", f"https://api.github.com/repos/{REPO}/pulls/43"),
+                                   ("commit_id", "c" * 40), ("state", "DISMISSED")):
             with self.subTest(field=field):
                 old_pr, old_comment = copy.deepcopy(self.pr), copy.deepcopy(self.comment)
                 if field == "head":
@@ -2068,8 +2147,9 @@ class ReviewSettlementTests(unittest.TestCase):
         self.findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
         self.comment = {"id": 777, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
                         "body": runner.pr_agent_marker(HEAD, 2, self.findings),
-                        "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
-                        "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+                        "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
+                        "state": "COMMENTED", "commit_id": HEAD,
+                        "html_url": f"https://github.com/{REPO}/pull/42#pullrequestreview-777"}
         self.check = {"id": 88, "name": runner.REVIEW_CHECK, "head_sha": HEAD,
                       "app": {"slug": runner.CONFIG["github_app"]["name"]},
                       "status": "completed", "conclusion": "failure",
@@ -2084,7 +2164,7 @@ class ReviewSettlementTests(unittest.TestCase):
             return {"permission": self.permission}
         if "/check-runs?" in path:
             return {"check_runs": self.checks}
-        if path.endswith("/issues/comments/777"):
+        if path.endswith("/pulls/42/reviews/777"):
             if self.comment is None:
                 raise runner.urllib.error.HTTPError(path, 404, "missing", {}, None)
             return self.comment
@@ -2172,7 +2252,7 @@ class ReviewSettlementTests(unittest.TestCase):
                 elif case == "identity":
                     self.comment["user"]["id"] = 1
                 elif case == "pr":
-                    self.comment["issue_url"] += "9"
+                    self.comment["pull_request_url"] += "9"
                 elif case == "marker":
                     self.comment["body"] = "no marker"
                 elif case == "stale":

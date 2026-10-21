@@ -83,10 +83,6 @@ while IFS= read -r repo; do
         },
         reviewed: (any($r[]; .user.login == "autokas[bot]" and
           .commit_id == $p.headRefOid and .submitted_at != null) or
-          any($c[]; .user.login == "autokas[bot]" and
-            ((.body // "") | contains("<!-- autokas:pr-agent ")) and
-            (try ((.body | capture("<!-- autokas:pr-agent (?<marker>[^\\n]+?) -->").marker |
-              fromjson).head == $p.headRefOid) catch false)) or
           any($p.statusCheckRollup[]?; .name == "autokas review" and
             .status == "COMPLETED" and
             (.conclusion == "SUCCESS" or .conclusion == "FAILURE")))

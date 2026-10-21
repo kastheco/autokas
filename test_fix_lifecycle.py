@@ -323,13 +323,14 @@ class FixLifecycleTests(unittest.TestCase):
         head = self.api.pr["head"]["sha"]
         comment = {"id": 777, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
                    "body": runner.pr_agent_marker(head, 1, [{"severity": "P1"}]),
-                   "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
-                   "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+                   "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
+                   "state": "COMMENTED", "commit_id": head,
+                   "html_url": f"https://github.com/{REPO}/pull/42#pullrequestreview-777"}
         github = runner.github
         def read(path):
             if path.endswith("/permission"):
                 return {"permission": "write"}
-            if path.endswith("/issues/comments/777"):
+            if path.endswith("/pulls/42/reviews/777"):
                 return comment
             return github(path)
         check = {"status": "completed", "conclusion": "failure", "details_url": comment["html_url"],
