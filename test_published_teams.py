@@ -24,6 +24,22 @@ class MergePublishedTest(unittest.TestCase):
                                  {"kas": {"image": NEW, "modal_environment": "main"}})
         self.assertEqual(NEW, merged["prod"]["image"])
 
+    def test_ambiguous_environment_preserves_the_secret_in_either_order(self):
+        secret = {"prod": {"image": OLD, "modal_environment": "main",
+                           "repo_images": {"o/r": APP}, "pull_secret": "private-pull"}}
+        entries = [("kas", {"image": NEW, "modal_environment": "main",
+                            "repo_images": {"o/r": NEW}}),
+                   ("other", {"image": APP, "modal_environment": "main"})]
+        for order in (entries, entries[::-1]):
+            with self.subTest(order=[name for name, _ in order]):
+                self.assertEqual(secret, merge_published(secret, dict(order)))
+
+    def test_name_match_wins_when_environment_is_ambiguous(self):
+        secret = {"kas": {"image": OLD, "modal_environment": "main"}}
+        published = {"other": {"image": APP, "modal_environment": "main"},
+                     "kas": {"image": NEW, "modal_environment": "main"}}
+        self.assertEqual(NEW, merge_published(secret, published)["kas"]["image"])
+
     def test_unpublished_and_extra_teams_are_left_alone(self):
         secret = {"kas": {"image": OLD, "modal_environment": "main", "repo_images": {"o/r": APP}}}
         merged = merge_published(secret, {"untapped": {"image": NEW, "modal_environment": None}})

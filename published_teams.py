@@ -19,15 +19,18 @@ def fetch_published(token: str) -> dict:
 def merge_published(teams: dict, published: dict) -> dict:
     """Take image and repo_images from the published entry; keep every other field from the secret.
 
-    A secret team matches a published team by name, or failing that by its modal environment.
+    A secret team matches by name, or failing that by a unique modal environment match.
     Published teams the secret doesn't define are ignored, so this never adds a team to a deploy.
     """
     merged = {}
     for name, entry in teams.items():
         source = published.get(name)
         if source is None and entry.get("modal_environment"):
-            source = next((team for team in published.values()
-                           if team.get("modal_environment") == entry["modal_environment"]), None)
+            matches = (team for team in published.values()
+                       if team.get("modal_environment") == entry["modal_environment"])
+            source = next(matches, None)
+            if next(matches, None) is not None:
+                source = None
         if source is None:
             merged[name] = entry
             continue
