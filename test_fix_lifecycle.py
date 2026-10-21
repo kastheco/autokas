@@ -153,6 +153,14 @@ class FixLifecycleTests(unittest.TestCase):
         self.assertFalse(runner.pending_fix_jobs(REPO, 42))
         self.assertEqual(self.api.checks, {})
 
+    def test_removed_repository_releases_unrouted_intake_without_github_calls(self):
+        job = runner.event_job("pull_request_review", event("pull_request_review", REVIEW))
+        runner.register_fix_intake(job)
+        with patch.dict(runner.CONFIG, allowed_owners=[]):
+            runner.worker.local(job)
+        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+        self.assertEqual(self.api.requests, [])
+
     def test_failed_label_delete_is_observable_and_reconciled_after_receipt_release(self):
         self.deliver()
         job = self.jobs[-1]

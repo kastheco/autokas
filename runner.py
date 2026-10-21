@@ -2461,6 +2461,10 @@ class LinearOAuthRefresher:
 def worker(job: dict[str, Any]) -> None:
     """Serialize intake and finalization; every failed route releases or reconciles its work."""
     if not allowed_repository(job.get("repo")):
+        receipt = job.get("fix_receipt", "")
+        if receipt.startswith("intake-fix:"):
+            CLAIMS.pop(receipt, None)
+            CLAIMS.pop(job.get("intake_key", job["key"]), None)
         if job.get("linear"):
             linear_intake.authorize_worker(job)
             linear_intake.set_state(job, "error", reason="Repository is not allowed")
