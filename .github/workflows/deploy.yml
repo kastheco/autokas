@@ -3,6 +3,9 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # autokas-teams sends this after it publishes new images, so they roll out without a secret edit.
+  repository_dispatch:
+    types: [team-images-published]
 permissions:
   contents: read
 concurrency:
@@ -31,6 +34,7 @@ jobs:
         env:
           AUTOKAS_CONFIG_JSON: ${{ secrets.AUTOKAS_CONFIG_JSON }}
           AUTOKAS_ALLOWED_OWNERS_JSON: ${{ secrets.AUTOKAS_ALLOWED_OWNERS_JSON }}
+          TEAMS_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
         run: |
           python - <<'PY'
           import json, os, sys
@@ -43,6 +47,17 @@ jobs:
               with open("config.example.json") as f:
                   config = json.load(f)
               config.update({key: private[key] for key in PRIVATE_KEYS if key in private})
+          except Exception:
+              sys.exit("AUTOKAS_CONFIG_JSON is missing, invalid, or still the example config")
+          # Image digests come from autokas-teams, which records them after each publish, so a new
+          # image never needs a secret edit. The secret still wins for every non-image team field.
+          try:
+              from published_teams import fetch_published, merge_published
+              config["teams"] = merge_published(config.get("teams") or {}, fetch_published(os.environ["TEAMS_TOKEN"]))
+          except Exception as error:
+              # Don't print the body: it names private repositories and this log is public.
+              print(f"published team images unavailable ({type(error).__name__}); using the secret's teams")
+          try:
               config["allowed_owners"] = json.loads(os.environ.get("AUTOKAS_ALLOWED_OWNERS_JSON") or "[]")
               url = urlparse(config["docs_update"]["webhook_url"])
               if url.scheme != "https" or not url.hostname or url.hostname.endswith(".invalid"):
