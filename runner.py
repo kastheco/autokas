@@ -2471,7 +2471,7 @@ def dispatch(job: dict[str, Any]) -> None:
     except Exception:
         if job.get("fix_receipt"):
             CLAIMS.pop(job["fix_receipt"], None)
-            CLAIMS.pop(job["key"], None)
+        CLAIMS.pop(job["key"], None)
         raise
     log("dispatched", key=job["key"], call_id=call.object_id)
 
@@ -3291,6 +3291,12 @@ class PRWorker:
                     elif code == 0 and final_head == head and remote_head == head:
                         record["state"] = "completed"
                     CLAIMS.put("command:" + job["key"], record)
+                if labeled:
+                    outcome_missing = not outcome_file.is_file()
+                    reported = "" if outcome_missing else outcome_file.read_text(encoding="utf-8", errors="replace").strip().lower()
+                    if code == 0 and publication_confirmed and reported == "published":
+                        CLAIMS.put(f"fix:{repo}:{number}:{final_head}", {
+                            "branch": branch, "findings": finding_keys(job)}, skip_if_exists=True)
                 if job.get("reviewer") == "pr_agent" and publication_confirmed:
                     try:
                         dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"]))
@@ -3298,11 +3304,6 @@ class PRWorker:
                         log("fix_review_dispatch_uncertain", key=job["key"], head=remote_head,
                             reason=type(error).__name__)
                 if labeled:
-                    outcome_missing = not outcome_file.is_file()
-                    reported = "" if outcome_missing else outcome_file.read_text(encoding="utf-8", errors="replace").strip().lower()
-                    if code == 0 and publication_confirmed and reported == "published":
-                        CLAIMS.put(f"fix:{repo}:{number}:{final_head}", {
-                            "branch": branch, "findings": finding_keys(job)}, skip_if_exists=True)
                     handled = (code == 0 and reported == "already handled" and final_head == head
                                and already_handled_confirmed(job, pr, branch, evidence_file, started_at))
                     state = fix_state(code, publication_confirmed, reported, handled)

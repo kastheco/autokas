@@ -174,6 +174,27 @@ class PRReviewIntakeTests(unittest.TestCase):
             runner.dispatch(runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD, 777))
             self.assertEqual(worker.spawn.call_count, 1)
 
+    def test_failed_followup_spawn_can_be_dispatched_again(self):
+        claims = {}
+
+        def claim(key, value, skip_if_exists=False):
+            if skip_if_exists and key in claims:
+                return False
+            claims[key] = value
+            return True
+
+        store = Mock(put=Mock(side_effect=claim), get=Mock(side_effect=claims.get),
+                     pop=Mock(side_effect=claims.pop))
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD, 777)
+        with patch.object(runner, "CLAIMS", store), patch.object(runner, "worker") as worker:
+            worker.spawn.side_effect = [RuntimeError("spawn rejected"), Mock(object_id="retry")]
+            with self.assertRaisesRegex(RuntimeError, "spawn rejected"):
+                runner.dispatch(job)
+            self.assertNotIn(job["key"], claims)
+            runner.dispatch(job)
+            self.assertEqual(claims[job["key"]], "claimed")
+            self.assertEqual(worker.spawn.call_count, 2)
+
     def test_ineligible_prs_are_not_reviewed(self):
         cases = {
             "generated docs": {"head": {**PR["head"], "ref": runner.CONFIG["docs_update"]["branch_prefix"] + "x"}},
@@ -1437,7 +1458,8 @@ class FixPublicationTests(unittest.TestCase):
         self.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", message], cwd)
 
     def run_fix(self, movement="restack", pr_changes=None, compare_error=None, code=0, prior_outcome=None,
-                write_evidence=True, commit_owner=None, duplicate_evidence=None, dispatch_error=None):
+                write_evidence=True, commit_owner=None, duplicate_evidence=None, dispatch_error=None,
+                receipt_error=None):
         self.dispatched, self.logs, self.labels = [], [], []
         comment = {"body": self.body, "user": {**runner.CONFIG[self.job["reviewer"]], "type": "Bot"},
                    "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
@@ -1445,6 +1467,8 @@ class FixPublicationTests(unittest.TestCase):
         self.launched = False
 
         def claim(key, value, skip_if_exists=False):
+            if key.startswith("fix:") and receipt_error:
+                raise receipt_error
             if skip_if_exists and key in self.claims:
                 return False
             self.claims[key] = copy.deepcopy(value)
@@ -1533,6 +1557,13 @@ class FixPublicationTests(unittest.TestCase):
               patch.object(runner, "set_fix_label", side_effect=lambda repo, pr, state, key: self.labels.append(state)),
               patch.object(runner, "log", side_effect=lambda event, **fields: self.logs.append((event, fields)))):
             runner.PRWorker(pr_key=f"{REPO}#42").run.local(self.job)
+
+    def test_publication_record_failure_does_not_start_followup(self):
+        with self.assertRaisesRegex(RuntimeError, "record unavailable"):
+            self.run_fix("exact", receipt_error=RuntimeError("record unavailable"))
+        self.assertEqual(self.dispatched, [])
+        self.assertNotIn(f"fix:{REPO}:42:{self.fix_head}", self.claims)
+        self.assertEqual(self.git(["show", f"{self.remote_head}:parser.py"], self.origin), "result = 'fixed'")
 
     def test_published_fix_dispatches_review_despite_final_check_failure(self):
         self.job["fix_receipt"] = f"pending-fix:{REPO}:42:{self.job['key']}"
