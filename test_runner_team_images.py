@@ -233,7 +233,9 @@ with patch('modal.is_local', return_value=False), patch('builtins.__import__', s
                 with self.subTest(repo=repo), patch.object(runner, "REPO_WORKERS", overrides), \
                         patch.object(runner, "PRWorker", default), \
                         patch.object(runner, "allowed_repository", return_value=True), \
-                        patch.object(runner.modal, "current_function_call_id", return_value=None):
+                        patch.object(runner.modal, "current_function_call_id", return_value=None), \
+                        patch.object(runner, "CLAIMS") as claims:
+                    claims.get.return_value = None
                     runner.worker.local(job)
                     selected.assert_called_once_with(pr_key=repo.lower() + "#12")
                     selected.return_value.run.spawn.assert_called_once_with(job)
