@@ -313,6 +313,7 @@ class PRReviewRunTests(unittest.TestCase):
                 patch.object(runner, "checkout_pr_diff", self.checkout), \
                 patch.object(runner, "merge_base_patch", return_value=""), \
                 patch.object(runner, "github_request", side_effect=post), \
+                patch.object(runner, "review_fixes_pending", return_value=False), \
                 patch.object(runner, "dispatch", side_effect=self.dispatched.append):
             runner.pr_review.local(job)
         return self.run
@@ -1067,6 +1068,7 @@ class PRReviewStackTests(unittest.TestCase):
             ("github_token", {"return_value": "disposable-token"}),
             ("check_proxy_model", {}),
             ("github", {"side_effect": self.github}),
+            ("review_fixes_pending", {"return_value": False}),
             ("github_request", {"side_effect": self.request}),
             ("dispatch", {"side_effect": self.dispatched.append}),
             ("log", {"side_effect": lambda event, **fields: self.logs.append((event, fields))}),
@@ -1905,6 +1907,7 @@ class ReviewFixBypassTests(unittest.TestCase):
             claims.add(key)
             return True
         with (patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim))),
+              patch.object(runner, "queue_fix_work"),
               patch.object(runner, "worker") as worker, patch.object(runner, "log")):
             worker.spawn.return_value = Mock(object_id="call")
             runner.dispatch(button)

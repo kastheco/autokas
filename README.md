@@ -49,6 +49,8 @@ the review comment is built from PR-Agent's structured output, not its markdown:
 
 each review also runs as an `autokas review` check on the head it reviewed, so it sits next to CI and goes stale on the next push. it fails when the review has findings at or above `pr_review.fix_severity`, the same ones that start a fix, and passes otherwise. its title counts findings by severity and its details link to the review comment. a review that stops early ends as `skipped` (empty diff), `cancelled` (the head moved) or `neutral` (PR-Agent failed). a check API failure logs its HTTP status, never response bodies or tokens, and doesn't stop the review.
 
+finding intake opens an in-progress check on the current head before queuing a fixer. a review can't finish green while `autokas:fixing`, another queued or running fix, or an unresolved actionable CodeRabbit, Cursor or PR-Agent inline thread remains. an unknown thread lookup also keeps it red with “review fixes pending or unresolved”. each fixer releases only its own queue receipt when it publishes or stops; blocked and rejected fixes stay non-green. CodeRabbit's no-new-findings acknowledgment covers only the reviewed commit range, not the whole PR.
+
 the check's **re-run** button reviews the PR's current head, not the old check commit. it needs write or admin access and keeps the PR's counted fix budget. a redelivered request starts no second review. the App needs checks read/write permission and a `check_run` subscription for re-runs and **fix anyway**.
 
 ## fixes
@@ -74,7 +76,7 @@ fix jobs set one label for the latest job's outcome, replacing any earlier one:
 
 | label | meaning |
 | -- | -- |
-| `autokas:fixing` | omp is running |
+| `autokas:fixing` | review fixes are queued or running |
 | `autokas:fixed` | a fix was pushed, or the host verified an earlier outcome against its publishing-job receipt |
 | `autokas:rejected` | the findings didn't warrant a change |
 | `autokas:blocked` | omp failed or got blocked, publication couldn't be confirmed, or the outcome was missing |

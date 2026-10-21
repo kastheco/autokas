@@ -220,6 +220,10 @@ existing Apps must subscribe to the **Check run** webhook event in their GitHub 
 
 GitHub delivers submitted reviews and inline review comments as distinct events. the runner accepts completed reviews, rejects pending or dismissed reviews, and verifies review membership through GitHub IDs rather than prompt similarity. both event paths fetch the same review and canonical finding set before dispatch, so an aggregate prompt and its differently worded inline prompts cannot create separate coding runs. a review without an aggregate prompt uses its inline prompts. a review without inline findings still gets one review-only job. the worker revalidates the complete finding fingerprint before starting omp.
 
+finding intake writes a pending receipt before its GitHub lookup. a lookup or label failure leaves that receipt in place and still queues the worker, so a claimed delivery doesn't lose its worker. the receipt holds the review gate even when GitHub can't accept the intake label or check.
+
+finalization stores the first outcome and retains the receipt and check ID until both the label update and check completion succeed. the worker's final cleanup can retry a failed update without changing a published outcome to blocked. only that job's receipt is excluded from its success gate, so other pending jobs and unresolved findings still prevent success. if final cleanup also fails, the receipt remains available for recovery and continues to hold the gate. there is no automatic recovery loop.
+
 
 ## provider accounts
 
