@@ -59,26 +59,14 @@ class MergeGateTests(unittest.TestCase):
                 self.assertEqual(result["conclusion"], "failure")
                 self.assertIn("pending", result["output"]["title"])
 
-    def test_intake_opens_check_and_label_before_worker_is_queued(self):
-        job = {"repo": REPO, "pr": 42, "key": "source", "prompt": "fix it", "reviewer": "coderabbit"}
-        order = []
-        with patch.dict(runner.CONFIG, allowed_owners=[REPO.split("/")[0]]), \
-                patch.object(runner, "github", return_value=self.pr), \
-                patch.object(runner, "start_review_check", side_effect=lambda *args: order.append("check") or 88), \
-                patch.object(runner, "set_fix_label", side_effect=lambda *args: order.append(args[2])), \
-                patch.object(runner, "worker") as worker:
-            worker.spawn.side_effect = lambda job: order.append("spawn") or Mock(object_id="call")
-            runner.dispatch(job)
-        self.assertEqual(order, ["check", "fixing", "spawn"])
-        self.assertTrue(runner.pending_fix_jobs(REPO, 42))
-        self.assertEqual(self.store.get(job["fix_receipt"])["head"], HEAD)
 
     def test_one_completed_job_does_not_clear_another_queued_job(self):
         jobs = [{"repo": REPO, "pr": 42, "key": str(i),
                  "fix_receipt": f"pending-fix:{REPO}:42:{i}"} for i in range(2)]
         for job in jobs:
             self.store.put(job["fix_receipt"], {"check": 88, "head": HEAD})
-        with patch.object(runner, "set_fix_label") as label, \
+        with patch.object(runner, "github", return_value=self.pr), \
+                patch.object(runner, "set_fix_label") as label, \
                 patch.object(runner, "finish_review_check") as finish:
             runner.finish_fix_work(jobs[0], "fixed")
             self.assertEqual(label.call_args.args[2], "fixing")
@@ -88,50 +76,6 @@ class MergeGateTests(unittest.TestCase):
             self.assertEqual(finish.call_args.args[3], "failure")
         self.assertFalse(runner.pending_fix_jobs(REPO, 42))
 
-    def test_github_intake_failures_still_dispatch_with_a_pending_receipt(self):
-        for failure in ("lookup", "label"):
-            with self.subTest(failure=failure):
-                self.store.values.clear()
-                job = {"repo": REPO, "pr": 42, "key": "source", "prompt": "fix it",
-                       "reviewer": "coderabbit"}
-                with patch.dict(runner.CONFIG, allowed_owners=[REPO.split("/")[0]]), \
-                        patch.object(runner, "github", return_value=self.pr,
-                                     side_effect=RuntimeError("offline") if failure == "lookup" else None), \
-                        patch.object(runner, "start_review_check", return_value=88), \
-                        patch.object(runner, "set_fix_label",
-                                     side_effect=RuntimeError("offline") if failure == "label" else None), \
-                        patch.object(runner, "worker") as worker:
-                    worker.spawn.return_value = Mock(object_id="call")
-                    runner.dispatch(job)
-                worker.spawn.assert_called_once_with(job)
-                self.assertTrue(runner.pending_fix_jobs(REPO, 42))
-                if failure == "label":
-                    self.assertEqual(self.store.get(job["fix_receipt"])["check"], 88)
-
-    def test_failed_finalization_retains_check_and_retries_original_outcome(self):
-        for failure in ("label", "check"):
-            with self.subTest(failure=failure):
-                self.store.values.clear()
-                job = {"repo": REPO, "pr": 42, "key": "source",
-                       "fix_receipt": f"pending-fix:{REPO}:42:source"}
-                self.store.put(job["fix_receipt"], {"head": HEAD, "check": 88})
-                with patch.object(runner, "github", return_value=self.pr), \
-                        patch.object(runner, "unresolved_review_findings", return_value=False), \
-                        patch.object(runner, "set_fix_label") as label, \
-                        patch.object(runner, "github_request") as request:
-                    if failure == "label":
-                        label.side_effect = [RuntimeError("offline"), None]
-                    else:
-                        request.side_effect = [RuntimeError("offline"), {}]
-                    with self.assertRaises(RuntimeError):
-                        runner.finish_fix_work(job, "fixed")
-                    self.assertEqual(self.store.get(job["fix_receipt"])["check"], 88)
-                    self.assertTrue(runner.pending_fix_jobs(REPO, 42))
-                    runner.finish_fix_work(job, "blocked")
-                self.assertFalse(runner.pending_fix_jobs(REPO, 42))
-                self.assertEqual(request.call_args.args[1], f"repos/{REPO}/check-runs/88")
-                self.assertEqual(request.call_args.args[2]["conclusion"], "success")
-                self.assertEqual(label.call_args.args[2], "fixed")
 
     def test_resolved_threads_and_non_actionable_or_human_threads_do_not_hold_gate(self):
         def thread(body, *, resolved=False, login=None, actor="Bot"):

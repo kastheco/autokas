@@ -245,6 +245,7 @@ class PRReviewRunTests(unittest.TestCase):
             ("log", {"side_effect": lambda event, **fields: self.logs.append((event, fields))}),
             ("github_token", {"return_value": "ghs_installation_token"}),
             ("check_proxy_model", {}),
+            ("CLAIMS", {}),
         ):
             patcher = patch.object(runner, target, **kwargs)
             patcher.start()
@@ -1068,6 +1069,7 @@ class PRReviewStackTests(unittest.TestCase):
             ("github_token", {"return_value": "disposable-token"}),
             ("check_proxy_model", {}),
             ("github", {"side_effect": self.github}),
+            ("CLAIMS", {}),
             ("review_fixes_pending", {"return_value": False}),
             ("github_request", {"side_effect": self.request}),
             ("dispatch", {"side_effect": self.dispatched.append}),
@@ -1527,6 +1529,15 @@ class FixPublicationTests(unittest.TestCase):
               patch.object(runner, "log", side_effect=lambda event, **fields: self.logs.append((event, fields)))):
             runner.PRWorker(pr_key=f"{REPO}#42").run.local(self.job)
 
+    def test_published_fix_dispatches_review_despite_final_check_failure(self):
+        self.job["fix_receipt"] = f"pending-fix:{REPO}:42:{self.job['key']}"
+        with patch.object(runner.worker, "remote", side_effect=RuntimeError("check PATCH unavailable")), \
+                patch.object(runner.worker, "spawn", return_value=Mock(object_id="finalization-retry")):
+            self.run_fix("exact")
+        self.assertEqual(len(self.dispatched), 1)
+        self.assertEqual(self.dispatched[0]["head"], self.fix_head)
+        self.assertEqual(self.dispatched[0]["mode"], "pr_review")
+
     def test_explicit_depth_bypass_revalidates_and_publishes_one_fix(self):
         self.body = runner.pr_agent_marker(self.starting_head, 7, runner.pr_agent_findings(
             {"review": {"key_issues_to_review": ISSUES}}))
@@ -1781,7 +1792,7 @@ class ReviewFixBypassTests(unittest.TestCase):
                       "repository": {"full_name": REPO}, "sender": {"login": "kas", "type": "User"},
                       "check_run": self.check}
         self.reads = []
-        self.claims = set()
+        self.claims = {}
         self.queued = []
 
     def checkbox_event(self):
@@ -1794,9 +1805,9 @@ class ReviewFixBypassTests(unittest.TestCase):
 
     def run_checkbox(self, payload):
         def claim(key, value, **kwargs):
-            if key in self.claims:
+            if kwargs.get("skip_if_exists") and key in self.claims:
                 return False
-            self.claims.add(key)
+            self.claims[key] = value
             return True
 
         def update(method, path, data):
@@ -1806,11 +1817,13 @@ class ReviewFixBypassTests(unittest.TestCase):
 
         def spawn(job):
             self.queued.append(job)
+            self.claims[job["key"]] = {"state": "routed"}
             return Mock(object_id="fix")
 
         with (patch.object(runner, "github", side_effect=self.github),
               patch.object(runner, "github_request", side_effect=update),
-              patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim))),
+              patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim),
+                                                 get=Mock(side_effect=self.claims.get))),
               patch.object(runner.worker, "spawn", side_effect=spawn), patch.object(runner, "log")):
             job = runner.event_job("issue_comment", payload)
             if job:
@@ -1900,16 +1913,19 @@ class ReviewFixBypassTests(unittest.TestCase):
         self.assertIn("[P1] Wrong lookup", button["prompt"])
         self.assertNotIn("[P3]", button["prompt"])
         self.assertEqual(button["head"], HEAD)
-        claims = set()
+        claims = {}
         def claim(key, value, **kwargs):
-            if key in claims:
+            if kwargs.get("skip_if_exists") and key in claims:
                 return False
-            claims.add(key)
+            claims[key] = value
             return True
-        with (patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim))),
-              patch.object(runner, "queue_fix_work"),
+        def route(job):
+            claims[job["key"]] = {"state": "routed"}
+            return Mock(object_id="call")
+        with (patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim),
+                                                 get=Mock(side_effect=claims.get))),
               patch.object(runner, "worker") as worker, patch.object(runner, "log")):
-            worker.spawn.return_value = Mock(object_id="call")
+            worker.spawn.side_effect = route
             runner.dispatch(button)
             runner.dispatch(fallback)
         self.assertEqual(worker.spawn.call_count, 1)
@@ -2065,6 +2081,22 @@ class ReviewSettlementTests(unittest.TestCase):
             latest = runner.latest_review_check(REPO, HEAD)
         self.assertEqual(latest["conclusion"], "failure")
         self.assertEqual(self.claims, {f"{REPO}:settle:command:555"})
+
+    def test_pending_fix_checks_do_not_hide_the_originating_review(self):
+        self.checks.append({**self.check, "id": 501, "status": "in_progress", "conclusion": None,
+                            "external_id": f"pending-fix:{REPO}:42:source", "details_url": None})
+        self.deliver()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.writes[0][2]["external_id"], "settled:777")
+
+    def test_pending_fix_checks_do_not_hide_a_settled_review(self):
+        self.deliver()
+        self.checks.append({**self.check, "id": 501, "status": "in_progress", "conclusion": None,
+                            "external_id": f"pending-fix:{REPO}:42:source", "details_url": None})
+        with patch.object(runner, "github", side_effect=self.github):
+            settled = runner.settled_review(REPO, {"head": HEAD, "comment": 777})
+        self.assertIsInstance(settled, dict)
+        self.assertEqual(settled["external_id"], "settled:777")
 
     def test_refuses_invalid_authority_review_pr_and_check_without_writes(self):
         for case in ("read", "none", "author", "identity", "pr", "marker", "stale", "closed", "fork", "base",
