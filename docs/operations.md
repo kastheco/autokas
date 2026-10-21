@@ -222,7 +222,22 @@ GitHub delivers submitted reviews and inline review comments as distinct events.
 
 finding intake writes a pending receipt before its GitHub lookup. a lookup or label failure leaves that receipt in place and still queues the worker, so a claimed delivery doesn't lose its worker. the receipt holds the review gate even when GitHub can't accept the intake label or check.
 
-finalization stores the first outcome and retains the receipt and check ID until both the label update and check completion succeed. the worker's final cleanup can retry a failed update without changing a published outcome to blocked. only that job's receipt is excluded from its success gate, so other pending jobs and unresolved findings still prevent success. if final cleanup also fails, the receipt remains available for recovery and continues to hold the gate. there is no automatic recovery loop.
+finalization stores the first outcome and retains the receipt and check ID until both the label update and check completion succeed. the worker's final cleanup can retry a failed update without changing a published outcome to blocked. only that job's receipt is excluded from its success gate, so other pending jobs and unresolved findings still prevent success. a failed fix only overrides held reviews on its own head. a clean review on a newer head keeps its original result once other work and unresolved findings are clear.
+
+fix receipts carry an `expires_at` deadline of at least 24 hours, or twice `timeout_seconds` when longer. expiry makes abandoned work eligible for operator recovery, not invisible to the gate. there is no automatic recovery loop. this avoids treating a slow or queued worker as dead just because its deadline passed. legacy receipts without a deadline get a full window from their first recovery inspection.
+
+before recovery, confirm in Modal that all coding and intake calls for this PR have stopped and none remain queued. from the configured deployment checkout, set `MODAL_ENVIRONMENT` to the affected team environment and invoke the deployed serialized worker with the affected repository and PR:
+
+```python
+import modal
+import runner
+
+modal.Function.from_name(runner.CONFIG["app"], "worker").remote({
+    "mode": "fix_recover", "repo": "owner/repo", "pr": 42, "key": "operator-recovery",
+})
+```
+
+`fix_recover` finalizes expired intake, pending and finalization receipts. it preserves a saved outcome, otherwise uses `blocked`, completes available checks, and clears `autokas:fixing` only when no other receipts remain. a GitHub failure retains recoverable state and surfaces the error, so repeat this recovery call after the outage. it never replays coding work or an uncertain publication. an orphan fixing label is changed to `autokas:blocked` even if Modal already removed its inactive receipt. malformed receipts need manual inspection. if manual deletion is necessary, clear the matching `intake-fix:`, `pending-fix:` and `finalize-fix:` entries for the abandoned job and complete its check, then run recovery to clear the fixing label. deleting only the receipt or only the label doesn't clear both gate inputs. unresolved findings still hold the gate.
 
 after a confirmed fix push, follow-up review dispatch failures log `fix_review_dispatch_uncertain` with the job key, pushed head and exception class. they don't skip publication recording or fix finalization, so a published fix stays fixed. an uncertain dispatch isn't retried automatically.
 

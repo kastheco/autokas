@@ -203,6 +203,83 @@ class FixLifecycleTests(unittest.TestCase):
         self.assertEqual(self.api.checks[real_failure]["conclusion"], "failure")
         self.assertFalse(runner.pending_fix_jobs(REPO, 42))
 
+    def test_blocked_old_head_restores_clean_current_head(self):
+        self.deliver()
+        job = self.jobs[-1]
+        self.api.pr["head"]["sha"] = "c" * 40
+        check = runner.start_review_check(REPO, "c" * 40, "current-review")
+        runner.finish_review_check(REPO, check, "current-review", "success", "no findings", number=42)
+        self.finalize(job, "blocked")
+        self.assertEqual(self.api.checks[check]["conclusion"], "success")
+        self.assertEqual(self.api.checks[501]["conclusion"], "failure")
+
+    def test_blocked_same_head_keeps_held_review_failed(self):
+        self.deliver()
+        check = runner.start_review_check(REPO, self.api.pr["head"]["sha"], "current-review")
+        runner.finish_review_check(REPO, check, "current-review", "success", "no findings", number=42)
+        self.finalize(self.jobs[-1], "blocked")
+        self.assertEqual(self.api.checks[check]["output"]["title"], "fix blocked")
+
+    def test_expired_work_reconciles_through_serialized_recovery(self):
+        self.deliver()
+        job = self.jobs[-1]
+        record = self.store.get(job["fix_receipt"])
+        record["expires_at"] = 1
+        self.store.put(job["fix_receipt"], record)
+        runner.worker.local({"mode": "fix_recover", "repo": REPO, "pr": 42, "key": "recovery"})
+        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+        self.assertEqual(self.api.pr["labels"], [{"name": "autokas:blocked"}])
+        self.assertEqual(self.api.checks[501]["conclusion"], "failure")
+
+    def test_expired_intake_does_not_clear_another_live_job(self):
+        self.deliver()
+        job = runner.event_job("pull_request_review", event("pull_request_review", REVIEW))
+        job["key"] = "abandoned-intake"
+        runner.register_fix_intake(job)
+        record = self.store.get(job["fix_receipt"])
+        record["expires_at"] = 1
+        self.store.put(job["fix_receipt"], record)
+        runner.worker.local({"mode": "fix_recover", "repo": REPO, "pr": 42, "key": "recovery"})
+        self.assertNotIn(job["fix_receipt"], self.store.values)
+        self.assertTrue(runner.pending_fix_jobs(REPO, 42))
+        self.assertEqual(self.api.pr["labels"], [{"name": "autokas:fixing"}])
+
+    def test_recovery_preserves_first_fixed_outcome_after_patch_failure(self):
+        self.deliver()
+        job = self.jobs[-1]
+        record = self.store.get(job["fix_receipt"])
+        record.update(expires_at=1, state="fixed")
+        self.store.put(job["fix_receipt"], record)
+        self.api.failures[("PATCH", f"repos/{REPO}/check-runs/501")] = RuntimeError("502")
+        recovery = {"mode": "fix_recover", "repo": REPO, "pr": 42, "key": "recovery"}
+        with self.assertRaises(RuntimeError):
+            runner.worker.local(recovery)
+        self.assertTrue(runner.pending_fix_jobs(REPO, 42))
+        runner.worker.local(recovery)
+        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+        self.assertEqual(self.api.pr["labels"], [{"name": "autokas:fixed"}])
+        self.assertEqual(self.api.checks[501]["conclusion"], "success")
+
+    def test_legacy_work_gets_full_window_then_expires_at_boundary(self):
+        self.deliver()
+        job = self.jobs[-1]
+        record = self.store.get(job["fix_receipt"])
+        record.pop("expires_at")
+        self.store.put(job["fix_receipt"], record)
+        recovery = {"mode": "fix_recover", "repo": REPO, "pr": 42, "key": "recovery"}
+        with patch.object(runner.time, "time", return_value=100):
+            runner.worker.local(recovery)
+        self.assertTrue(runner.pending_fix_jobs(REPO, 42))
+        with patch.object(runner.time, "time", return_value=100 + runner.FIX_RECEIPT_TTL):
+            runner.worker.local(recovery)
+        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+        self.assertEqual(self.api.pr["labels"], [{"name": "autokas:blocked"}])
+
+    def test_recovery_clears_orphan_fixing_label_without_receipts(self):
+        self.api.pr["labels"] = [{"name": "autokas:fixing"}]
+        runner.worker.local({"mode": "fix_recover", "repo": REPO, "pr": 42, "key": "recovery"})
+        self.assertEqual(self.api.pr["labels"], [{"name": "autokas:blocked"}])
+
     def test_check_patch_failure_retains_reconciliation_then_retries(self):
         self.deliver()
         job = self.jobs[-1]
@@ -223,7 +300,7 @@ class WebhookIntakeTests(unittest.IsolatedAsyncioTestCase):
             "x-hub-signature-256": "sha256=" + hmac.new(b"test-secret", raw, hashlib.sha256).hexdigest()})
         store = PendingStore()
         claims = Mock()
-        claims.put.side_effect = store.put
+        claims.put.side_effect = AssertionError("blocking write in async webhook")
         claims.put.aio = AsyncMock(side_effect=store.put)
         claims.get.aio = AsyncMock(side_effect=store.get)
         claims.pop.aio = AsyncMock(side_effect=store.pop)
