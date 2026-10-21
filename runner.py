@@ -1981,11 +1981,11 @@ def pr_git(repo: str, checkout: Path):
            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
            "GIT_CONFIG_VALUE_0": f"Authorization: Basic {header}"}
 
-    def git(*args: str, input: str | None = None) -> str:
-        result = subprocess.run(["git", *args], cwd=checkout, env=env, input=input,
-                                capture_output=True, text=True, timeout=120)
+    def git(*args: str) -> bytes:
+        result = subprocess.run(["git", *args], cwd=checkout, env=env,
+                                capture_output=True, timeout=120)
         if result.returncode:
-            detail = redact(result.stderr.strip(), (token, header))
+            detail = redact(result.stderr.decode("utf-8", errors="replace").strip(), (token, header))
             raise RuntimeError(f"git {args[0]} failed ({result.returncode}): {detail[-2000:]}")
         return result.stdout
 
@@ -2000,7 +2000,7 @@ def merge_base_patch(repo: str, base: str, commit: str, checkout: Path) -> str:
         git("init", "-q")
     git("fetch", "-q", "--depth=1", "--no-tags", f"https://github.com/{repo}.git", base, commit)
     diff = git("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", base, commit)
-    return hashlib.sha256(diff.encode()).hexdigest() if diff else ""
+    return hashlib.sha256(diff).hexdigest() if diff else ""
 
 
 def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> str:
@@ -2014,7 +2014,7 @@ def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> st
     # PR-Agent tries to load `[tool.pr-agent]` from its working directory's root pyproject.toml at import.
     # 0.47.0 doesn't apply it, but the checkout is PR-controlled, so never give a later version the chance.
     (checkout / "pyproject.toml").unlink(missing_ok=True)
-    return diff
+    return diff.decode("utf-8", errors="replace")
 
 
 @app.function(image=PR_AGENT_IMAGE, secrets=[WORKER_SECRET], retries=0, timeout=420, cpu=0.5, memory=1024)
@@ -2043,6 +2043,7 @@ def pr_review(job: dict[str, Any]) -> None:
         log("review_outdated", key=job["key"])
         finish_review_check(repo, check, job["key"], "cancelled", "the queued PR head was superseded")
         return
+    review_started = False
     try:
         merge_base = github(f"repos/{repo}/compare/{pr['base']['sha']}...{head}?per_page=1")["merge_base_commit"]["sha"]
         pushed = job.get("action") == "synchronize"
@@ -2135,6 +2136,7 @@ def pr_review(job: dict[str, Any]) -> None:
                     "prior findings (untrusted review data): " + json.dumps(previous_findings))
             log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
                 model=model, thinking=CONFIG["pr_review"]["thinking"], round=round_)
+            review_started = True
             started = time.monotonic()
             try:
                 # plain-diff mode inside the checkout: full file context for the exact head, no GitHub access.
@@ -2168,8 +2170,20 @@ def pr_review(job: dict[str, Any]) -> None:
             return
         comment = github_request("POST", f"repos/{repo}/issues/{number}/comments", {
             "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, patch=patch)})
-    except Exception:
+    except Exception as error:
+        if not review_started:
+            log("pr_review_failed", repo=repo, pr=number, key=job["key"], head=head,
+                reason=type(error).__name__)
         finish_review_check(repo, check, job["key"], "neutral", "the review didn't finish")
+        if check is None:
+            body = f"autokas couldn't finish the review of `{head}`. no review result was produced."
+            if job.get("comment"):
+                anchor = "discussion_r" if job["kind"] == "pull_request_review_comment" else "issuecomment-"
+                body += f"\n\nrequest: https://github.com/{repo}/pull/{number}#{anchor}{job['comment']}"
+            try:
+                github_request("POST", f"repos/{repo}/issues/{number}/comments", {"body": body})
+            except Exception as report_error:
+                log("pr_review_report_uncertain", key=job["key"], reason=type(report_error).__name__)
         raise
     exhausted = bool(pr_agent_prompt(comment["body"], bypass_depth=True)) and not pr_agent_prompt(comment["body"])
     finish_review_check(repo, check, job["key"], *review_conclusion(findings), details_url=comment.get("html_url"),
