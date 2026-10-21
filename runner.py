@@ -858,12 +858,12 @@ def pr_agent_review_state(body: str) -> dict[str, Any] | None:
 
 
 def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, dict[str, Any]], dict[str, Any] | None]:
-    """Read the next counted round, reviewed heads and latest state from bot-authored comments."""
+    """Read the next counted round, reviewed heads and latest state from bot-authored reviews."""
     highest = 0
     reviews: dict[str, dict[str, Any]] = {}
     latest = None
     for page in range(1, 1000):
-        batch = github(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
+        batch = github(f"repos/{repo}/pulls/{number}/reviews?per_page=100&page={page}")
         for comment in batch:
             user = comment.get("user") or {}
             if any(user.get(field) != CONFIG["pr_agent"][field] for field in ("login", "id")):
@@ -881,7 +881,7 @@ def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, dict[str, A
                 highest = round_
         if len(batch) < 100:
             return highest + 1, reviews, latest
-    raise RuntimeError("PR-Agent review history exceeds the comment pagination limit")
+    raise RuntimeError("PR-Agent review history exceeds the review pagination limit")
 
 
 def pr_agent_round(repo: str, number: int) -> int:
@@ -960,7 +960,7 @@ def consume_fix_checkbox(job: dict[str, Any], body: str, status: str) -> None:
     updated = "\n".join(f"**fix anyway:** {status}" if line in
                         (FIX_ANYWAY_UNCHECKED, FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]"))
                         else line for line in body.split("\n"))
-    github_request("PATCH", f"repos/{job['repo']}/issues/comments/{job['comment']}", {"body": updated})
+    github_request("PUT", f"repos/{job['repo']}/pulls/{job['pr']}/reviews/{job['comment']}", {"body": updated})
 
 
 def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
@@ -971,7 +971,7 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
         if access.get("permission") not in {"admin", "write"}:
             log("command_unauthorized", key=job["key"])
             return None
-    comment = github(f"repos/{repo}/issues/comments/{job['comment']}")
+    comment = github(f"repos/{repo}/pulls/{number}/reviews/{job['comment']}")
     pr = github(f"repos/{repo}/pulls/{number}")
     body = comment.get("body") or ""
     state = pr_agent_review_state(body)
@@ -979,13 +979,14 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
                                         (FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]"))):
         return None
     if (reviewer_of(comment.get("user", {})) != "pr_agent"
-            or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
-            or not state or state.get("head") != pr["head"]["sha"]
+            or comment.get("pull_request_url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
+            or comment.get("state", "").lower() != "commented"
+            or not state or state.get("head") != pr["head"]["sha"] or comment.get("commit_id") != state["head"]
             or pr["state"] != "open" or generated_docs_pr(pr) or autokas_ignored(pr)
             or pr["head"]["repo"]["full_name"] != repo or pr["base"]["repo"]["full_name"] != repo):
         log("review_fix_outdated", key=job["key"])
         if (job.get("checkbox") and reviewer_of(comment.get("user", {})) == "pr_agent"
-                and comment.get("issue_url") == f"https://api.github.com/repos/{repo}/issues/{number}"
+                and comment.get("pull_request_url") == f"https://api.github.com/repos/{repo}/pulls/{number}"
                 and state and state.get("head") != pr["head"]["sha"]):
             consume_fix_checkbox(job, body, "stale head, no fixer was queued. request a new review.")
         return None
@@ -1001,10 +1002,10 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
             log("review_fix_invalid_check", key=job["key"])
             return None
     fingerprint = hashlib.sha256(prompt.encode()).hexdigest()
-    fix = {"repo": repo, "pr": number, "comment": job["comment"], "kind": "issue_comment",
+    fix = {"repo": repo, "pr": number, "comment": job["comment"], "kind": "pull_request_review",
            "reviewer": "pr_agent", "head": state["head"], "prompt": prompt,
            "bypass_depth": True, "author": job["author"], "author_id": job.get("author_id"),
-           "key": f"{repo}:issue_comment:{job['comment']}:{fingerprint}"}
+           "key": f"{repo}:pull_request_review:{job['comment']}:{fingerprint}"}
     if job.get("checkbox"):
         fix["checkbox_body"] = body
     return fix
@@ -1022,8 +1023,8 @@ def allowed_repository(repo: Any) -> bool:
 
 def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, delivery: str = "") -> dict[str, Any] | None:
     """Dispatch docs merges separately while preserving review-bot intake. `posted_review` is set only by `pr_review`
-    for the comment it just posted: coding jobs also comment as autokas[bot], so a delivered or reconciled
-    autokas[bot] comment never starts a PR-Agent fix."""
+    for the review it just posted: coding jobs also comment as autokas[bot], so a delivered or reconciled
+    autokas[bot] review or comment never starts a PR-Agent fix."""
     if not allowed_repository(payload.get("repository", {}).get("full_name")):
         return None
     if event == "check_run":
@@ -1047,7 +1048,7 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, 
                     "author": sender["login"],
                     "key": f"{repo}:pr_review:rerequest:{check['id']}:{delivery}"}
         action = re.fullmatch(r"fix:([1-9][0-9]*)", payload.get("requested_action", {}).get("identifier", ""))
-        target = re.fullmatch(rf"https://github.com/{re.escape(repo)}/pull/([1-9][0-9]*)#issuecomment-([1-9][0-9]*)",
+        target = re.fullmatch(rf"https://github.com/{re.escape(repo)}/pull/([1-9][0-9]*)#pullrequestreview-([1-9][0-9]*)",
                               check.get("details_url") or "")
         if (payload.get("action") != "requested_action" or not action or not target
                 or target[2] != action[1] or sender.get("type") != "User" or not sender.get("login")
@@ -1058,24 +1059,25 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, 
                 "key": f"{repo}:review_fix:check:{check['id']}:{sender['login']}"}
     if event == "pull_request":
         return docs_event_job(payload) or review_event_job(payload)
-    if (event == "issue_comment" and payload.get("action") == "edited"
-            and reviewer_of(payload.get("comment", {}).get("user", {})) == "pr_agent"):
-        comment, issue, sender = (payload.get(key, {}) for key in ("comment", "issue", "sender"))
-        repo, number = payload["repository"]["full_name"], issue.get("number")
+    if (event == "pull_request_review" and payload.get("action") == "edited"
+            and reviewer_of(payload.get("review", {}).get("user", {})) == "pr_agent"):
+        comment, pr, sender = (payload.get(key, {}) for key in ("review", "pull_request", "sender"))
+        repo, number = payload["repository"]["full_name"], pr.get("number")
         before = payload.get("changes", {}).get("body", {}).get("from")
         body = comment.get("body") or ""
         state = pr_agent_review_state(body)
         if (reviewer_of(comment.get("user", {})) != "pr_agent" or sender.get("type") != "User"
                 or not sender.get("login") or type(comment.get("id")) is not int
                 or type(number) is not int or number <= 0
-                or issue.get("pull_request", {}).get("url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
-                or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
+                or pr.get("base", {}).get("repo", {}).get("full_name") != repo
+                or comment.get("pull_request_url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
+                or comment.get("state", "").lower() != "commented"
                 or not isinstance(before, str) or FIX_ANYWAY_UNCHECKED not in before.splitlines()
                 or any(line in before.splitlines() for line in (FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]")))
                 or not any(line in body.splitlines() for line in (FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]")))
                 or FIX_ANYWAY_UNCHECKED in body.splitlines() or not state
                 or not isinstance(state.get("head"), str) or not re.fullmatch(r"[0-9a-fA-F]{40}", state["head"])
-                or state != pr_agent_review_state(before)):
+                or comment.get("commit_id") != state["head"] or state != pr_agent_review_state(before)):
             return None
         return {"mode": "review_fix_request", "repo": repo, "pr": number, "comment": comment["id"],
                 "checkbox": True, "author": sender["login"], "author_id": sender.get("id"),
@@ -1094,7 +1096,7 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, 
         return None
     if reviewer == "bugbot" and event != "pull_request_review_comment":
         return None
-    if reviewer == "pr_agent" and (event != "issue_comment" or not posted_review):
+    if reviewer == "pr_agent" and (event != "pull_request_review" or not posted_review):
         return None
     comment = payload.get("review" if event == "pull_request_review" else "comment", {})
     if event == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
@@ -1134,7 +1136,8 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, 
            "reviewer": reviewer, "key": f"{repo}:{event}:{comment['id']}:{fingerprint}"}
     if reviewer == "pr_agent":
         state = pr_agent_review_state(comment.get("body") or "")
-        if not state or not isinstance(state.get("head"), str):
+        if (not state or not isinstance(state.get("head"), str)
+                or comment.get("state", "").lower() != "commented" or comment.get("commit_id") != state["head"]):
             return None
         job["head"] = state["head"]
     return job
@@ -1645,7 +1648,7 @@ def settle_review(job: dict[str, Any]) -> None:
         return
     recover_fix_work(repo, number)
     try:
-        comment = github(f"repos/{repo}/issues/comments/{job['comment']}")
+        comment = github(f"repos/{repo}/pulls/{number}/reviews/{job['comment']}")
     except urllib.error.HTTPError as error:
         if error.code != 404:
             raise
@@ -1654,8 +1657,10 @@ def settle_review(job: dict[str, Any]) -> None:
     pr = github(f"repos/{repo}/pulls/{number}")
     state = pr_agent_review_state(comment.get("body") or "")
     if (reviewer_of(comment.get("user", {})) != "pr_agent"
-            or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
+            or comment.get("pull_request_url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
+            or comment.get("state", "").lower() != "commented"
             or not state or state.get("head") != pr["head"]["sha"] or pr["state"] != "open"
+            or comment.get("commit_id") != state["head"]
             or (pr["head"].get("repo") or {}).get("full_name") != repo
             or (pr["base"].get("repo") or {}).get("full_name") != repo):
         log("review_settle_outdated", key=job["key"])
@@ -1862,12 +1867,20 @@ def review_job(job: dict[str, Any], pr: dict[str, Any]) -> dict[str, Any] | None
     if type(review_id) is not int:
         return None
     review = github(f"repos/{repo}/pulls/{number}/reviews/{review_id}")
-    review_prompt = finding_prompt(reviewer, review.get("body") or "")
+    review_prompt = (pr_agent_prompt(review.get("body") or "", bypass_depth=True)
+                     if job.get("bypass_depth") else finding_prompt(reviewer, review.get("body") or ""))
     if (reviewer_of(review["user"]) != reviewer or review.get("pull_request_url") != expected
             or review.get("state", "").lower() not in {"commented", "approved", "changes_requested"}
             or (job["kind"] == "pull_request_review"
                 and review_prompt != job.get("review_prompt", job["prompt"]))):
         return None
+    if reviewer == "pr_agent":
+        state = pr_agent_review_state(review.get("body") or "")
+        if (not state or state.get("head") != job.get("head") or state["head"] != pr["head"]["sha"]
+                or review.get("commit_id") != state["head"] or review.get("state", "").lower() != "commented"):
+            return None
+        return {**job, "mode": "review", "review_prompt": review_prompt,
+                "finding_url": review["html_url"], "targets": []}
     targets = []
     page = 1
     while True:
@@ -2516,7 +2529,8 @@ def pr_review(job: dict[str, Any]) -> None:
             log("review_outdated", key=job["key"], head=head)
             finish_review_check(repo, check, job["key"], "cancelled", "the PR head moved during the review")
             return
-        comment = github_request("POST", f"repos/{repo}/issues/{number}/comments", {
+        comment = github_request("POST", f"repos/{repo}/pulls/{number}/reviews", {
+            "commit_id": head, "event": "COMMENT",
             "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, patch=patch)})
     except Exception as error:
         if not review_started:
@@ -2537,20 +2551,20 @@ def pr_review(job: dict[str, Any]) -> None:
     finish_review_check(repo, check, job["key"], *review_conclusion(findings), details_url=comment.get("html_url"),
                         fix_comment=comment["id"] if exhausted else None, number=number)
     if exhausted:
-        # the fallback command names this comment, so the note is added once its ID exists.
+        # the fallback command names this review, so the note is added once its ID exists.
         note = depth_note(round_, comment["id"])
         try:
-            comment = {**comment, **github_request("PATCH", f"repos/{repo}/issues/comments/{comment['id']}", {
+            comment = {**comment, **github_request("PUT", f"repos/{repo}/pulls/{number}/reviews/{comment['id']}", {
                 "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, note=note, patch=patch)})}
         except Exception as error:
             log("fix_limit_note_uncertain", key=job["key"], reason=type(error).__name__,
                 status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
-    # automatic intake only: delivered review comments never start a fix without an authorized bypass request.
-    fix = event_job("issue_comment", {
-        "action": "created", "repository": {"full_name": repo}, "sender": comment["user"], "comment": comment,
-        "issue": {**current, "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/{number}"}},
+    # automatic intake only: delivered reviews never start a fix without an authorized bypass request.
+    fix = event_job("pull_request_review", {
+        "action": "submitted", "repository": {"full_name": repo}, "sender": comment["user"], "review": comment,
+        "pull_request": current,
     }, posted_review=True)
     if fix is None:
         log("pr_review_no_fix", key=job["key"], round=round_)
@@ -2693,7 +2707,7 @@ def route_worker(job: dict[str, Any]) -> bool | None:
             log("command_unauthorized", key=job["key"])
             return
     if job.get("mode") == "pr_review":
-        # reviews post one comment from their own small image; they never start a coding container.
+        # reviews post from their own small image; they never start a coding container.
         call = pr_review.spawn(job)
         log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
         return
@@ -3205,6 +3219,12 @@ class PRWorker:
                                 if job.get("bypass_depth") else finding_prompt(reviewer, comment.get("body") or ""))
                             != job.get("review_prompt", job["prompt"])):
                         raise RuntimeError("comment changed or PR relationship is invalid")
+                    if reviewer == "pr_agent":
+                        state = pr_agent_review_state(comment.get("body") or "")
+                        if (not state or state.get("head") != job.get("head")
+                                or comment.get("commit_id") != state["head"]
+                                or comment.get("state", "").lower() != "commented"):
+                            raise RuntimeError("PR-Agent review head or state changed")
                 worktree = root / "repo"
                 if command_resume is not None:
                     worktree.mkdir(exist_ok=True)
