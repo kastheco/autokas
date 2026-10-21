@@ -1,0 +1,16 @@
+name: probe deploy token
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
+        run: |
+          for p in repos/kastheco/autokas-teams/contents/teams.json orgs/kastheco/packages/container/autokas-teams%2Fkasthelife/versions repos/kastheco/autokas/actions/workflows; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/$p")
+            echo "$p -> $code"
+          done
+          curl -sI -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user | grep -i -E '^x-oauth-scopes' || echo "no classic scopes header"
