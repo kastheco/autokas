@@ -171,7 +171,7 @@ class PRReviewIntakeTests(unittest.TestCase):
             job = runner.event_job("pull_request", pr_event("synchronize"))
             runner.dispatch(job)
             runner.dispatch(copy.deepcopy(job))
-            runner.dispatch(runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD))
+            runner.dispatch(runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD, 777))
             self.assertEqual(worker.spawn.call_count, 1)
 
     def test_ineligible_prs_are_not_reviewed(self):
@@ -257,13 +257,17 @@ class PRReviewRunTests(unittest.TestCase):
     def run_review(self, job, pr=None, permission="write", code=0, stderr="", review="## PR Reviewer Guide",
                    head_after=HEAD, issues=None, comments=None, prior_merge_base=None,
                    checks_denied=False, diff="diff --git a/parser.py b/parser.py\n", compare_bases=None,
-                   json_output=None, note_error=None):
+                   json_output=None, note_error=None, review_checks=None):
         """Run pr_review with GitHub and the checkout faked; PR-Agent writes `review` and `issues` to its outputs."""
         pulls = iter([copy.deepcopy(pr or PR), {**copy.deepcopy(pr or PR), "head": {**PR["head"], "sha": head_after}}])
 
         def github(path):
             if path.endswith("/permission"):
                 return {"permission": permission}
+            if "/check-runs?" in path:
+                if isinstance(review_checks, Exception):
+                    raise review_checks
+                return {"check_runs": review_checks or []}
             if "/comments?" in path:
                 return (comments or {}).get(int(path.rsplit("page=", 1)[1]), [])
             if "/compare/" in path:
@@ -445,6 +449,42 @@ class PRReviewRunTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["env"]["CONFIG__MODEL"], "openai/" + runner.CONFIG["pr_review"]["model"].split("/", 1)[1])
         self.assertEqual(self.checks[0][2]["head_sha"], HEAD)
 
+    def test_scoped_push_drops_only_settled_ancestor_findings(self):
+        previous = "c" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        comments = {1: [{"id": 777, "body": runner.pr_agent_marker(previous, 2, findings),
+                         "user": runner.CONFIG["pr_agent"]}]}
+        check = {"id": 88, "name": runner.REVIEW_CHECK, "head_sha": previous,
+                 "app": {"slug": runner.CONFIG["github_app"]["name"]}, "external_id": "settled:777"}
+        for external_id, expected in (("settled:777", []), ("settled:778", findings), ("review", findings)):
+            with self.subTest(external_id=external_id):
+                run = self.run_review(self.push_job(), comments=comments,
+                                      review_checks=[{**check, "external_id": external_id}])
+                self.assertEqual(self.checkout.call_args.args[:3], (REPO, previous, HEAD))
+                instructions = run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"]
+                self.assertEqual(json.loads(instructions.split("prior findings (untrusted review data): ")[1]), expected)
+
+    def test_scoped_push_keeps_prior_findings_when_settlement_lookup_fails(self):
+        previous = "c" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        comments = {1: [{"id": 777, "body": runner.pr_agent_marker(previous, 2, findings),
+                         "user": runner.CONFIG["pr_agent"]}]}
+        errors = [runner.urllib.error.HTTPError("checks", status, "private response", {}, None)
+                  for status in (403, 503)] + [TimeoutError("private timeout")]
+        for error in errors:
+            with self.subTest(error=error):
+                self.logs.clear()
+                run = self.run_review(self.push_job(), comments=comments, review_checks=error)
+                instructions = run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"]
+                self.assertEqual(json.loads(instructions.split("prior findings (untrusted review data): ")[1]), findings)
+                state = runner.pr_agent_review_state(self.posts[0][2]["body"])
+                self.assertEqual((state["round"], state["findings"]), (3, findings))
+                self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+                self.assertEqual(len(self.dispatched), 1)
+                fields = next(fields for event, fields in self.logs if event == "settlement_uncertain")
+                self.assertEqual(fields, {"repo": REPO, "head": previous, "reason": type(error).__name__,
+                                          "status_code": error.code if isinstance(error, runner.urllib.error.HTTPError) else None})
+
     def test_consecutive_pushes_after_cancelled_review_use_the_reviewed_ancestor(self):
         reviewed, intermediate = "d" * 40, "c" * 40
         findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
@@ -510,7 +550,7 @@ class PRReviewRunTests(unittest.TestCase):
         state = runner.pr_agent_review_state(body)
         self.assertEqual((state["round"], state["restack"]), (2, True))
         self.assertIn("fix round 3", self.dispatched[0]["prompt"])
-        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40)["round"], 4)
+        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40, 777)["round"], 4)
         comments[1].append({"body": body, "user": runner.CONFIG["pr_agent"]})
         self.run_review(self.command_job(), comments=comments)
         self.assertEqual(runner.pr_agent_review_state(self.posts[0][2]["body"])["round"], 3)
@@ -529,7 +569,7 @@ class PRReviewRunTests(unittest.TestCase):
         state = runner.pr_agent_review_state(body)
         self.assertEqual((state["round"], state["restack"]), (0, True))
         self.assertIn("fix round 1", self.dispatched[0]["prompt"])
-        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40)["round"], 2)
+        self.assertEqual(runner.next_review_job(REPO, 42, body, "d" * 40, 777)["round"], 2)
 
     def test_restack_markers_do_not_count_even_with_a_higher_stored_round(self):
         comments = [{"body": runner.pr_agent_marker(HEAD, 2, []), "user": runner.CONFIG["pr_agent"]},
@@ -546,17 +586,29 @@ class PRReviewRunTests(unittest.TestCase):
     def test_fix_review_limits_diff_to_the_previous_review(self):
         previous = "c" * 40
         findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
-        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker(previous, 1, findings), HEAD)
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker(previous, 1, findings), HEAD, 777)
         self.run_review(job)
         self.assertEqual(self.checkout.call_args.args[:3], (REPO, previous, HEAD))
 
+    def test_fix_follow_up_drops_only_its_settled_source_findings(self):
+        previous = "c" * 40
+        findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker(previous, 1, findings), HEAD, 777)
+        check = {"id": 87, "name": runner.REVIEW_CHECK, "head_sha": previous,
+                 "app": {"slug": runner.CONFIG["github_app"]["name"]}}
+        for external_id, expected in (("settled:777", []), ("settled:778", findings), ("review", findings)):
+            with self.subTest(external_id=external_id):
+                run = self.run_review(job, review_checks=[{**check, "external_id": external_id}])
+                instructions = run.call_args.kwargs["env"]["PR_REVIEWER__EXTRA_INSTRUCTIONS"]
+                self.assertEqual(json.loads(instructions.split("prior findings (untrusted review data): ")[1]), expected)
+
     def test_force_pushed_fix_review_falls_back_to_the_pr_merge_base(self):
-        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD)
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD, 777)
         self.run_review(job, prior_merge_base="d" * 40)
         self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
 
     def test_unavailable_previous_head_falls_back_but_other_compare_errors_fail(self):
-        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD)
+        job = runner.next_review_job(REPO, 42, runner.pr_agent_marker("c" * 40, 1, []), HEAD, 777)
         missing = runner.urllib.error.HTTPError("compare", 404, "not found", {}, None)
         self.run_review(job, prior_merge_base=missing)
         self.assertEqual(self.checkout.call_args.args[:3], (REPO, MERGE_BASE, HEAD))
@@ -711,7 +763,7 @@ class PRReviewRunTests(unittest.TestCase):
         rounds = runner.CONFIG["pr_review"]["max_fix_rounds"]
         body = runner.pr_agent_marker(HEAD, 1, runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}}))
         for round_ in range(1, rounds + 2):
-            job = runner.next_review_job(REPO, 42, body, "f" * 40)
+            job = runner.next_review_job(REPO, 42, body, "f" * 40, 777)
             self.assertEqual((job["kind"], job["head"], job["round"]), ("fix", "f" * 40, round_ + 1))
             self.assertEqual(job["key"], f"{REPO}:pr_review:42:{'f' * 40}")
             body = runner.pr_agent_marker("f" * 40, job["round"], runner.pr_agent_findings(
@@ -1043,6 +1095,8 @@ class PRReviewStackTests(unittest.TestCase):
     def github(self, path):
         if path.endswith("/permission"):
             return {"permission": "write"}
+        if "/check-runs?" in path:
+            return {"check_runs": getattr(self, "review_checks", [])}
         if "/comments?" in path:
             return copy.deepcopy(self.comments) if path.endswith("page=1") else []
         if "/compare/" in path:
@@ -1175,6 +1229,148 @@ class PRReviewStackTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.assertIn("@@ -9,7 +9,7 @@", self.calls[-1]["diff"])
         self.assertNotIn("pr_review_skipped", [event for event, _ in self.logs])
+
+    def test_unchanged_patch_fails_when_settlement_is_unknown_after_threshold_change(self):
+        self.review()
+        old_head = self.git(["rev-parse", "pr2"])
+        self.git(["commit", "--amend", "-m", "equivalent head"])
+        self.publish()
+        github = self.github
+
+        def unavailable_checks(path):
+            if "/check-runs?" in path:
+                raise TimeoutError("private timeout")
+            return github(path)
+
+        with patch.dict(runner.CONFIG["pr_review"], fix_severity=None):
+            with patch.object(runner, "github", side_effect=unavailable_checks):
+                self.review(previous=old_head)
+            self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+            self.assertEqual(self.checks[-1][2]["details_url"], self.comments[0]["html_url"])
+            self.assertIn("settlement_uncertain", [event for event, _ in self.logs])
+            self.review(previous=old_head)
+            self.assertEqual(self.checks[-1][2]["conclusion"], "success")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.comments), 1)
+
+    def test_settled_unchanged_patch_keeps_merge_gate_until_a_real_review(self):
+        self.review()
+        first = self.comments[0]
+        state = runner.pr_agent_review_state(first["body"])
+        title = "adjudicated false positive by @kas · 1 P1, fix threshold P2"
+        self.review_checks = [{"id": 89, "name": runner.REVIEW_CHECK, "head_sha": state["head"],
+                               "app": {"slug": runner.CONFIG["github_app"]["name"]},
+                               "external_id": f"settled:{first['id']}", "output": {"title": title}}]
+        old_head = self.git(["rev-parse", "pr2"])
+        self.git(["checkout", "main"])
+        self.git(["merge", "--squash", "pr1"])
+        self.git(["commit", "-m", "squash parent"])
+        self.git(["rebase", "--onto", "main", "pr1", "pr2"])
+        self.publish()
+        self.pr["base"]["ref"] = "main"
+        self.review(previous=old_head)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+        self.assertEqual(self.checks[-1][2]["output"]["title"], title)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.comments), 1)
+        restacked = self.git(["rev-parse", "pr2"])
+        self.commit("parser.py", "result = 'broken'\nnew_line = True\n")
+        self.publish()
+        self.review(previous=restacked)
+        self.assertIn("prior findings (untrusted review data): []", self.calls[-1]["instructions"])
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+        self.assertEqual(len(self.comments), 2)
+
+    def test_return_to_settled_head_preserves_settlement_on_the_next_push(self):
+        self.review()
+        first = self.comments[0]
+        original = self.git(["rev-parse", "pr2"])
+        title = "adjudicated false positive by @kas · 1 P1, fix threshold P2"
+        settlement = {"id": 89, "name": runner.REVIEW_CHECK, "head_sha": original,
+                      "app": {"slug": runner.CONFIG["github_app"]["name"]},
+                      "external_id": f"settled:{first['id']}", "output": {"title": title}}
+        self.review_checks = [settlement]
+        self.git(["commit", "--amend", "-m", "equivalent head"])
+        equivalent = self.git(["rev-parse", "pr2"])
+        self.publish()
+        self.review(previous=original)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+        self.git(["checkout", "-B", "pr2", original])
+        self.publish()
+        request = self.request
+
+        def record_check(method, path, payload):
+            result = request(method, path, payload)
+            if method == "POST" and path.endswith("/check-runs"):
+                result = {"id": 90}
+                self.review_checks.append({**settlement, **payload, **result, "output": {}})
+            elif method == "PATCH" and "/check-runs/" in path:
+                check_id = int(path.rsplit("/", 1)[1])
+                next(check for check in self.review_checks if check["id"] == check_id).update(payload)
+            return result
+
+        with patch.object(runner, "github_request", side_effect=record_check):
+            self.review(previous=equivalent)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+        self.assertEqual(self.checks[-1][2]["output"]["title"], title)
+        self.assertEqual(self.checks[-1][2]["details_url"], first["html_url"])
+        self.git(["checkout", "-B", "pr2", equivalent])
+        self.publish()
+        self.review(previous=original)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+        self.assertEqual(self.checks[-1][2]["output"]["title"], title)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.comments), 1)
+
+    def test_return_to_settled_head_recovers_after_lookup_failure(self):
+        self.review()
+        first = self.comments[0]
+        original = self.git(["rev-parse", "pr2"])
+        title = "adjudicated false positive by @kas · 1 P1, fix threshold P2"
+        settlement = {"id": 89, "name": runner.REVIEW_CHECK, "head_sha": original,
+                      "app": {"slug": runner.CONFIG["github_app"]["name"]},
+                      "external_id": f"settled:{first['id']}", "output": {"title": title}}
+        self.review_checks = [settlement]
+        self.git(["commit", "--amend", "-m", "equivalent head"])
+        equivalent = self.git(["rev-parse", "pr2"])
+        self.publish()
+        self.review(previous=original)
+        self.git(["checkout", "-B", "pr2", original])
+        self.publish()
+        request, github = self.request, self.github
+
+        def record_check(method, path, payload):
+            result = request(method, path, payload)
+            if method == "POST" and path.endswith("/check-runs"):
+                result = {"id": 90}
+                self.review_checks.append({**settlement, **payload, **result, "output": {}})
+            elif method == "PATCH" and "/check-runs/" in path:
+                check_id = int(path.rsplit("/", 1)[1])
+                next(check for check in self.review_checks if check["id"] == check_id).update(payload)
+            return result
+
+        def unavailable_checks(path):
+            if "/check-runs?" in path:
+                raise TimeoutError("private timeout")
+            return github(path)
+
+        with (patch.object(runner, "github_request", side_effect=record_check),
+              patch.object(runner, "github", side_effect=unavailable_checks)):
+            self.review(previous=equivalent)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+        state = {"head": original, "comment": first["id"]}
+        self.assertEqual(runner.settled_review(REPO, state), settlement)
+        self.git(["checkout", "-B", "pr2", equivalent])
+        self.publish()
+        with patch.dict(runner.CONFIG["pr_review"], fix_severity=None):
+            self.review(previous=original)
+        self.assertEqual(self.checks[-1][2]["conclusion"], "failure")
+        self.assertEqual(self.checks[-1][2]["output"]["title"], title)
+        self.assertEqual(len(self.calls), 1)
+        self.commit("parser.py", "result = 'broken'\nnew_line = True\n")
+        self.publish()
+        self.review(previous=equivalent)
+        self.assertIn("prior findings (untrusted review data): []", self.calls[-1]["instructions"])
 
     def test_restack_with_an_unchanged_diff_skips_review_but_kas_review_still_runs(self):
         self.skipped_restack()
@@ -1783,6 +1979,170 @@ class ReviewFixBypassTests(unittest.TestCase):
             self.assertIsNone(self.resolve())
         self.comment["body"] = runner.pr_agent_marker(HEAD, 7, [{"severity": "P3"}])
         self.assertIsNone(self.resolve())
+
+
+class ReviewSettlementTests(unittest.TestCase):
+    def setUp(self):
+        self.pr = copy.deepcopy(PR)
+        self.findings = runner.pr_agent_findings({"review": {"key_issues_to_review": ISSUES}})
+        self.comment = {"id": 777, "user": {**runner.CONFIG["pr_agent"], "type": "Bot"},
+                        "body": runner.pr_agent_marker(HEAD, 2, self.findings),
+                        "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
+                        "html_url": f"https://github.com/{REPO}/pull/42#issuecomment-777"}
+        self.check = {"id": 88, "name": runner.REVIEW_CHECK, "head_sha": HEAD,
+                      "app": {"slug": runner.CONFIG["github_app"]["name"]},
+                      "status": "completed", "conclusion": "failure",
+                      "details_url": self.comment["html_url"],
+                      "html_url": f"https://github.com/{REPO}/actions/runs/88"}
+        self.checks = [self.check]
+        self.permission = "write"
+        self.writes, self.claims = [], set()
+
+    def github(self, path):
+        if path.endswith("/permission"):
+            return {"permission": self.permission}
+        if "/check-runs?" in path:
+            return {"check_runs": self.checks}
+        if path.endswith("/issues/comments/777"):
+            if self.comment is None:
+                raise runner.urllib.error.HTTPError(path, 404, "missing", {}, None)
+            return self.comment
+        if path.endswith("/pulls/42"):
+            return self.pr
+        raise AssertionError(path)
+
+    def deliver(self, body="!kas settle review 777 timestamp is valid", **kwargs):
+        def claim(key, value, **options):
+            if key in self.claims:
+                return False
+            self.claims.add(key)
+            return True
+
+        def create(method, path, data):
+            self.writes.append((method, path, copy.deepcopy(data)))
+            check = {**data, "id": 89, "app": self.check["app"], "html_url": "https://example/check/89"}
+            self.checks.append(check)
+            return check
+
+        def spawn(job):
+            runner.worker.local(job)
+            return Mock(object_id="local-settlement")
+
+        with (patch.object(runner, "github", side_effect=self.github),
+              patch.object(runner, "github_request", side_effect=create),
+              patch.object(runner, "CLAIMS", Mock(put=Mock(side_effect=claim))),
+              patch.object(runner.worker, "spawn", side_effect=spawn),
+              patch.object(runner, "PRWorker") as coding, patch.object(runner, "pr_review") as review,
+              patch.object(runner, "log")):
+            job = runner.event_job(*comment_event(body, **kwargs))
+            if job:
+                runner.dispatch(job)
+            coding.assert_not_called()
+            review.spawn.assert_not_called()
+        return job
+
+    def test_human_writer_settlement_preserves_review_and_failure_and_claims_once(self):
+        original_comment, original_check = copy.deepcopy(self.comment), copy.deepcopy(self.check)
+        for event in ("issue_comment", "pull_request_review_comment"):
+            self.deliver(event=event)
+        self.assertEqual(len(self.writes), 1)
+        method, path, data = self.writes[0]
+        self.assertEqual((method, path), ("POST", f"repos/{REPO}/check-runs"))
+        self.assertEqual((data["head_sha"], data["conclusion"], data["status"], data["external_id"]),
+                         (HEAD, "failure", "completed", "settled:777"))
+        self.assertEqual(data["details_url"], f"https://github.com/{REPO}/pull/42#issuecomment-555")
+        self.assertEqual(data["name"], "autokas review")
+        self.assertEqual(data["output"]["title"],
+                         "adjudicated false positive by @kas · " + runner.review_conclusion(self.findings)[1])
+        for text in (self.comment["html_url"], self.check["html_url"], data["details_url"], "> timestamp is valid"):
+            self.assertIn(text, data["output"]["summary"])
+        self.assertEqual(self.comment, original_comment)
+        self.assertEqual(self.check, original_check)
+        with patch.object(runner, "github", side_effect=self.github):
+            latest = runner.latest_review_check(REPO, HEAD)
+        self.assertEqual(latest["conclusion"], "failure")
+        self.assertEqual(self.claims, {f"{REPO}:settle:command:555"})
+
+    def test_refuses_invalid_authority_review_pr_and_check_without_writes(self):
+        for case in ("read", "none", "author", "identity", "pr", "marker", "stale", "closed", "fork", "base",
+                     "missing", "success", "running", "link", "app", "check_head", "newer"):
+            with self.subTest(case=case):
+                self.setUp()
+                if case in {"read", "none"}:
+                    self.permission = case
+                elif case == "author":
+                    self.comment["user"]["login"] = "other[bot]"
+                elif case == "identity":
+                    self.comment["user"]["id"] = 1
+                elif case == "pr":
+                    self.comment["issue_url"] += "9"
+                elif case == "marker":
+                    self.comment["body"] = "no marker"
+                elif case == "stale":
+                    self.pr["head"]["sha"] = "c" * 40
+                elif case == "closed":
+                    self.pr["state"] = "closed"
+                elif case in {"fork", "base"}:
+                    self.pr["head" if case == "fork" else "base"]["repo"]["full_name"] = "outsider/repo"
+                elif case == "missing":
+                    self.comment = None
+                elif case == "success":
+                    self.check["conclusion"] = "success"
+                elif case == "running":
+                    self.check["status"] = "in_progress"
+                elif case == "link":
+                    self.check["details_url"] += "9"
+                elif case == "app":
+                    self.check["app"]["slug"] = "other"
+                elif case == "check_head":
+                    self.check["head_sha"] = "c" * 40
+                elif case == "newer":
+                    self.checks.insert(0, {**self.check, "id": 99, "conclusion": "success"})
+                self.deliver()
+                self.assertEqual(self.writes, [])
+
+    def test_malformed_settlement_never_becomes_a_coding_job(self):
+        for text in ("settle", "settle review", "settle review 777", "settle review 777   ",
+                     "settle review nope reason", "settle review -1 reason", "settle review 0 reason",
+                     "settle review 1.0 reason", "settle review: 777 reason", "settle-review 777 reason",
+                     "settle_review 777 reason", "SeTtLe_ReViEw 777 reason", "settle__review 777 reason"):
+            for prefix in ("!kas", "@AUTOKAS"):
+                for event in ("issue_comment", "pull_request_review_comment"):
+                    with self.subTest(text=text, prefix=prefix, event=event):
+                        body = f"{prefix} {text}"
+                        self.assertIsNone(runner.event_job(*comment_event(body, event=event)))
+                        self.assertIsNone(self.deliver(body, event=event))
+        self.assertEqual(self.writes, [])
+        for event in ("issue_comment", "pull_request_review_comment"):
+            self.assertIsNone(runner.event_job(*trusted_comment("!kas settle review 777 reason", event=event)))
+        self.assertIsNone(self.deliver(on_issue=True))
+
+    def test_alias_case_and_admin_authority(self):
+        self.permission = "admin"
+        self.deliver("@AUTOKAS SeTtLe ReViEw 777 adjudicated\nwith evidence")
+        self.assertIn("> adjudicated\n> with evidence", self.writes[0][2]["output"]["summary"])
+
+    def test_settlement_title_keeps_threshold_when_fixes_were_disabled_since_review(self):
+        with patch.dict(runner.CONFIG["pr_review"], fix_severity=None):
+            self.deliver()
+        self.assertEqual(self.writes[0][2]["conclusion"], "failure")
+        self.assertEqual(self.writes[0][2]["output"]["title"],
+                         "adjudicated false positive by @kas · 1 P1, 1 P3, fix threshold None")
+
+    def test_settlement_applies_only_until_a_new_same_app_review(self):
+        self.deliver()
+        state = {"head": HEAD, "comment": 777}
+        with patch.object(runner, "github", side_effect=self.github):
+            self.assertEqual(runner.settled_review(REPO, state)["external_id"], "settled:777")
+            self.assertIs(runner.settled_review(REPO, {**state, "comment": 778}), False)
+            self.checks.append({**self.check, "id": 90, "app": {"slug": "other-app"}})
+            self.assertIsNotNone(runner.settled_review(REPO, state))
+            self.checks.extend({**self.check, "id": check_id, "external_id": "settlement-unknown:777"}
+                               for check_id in (91, 92))
+            self.assertEqual(runner.settled_review(REPO, state)["external_id"], "settled:777")
+            self.checks.append({**self.check, "id": 93})
+            self.checks.append({**self.check, "id": 94, "external_id": "settlement-unknown:777"})
+            self.assertIs(runner.settled_review(REPO, state), False)
 
 
 if __name__ == "__main__":

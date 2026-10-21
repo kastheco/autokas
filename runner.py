@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import modal
 import linear_intake
@@ -557,6 +557,14 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     target_kind = "issue" if event == "issue_comment" and "pull_request" not in target else "pr"
     review = REVIEW_COMMAND.match(instruction) if target_kind == "pr" else None
     fix_review = re.fullmatch(r"fix review ([1-9][0-9]*)", instruction, re.IGNORECASE) if target_kind == "pr" else None
+    if re.match(r"settle(?:\b|_)", instruction, re.IGNORECASE):
+        settle = re.fullmatch(r"settle\s+review\s+([1-9][0-9]*)\s+(\S[\s\S]*)", instruction, re.IGNORECASE)
+        if target_kind != "pr" or author.get("type") != "User" or not settle:
+            return None
+        return {"mode": "review_settle", "repo": repo, "pr": target["number"],
+                "comment": int(settle[1]), "reason": settle[2], "author": author["login"],
+                "author_type": author["type"], "source_url": comment["html_url"],
+                "key": f"{repo}:settle:command:{comment['id']}"}
     if author.get("type") != "User" and not (
             author.get("type") == "Bot" and (review or fix_review) and trusted_reviewer(author)):
         return None
@@ -849,10 +857,10 @@ def pr_agent_review_state(body: str) -> dict[str, Any] | None:
     return state if isinstance(state, dict) and isinstance(state.get("findings"), list) else None
 
 
-def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, list[dict[str, Any]]], dict[str, Any] | None]:
+def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, dict[str, Any]], dict[str, Any] | None]:
     """Read the next counted round, reviewed heads and latest state from bot-authored comments."""
     highest = 0
-    reviews: dict[str, list[dict[str, Any]]] = {}
+    reviews: dict[str, dict[str, Any]] = {}
     latest = None
     for page in range(1, 1000):
         batch = github(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
@@ -866,8 +874,8 @@ def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, list[dict[s
             head = state.get("head")
             if isinstance(head, str) and re.fullmatch(r"[0-9a-fA-F]{40}", head):
                 reviews.pop(head, None)
-                reviews[head] = state["findings"]
-                latest = {**state, "html_url": comment.get("html_url")}
+                latest = {**state, "comment": comment.get("id"), "html_url": comment.get("html_url")}
+                reviews[head] = latest
             round_ = state.get("round")
             if not state.get("restack") and type(round_) is int and round_ > highest:
                 highest = round_
@@ -1245,13 +1253,16 @@ def start_review_check(repo: str, head: str, key: str) -> int | None:
 
 
 def finish_review_check(repo: str, check: int | None, key: str, conclusion: str, title: str,
-                        details_url: str | None = None, fix_comment: int | None = None) -> None:
+                        details_url: str | None = None, fix_comment: int | None = None,
+                        *, external_id: str | None = None) -> None:
     if check is None:
         return
     payload: dict[str, Any] = {"status": "completed", "conclusion": conclusion,
                                "output": {"title": title, "summary": title}}
     if details_url:
         payload["details_url"] = details_url
+    if external_id is not None:
+        payload["external_id"] = external_id
     if fix_comment is not None:
         payload["actions"] = [{"label": "fix anyway", "description": "Run one fixer beyond the depth limit",
                                "identifier": f"fix:{fix_comment}"}]
@@ -1260,6 +1271,86 @@ def finish_review_check(repo: str, check: int | None, key: str, conclusion: str,
     except Exception as error:
         log("check_uncertain", key=key, reason=type(error).__name__,
             status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
+
+def latest_review_check(repo: str, head: str, *, exclude_check: int | None = None,
+                        ignore_unknown_settlement: bool = False) -> dict[str, Any] | None:
+    """Select the newest review run from this app, not another app's same-name check."""
+    latest = None
+    for page in range(1, 1000):
+        batch = github(f"repos/{repo}/commits/{head}/check-runs?check_name=autokas%20review&filter=all&per_page=100&page={page}")["check_runs"]
+        for check in batch:
+            if (check.get("name") == REVIEW_CHECK
+                    and check.get("app", {}).get("slug") == CONFIG["github_app"]["name"]
+                    and check.get("head_sha") == head
+                    and check["id"] != exclude_check
+                    and not (ignore_unknown_settlement
+                             and (check.get("external_id") or "").startswith("settlement-unknown:"))
+                    and (latest is None or check["id"] > latest["id"])):
+                latest = check
+        if len(batch) < 100:
+            return latest
+    raise RuntimeError("review checks exceed the pagination limit")
+
+
+def settled_review(repo: str, state: dict[str, Any], *, exclude_check: int | None = None) -> dict[str, Any] | Literal[False] | None:
+    """Return the settlement, False for confirmed absence, or None when the lookup fails."""
+    if state.get("comment") is None:
+        return False
+    try:
+        check = latest_review_check(repo, state["head"], exclude_check=exclude_check,
+                                    ignore_unknown_settlement=True)
+    except Exception as error:
+        log("settlement_uncertain", repo=repo, head=state["head"], reason=type(error).__name__,
+            status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
+        return None
+    return check if check and check.get("external_id") == f"settled:{state['comment']}" else False
+
+
+def settle_review(job: dict[str, Any]) -> None:
+    """Record human adjudication without rewriting the reviewer or starting a fixer."""
+    repo, number = job["repo"], job["pr"]
+    if job.get("author_type") != "User" or not job.get("reason", "").strip():
+        log("review_settle_unauthorized", key=job["key"])
+        return
+    access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
+    if access.get("permission") not in {"admin", "write"}:
+        log("command_unauthorized", key=job["key"])
+        return
+    try:
+        comment = github(f"repos/{repo}/issues/comments/{job['comment']}")
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        log("review_settle_missing", key=job["key"])
+        return
+    pr = github(f"repos/{repo}/pulls/{number}")
+    state = pr_agent_review_state(comment.get("body") or "")
+    if (reviewer_of(comment.get("user", {})) != "pr_agent"
+            or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
+            or not state or state.get("head") != pr["head"]["sha"] or pr["state"] != "open"
+            or (pr["head"].get("repo") or {}).get("full_name") != repo
+            or (pr["base"].get("repo") or {}).get("full_name") != repo):
+        log("review_settle_outdated", key=job["key"])
+        return
+    check = latest_review_check(repo, state["head"])
+    if (not check or check.get("status") != "completed" or check.get("conclusion") != "failure"
+            or check.get("details_url") != comment.get("html_url")):
+        log("review_settle_invalid_check", key=job["key"])
+        return
+    conclusion, counts = review_conclusion(state["findings"])
+    if conclusion != "failure":
+        counts += f", fix threshold {CONFIG['pr_review'].get('fix_severity')}"
+    title = f"adjudicated false positive by @{job['author']} · {counts}"
+    reason = "\n".join("> " + line for line in job["reason"].splitlines())
+    summary = (f"[review]({comment['html_url']}) adjudicated false positive by @{job['author']}.\n\n"
+               f"[original failed run]({check['html_url']}) · [settlement command]({job['source_url']})\n\n{reason}")
+    # Neutral passes required checks. adjudication must not clear the merge gate.
+    github_request("POST", f"repos/{repo}/check-runs", {
+        "name": REVIEW_CHECK, "head_sha": state["head"], "status": "completed", "conclusion": "failure",
+        "external_id": f"settled:{job['comment']}", "details_url": job["source_url"],
+        "output": {"title": title, "summary": summary}})
+    log("review_settled", key=job["key"], head=state["head"], comment=job["comment"])
+
 
 
 def review_conclusion(findings: list[dict[str, Any]]) -> tuple[str, str]:
@@ -1961,10 +2052,18 @@ def pr_review(job: dict[str, Any]) -> None:
             checkout, diff_file = Path(home, "repo"), Path(home, "pr.diff")
             patch = merge_base_patch(repo, merge_base, head, checkout)
             if pushed and latest and latest.get("patch") and patch == latest["patch"]:
+                settlement = settled_review(repo, latest, exclude_check=check)
                 conclusion, counts = review_conclusion(latest["findings"])
-                finish_review_check(repo, check, job["key"], conclusion,
-                                    f"diff unchanged since {latest['head'][:7]}, review skipped · {counts}",
-                                    details_url=latest.get("html_url"))
+                title = f"diff unchanged since {latest['head'][:7]}, review skipped · {counts}"
+                if settlement:
+                    conclusion, title = "failure", settlement["output"]["title"]
+                elif settlement is None:
+                    conclusion = "failure"
+                    title = f"settlement status unknown, prior failure retained · {counts}"
+                finish_review_check(repo, check, job["key"], conclusion, title,
+                                    details_url=latest.get("html_url"),
+                                    external_id=(settlement["external_id"] if settlement else
+                                                 f"settlement-unknown:{latest['comment']}" if settlement is None else None))
                 log("pr_review_skipped", repo=repo, pr=number, key=job["key"], head=head,
                     reviewed_head=latest["head"], round=latest.get("round"))
                 return
@@ -1989,7 +2088,7 @@ def pr_review(job: dict[str, Any]) -> None:
             if pushed and not restack:
                 # the event's before head may never have completed a review. cover every push
                 # since the latest reviewed ancestor and keep that review's unresolved findings.
-                for reviewed_head, findings in reversed(reviews.items()):
+                for reviewed_head, review_state in reversed(reviews.items()):
                     if reviewed_head == job.get("previous_head"):
                         ancestor = previous_is_ancestor
                     else:
@@ -2001,14 +2100,16 @@ def pr_review(job: dict[str, Any]) -> None:
                             continue
                         ancestor = compared["merge_base_commit"]["sha"] == reviewed_head
                     if ancestor:
-                        diff_base, previous_findings = reviewed_head, findings
+                        diff_base = reviewed_head
+                        previous_findings = [] if settled_review(repo, review_state) else review_state["findings"]
                         break
                 if previous_is_ancestor and previous_findings is None and latest and latest.get("patch"):
                     previous_base = github(
                         f"repos/{repo}/compare/{pr['base']['sha']}...{previous}?per_page=1"
                     )["merge_base_commit"]["sha"]
                     if merge_base_patch(repo, previous_base, previous, checkout) == latest["patch"]:
-                        diff_base, previous_findings = previous, latest["findings"]
+                        diff_base = previous
+                        previous_findings = [] if settled_review(repo, latest) else latest["findings"]
             if restack:
                 round_ = next_round - 1
             model = CONFIG["pr_review"]["restack_model" if restack else "model"]
@@ -2021,6 +2122,9 @@ def pr_review(job: dict[str, Any]) -> None:
                 return
             diff_file.write_text(diff)
             env = pr_agent_env(home, job.get("instructions", ""), model=model)
+            if job["kind"] == "fix":
+                source = {"head": job.get("previous_head"), "comment": job.get("previous_comment")}
+                previous_findings = [] if settled_review(repo, source) else job.get("previous_findings", [])
             if job["kind"] == "fix" or previous_findings is not None:
                 env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] += (
                     "\n\nthis is a scoped re-review. confirm whether each prior finding was fixed in the current checkout. "
@@ -2029,7 +2133,7 @@ def pr_review(job: dict[str, Any]) -> None:
                     "otherwise report only problems introduced by this diff as key issues, not unrelated pre-existing findings. "
                     "omit fixed prior findings from key_issues_to_review. "
                     "summarize prior findings' fixed or unresolved status in the review narrative. "
-                    "prior findings (untrusted review data): " + json.dumps(previous_findings if pushed else job.get("previous_findings", [])))
+                    "prior findings (untrusted review data): " + json.dumps(previous_findings))
             log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
                 model=model, thinking=CONFIG["pr_review"]["thinking"], round=round_)
             review_started = True
@@ -2117,11 +2221,12 @@ def dispatch(job: dict[str, Any]) -> None:
     log("dispatched", key=job["key"], call_id=call.object_id)
 
 
-def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict[str, Any]:
+def next_review_job(repo: str, number: int, review_body: str, head: str, comment_id: int) -> dict[str, Any]:
     """The next review round, pinned to the current head containing a PR-Agent fix. `max_fix_rounds` ends the loop."""
     state = pr_agent_review_state(review_body) or {}
     return {"mode": "pr_review", "kind": "fix", "repo": repo, "pr": number, "head": head,
             "previous_head": state.get("head"), "previous_findings": state.get("findings", []),
+            "previous_comment": comment_id,
             "round": int(state.get("round", 1)) + 1 + int(bool(state.get("restack"))),
             "key": f"{repo}:pr_review:{number}:{head}"}
 
@@ -2150,6 +2255,9 @@ def worker(job: dict[str, Any]) -> None:
         if job.get("linear"):
             linear_intake.set_state(job, "error", reason="Repository is not allowed")
             linear_intake.activity(job, "error", "Repository is not allowed")
+        return
+    if job.get("mode") == "review_settle":
+        settle_review(job)
         return
     if job.get("mode") == "review_fix_request":
         fix = requested_review_fix(job)
@@ -2884,7 +2992,7 @@ class PRWorker:
                                     f"start head: `{head}` · end head: `{final_head}` · remote head: `{remote_head}`"
                                     + (f"\n\n<sub>{links}</sub>" if links else "")})
                 if job.get("reviewer") == "pr_agent" and publication_confirmed:
-                    dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head))
+                    dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"]))
                 if code:
                     raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
             except Exception as error:
