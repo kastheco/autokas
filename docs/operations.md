@@ -224,6 +224,8 @@ finding intake writes a pending receipt before its GitHub lookup. a lookup or la
 
 finalization stores the first outcome and retains the receipt and check ID until both the label update and check completion succeed. the worker's final cleanup can retry a failed update without changing a published outcome to blocked. only that job's receipt is excluded from its success gate, so other pending jobs and unresolved findings still prevent success. if final cleanup also fails, the receipt remains available for recovery and continues to hold the gate. there is no automatic recovery loop.
 
+after a confirmed fix push, follow-up review dispatch failures log `fix_review_dispatch_uncertain` with the job key, pushed head and exception class. they don't skip publication recording or fix finalization, so a published fix stays fixed. an uncertain dispatch isn't retried automatically.
+
 
 ## provider accounts
 

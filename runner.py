@@ -3245,7 +3245,11 @@ class PRWorker:
                         record["state"] = "completed"
                     CLAIMS.put("command:" + job["key"], record)
                 if job.get("reviewer") == "pr_agent" and publication_confirmed:
-                    dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"]))
+                    try:
+                        dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"]))
+                    except Exception as error:
+                        log("fix_review_dispatch_uncertain", key=job["key"], head=remote_head,
+                            reason=type(error).__name__)
                 if labeled:
                     outcome_missing = not outcome_file.is_file()
                     reported = "" if outcome_missing else outcome_file.read_text(encoding="utf-8", errors="replace").strip().lower()

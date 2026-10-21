@@ -1437,7 +1437,7 @@ class FixPublicationTests(unittest.TestCase):
         self.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", message], cwd)
 
     def run_fix(self, movement="restack", pr_changes=None, compare_error=None, code=0, prior_outcome=None,
-                write_evidence=True, commit_owner=None, duplicate_evidence=None):
+                write_evidence=True, commit_owner=None, duplicate_evidence=None, dispatch_error=None):
         self.dispatched, self.logs, self.labels = [], [], []
         comment = {"body": self.body, "user": {**runner.CONFIG[self.job["reviewer"]], "type": "Bot"},
                    "issue_url": f"https://api.github.com/repos/{REPO}/issues/42",
@@ -1514,6 +1514,11 @@ class FixPublicationTests(unittest.TestCase):
             return Mock(pid=-1, **{"wait.return_value": code})
         self.smoke.on_omp = capture_omp
 
+        def dispatch(job):
+            self.dispatched.append(job)
+            if dispatch_error:
+                raise dispatch_error
+
         with (patch.object(runner, "CLAIMS", store),
               patch.dict(runner.CONFIG, {"jarvis_owner": ""}),
               patch.dict(runner.os.environ, {"PATH": runner.os.defpath, "BUN_INSTALL": "/unused",
@@ -1524,7 +1529,7 @@ class FixPublicationTests(unittest.TestCase):
               patch.object(runner.subprocess, "run", side_effect=self.smoke.run),
               patch.object(runner.subprocess, "Popen", side_effect=self.smoke.popen),
               patch.object(runner.os, "killpg"),
-              patch.object(runner, "dispatch", side_effect=self.dispatched.append),
+              patch.object(runner, "dispatch", side_effect=dispatch),
               patch.object(runner, "set_fix_label", side_effect=lambda repo, pr, state, key: self.labels.append(state)),
               patch.object(runner, "log", side_effect=lambda event, **fields: self.logs.append((event, fields)))):
             runner.PRWorker(pr_key=f"{REPO}#42").run.local(self.job)
@@ -1537,6 +1542,20 @@ class FixPublicationTests(unittest.TestCase):
         self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(self.dispatched[0]["head"], self.fix_head)
         self.assertEqual(self.dispatched[0]["mode"], "pr_review")
+
+    def test_followup_dispatch_failure_preserves_published_outcome(self):
+        self.run_fix("exact", dispatch_error=TimeoutError("dispatch unavailable"))
+        self.assertEqual(self.labels, ["fixing", "fixed"])
+        self.assertEqual(self.claims[f"fix:{REPO}:42:{self.fix_head}"]["findings"],
+                         runner.finding_keys(self.job))
+        self.assertEqual(self.git(["show", f"{self.remote_head}:parser.py"], self.origin), "result = 'fixed'")
+
+    def test_followup_dispatch_failure_finalizes_receipt_as_fixed(self):
+        self.job["fix_receipt"] = f"pending-fix:{REPO}:42:{self.job['key']}"
+        with patch.object(runner.worker, "remote") as finalize:
+            self.run_fix("exact", dispatch_error=TimeoutError("dispatch unavailable"))
+        self.assertEqual([call.args[0]["fix_state"] for call in finalize.call_args_list], ["fixed"])
+        self.assertIn(f"fix:{REPO}:42:{self.fix_head}", self.claims)
 
     def test_explicit_depth_bypass_revalidates_and_publishes_one_fix(self):
         self.body = runner.pr_agent_marker(self.starting_head, 7, runner.pr_agent_findings(
