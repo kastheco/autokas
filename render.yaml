@@ -45,7 +45,12 @@ projects:
                         - name: \"gpt-*\"
                           protocol: \"codex\"
                       params:
-                        service_tier: priority" > /CLIProxyAPI/config.yaml
+                        service_tier: priority
+                    - models:
+                        - name: \"gpt-6-astra-ultrafast\"
+                          protocol: \"codex\"
+                      params:
+                        service_tier: ultrafast" > /CLIProxyAPI/config.yaml
               pids=""
               trap '\''kill $pids 2>/dev/null || true; wait'\'' EXIT
               trap '\''exit 143'\'' TERM INT

@@ -217,6 +217,8 @@ Render's [private network](https://render.com/docs/private-network) otherwise le
 
 the startup command encodes `CLI_PROXY_API_KEY` as YAML Unicode escapes with the Debian image's `iconv`, `od`, `tr` and `sed` tools. quotes, backslashes and whitespace in a supplied UTF-8 key stay unchanged when CPA reads the config. the command does not generate or rotate the credential.
 
+render's `dockerCommand` embeds its own proxy configuration rather than reading `.railway/proxy.yaml`. it includes the same alias-specific `gpt-6-astra-ultrafast` override after the wildcard priority rule. that rule does not grant account access: preserve an ultrafast-capable account's per-auth alias during an authorized migration, and recheck its upstream `service_tiers` plus account trace before using the render route. no personal render proxy is deployed yet, so render-side tier and account smokes remain unverified.
+
 provide `CLI_PROXY_API_KEY` and `MANAGEMENT_PASSWORD` from the corresponding Railway proxy variables, and `OMCPA_MASTER_KEY` from the deployed Railway dashboard variable. also provide the dashboard's `OMCPA_CPA_MANAGEMENT_KEY` as a separate input with exactly the same credential as the proxy's `MANAGEMENT_PASSWORD`. all four secret inputs are `sync: false`. preserve the existing master key with the copied database, never generate a replacement.
 
 initial setup must have two phases, only after separate resource and migration authorization. Render [prompts for `sync: false` values before creating services](https://render.com/docs/blueprint-spec#prompting-for-secret-values), so do not submit the full blueprint with a guessed hostname or a placeholder URL:
