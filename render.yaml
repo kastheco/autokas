@@ -1,0 +1,98 @@
+# prep only. do not sync without separate approval to create resources and incur spend.
+# target workspace: kas the co (tea-d4b575ripnbc73ammo1g).
+# reuse the pinned proxy image with the existing nginx public-path allowlist.
+projects:
+  - name: autokas
+    environments:
+      - name: production
+        services:
+          - name: cli-proxy
+            type: web
+            runtime: docker
+            dockerfilePath: .railway/Dockerfile.proxy
+            dockerContext: .
+            region: virginia
+            plan: 0.5c-512mb
+            numInstances: 1
+            healthCheckPath: /healthz
+            dockerCommand: |
+              /bin/bash -ec 'umask 077
+              : "${CLI_PROXY_API_KEY:?CLI_PROXY_API_KEY is required}"
+              mkdir -p /data/auths
+              chmod 700 /data/auths
+              # YAML double-quoted escapes preserve quotes, controls and Unicode line breaks.
+              escaped_key=$(printf "%s" "$CLI_PROXY_API_KEY" | iconv -f UTF-8 -t UTF-32BE | od -An -v -tx1 | tr -d " \n" | sed "s/......../\\\\U&/g")
+              printf "%s\n" "host: \"\"
+              port: 8318
+              auth-dir: /data/auths
+              api-keys:
+                - \"${escaped_key}\"
+              remote-management:
+                allow-remote: false
+                secret-key: \"\"
+                disable-control-panel: true
+              ws-auth: true
+              usage-statistics-enabled: true
+              logging-to-file: false
+              request-log: false
+              requests:
+                payload:
+                  override:
+                    - models:
+                        - name: \"gpt-*\"
+                          protocol: \"codex\"
+                      params:
+                        service_tier: priority" > /CLIProxyAPI/config.yaml
+              pids=""
+              trap '\''kill $pids 2>/dev/null || true; wait'\'' EXIT
+              trap '\''exit 143'\'' TERM INT
+              /usr/sbin/nginx -c /CLIProxyAPI/nginx.conf -g "daemon off;" &
+              pids="$!"
+              /CLIProxyAPI/CLIProxyAPI -config /CLIProxyAPI/config.yaml &
+              pids="$pids $!"
+              wait -n $pids
+              exit 1'
+            envVars:
+              - key: PORT
+                value: "8317"
+              - key: CLI_PROXY_API_KEY
+                sync: false
+              - key: MANAGEMENT_PASSWORD
+                sync: false
+            disk:
+              name: cli-proxy-auth
+              mountPath: /data/auths
+              sizeGB: 1
+          - name: oh-my-cpa
+            type: web
+            runtime: image
+            image:
+              url: docker.io/wiziscool/oh-my-cpa:v0.2.9
+            region: virginia
+            plan: 1c-2g
+            # paid disk-backed services do not sleep automatically. see docs/operations.md.
+            numInstances: 1
+            healthCheckPath: /omc/api/healthz
+            # retain the image entrypoint and UID 10001. prepare disk ownership before startup.
+            envVars:
+              - key: PORT
+                value: "8080"
+              - key: OMCPA_DATA_DIR
+                value: /data
+              # nonsecret: require the dashboard's complete https:// URL before sign-in.
+              # the HTTPS scheme makes the image set Secure on its session cookie.
+              - key: OMCPA_PUBLIC_URL
+                sync: false
+              # nonsecret: create cli-proxy first, then use its private hostname on port 8318.
+              # see docs/operations.md for the required two-phase setup.
+              - key: OMCPA_CPA_BASE_URL
+                sync: false
+              # set the same credential as cli-proxy's MANAGEMENT_PASSWORD at setup.
+              - key: OMCPA_CPA_MANAGEMENT_KEY
+                sync: false
+              - key: OMCPA_MASTER_KEY
+                sync: false
+            disk:
+              name: oh-my-cpa-data
+              mountPath: /data
+              sizeGB: 1

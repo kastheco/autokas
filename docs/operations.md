@@ -162,6 +162,8 @@ enter secrets through Modal's native secret form or SDK using hidden/local input
 
 the personal CLIProxyAPI deployment is owned by `.railway/railway.ts` in this repo. the Railway project is `autokas`, formerly `digikas`. `.railway/Dockerfile.proxy` wraps the pinned `eceasy/cli-proxy-api:v8.0.27` image with nginx and builds from this repository's `main` branch. keep this repository available for future proxy builds.
 
+the following describes the repository's target Railway configuration. the 2026-10-22 live inventory still runs the pinned proxy image directly on port 8317, without this nginx wrapper, and the dashboard still omits `OMCPA_PUBLIC_URL`. the Render preparation below preserves that live configuration rather than applying the undeployed wrapper.
+
 ```sh
 export RAILWAY_PROJECT_ID=03fd53c4-dbc1-4753-b334-95a3e6611e44
 export RAILWAY_ENVIRONMENT_ID=ccdf7ae4-c247-4401-a8a4-a0fae4a2dbc5
@@ -192,6 +194,45 @@ OMC is the usage dashboard at the `oh-my-cpa` service's generated domain under `
 
 back up `oh-my-cpa-data` with its matching `autokas/oh-my-cpa-master-key` in secure storage. to restore, stop OMC, restore the data volume, provision the same `OMCPA_MASTER_KEY` shared variable in the target Railway environment, then start OMC with that volume mounted at `/data`. a fresh key can't decrypt the restored credentials or payloads. follow the pinned image's [SQLite backup and restore procedure](https://github.com/WizisCool/oh-my-cpa/blob/v0.2.9/docs/ops/sqlite-operations.md) for a consistent database backup.
 
+
+### render preparation
+
+`render.yaml` prepares an `autokas` project with a `production` environment in Render's `kas the co` workspace (`tea-d4b575ripnbc73ammo1g`). it does not authorize deployment. do not sync the blueprint, create resources, transfer credentials or data, or change clients until kas gives a separate go. Railway remains read-only and its proxy must stay up until every client has moved, including the migration agent.
+
+the approved sizes are `0.5c-512mb` for `cli-proxy` and `1c-2g` for `oh-my-cpa`, each with one instance in Virginia and a 1 GB disk at its existing mount path. Virginia is the requested default for this east-coast deployment. these sizes reduce Railway's allowed compute ceilings based on measured usage. the listed cost if both run continuously is $32/month compute plus $0.50/month disks, before bandwidth and workspace fees. the dashboard disk was approximately 99% full at inventory time. recheck free bytes before any copy and obtain approval before increasing capacity or deleting data.
+
+`oh-my-cpa` is for occasional checks, and slow startup is acceptable. however, Render's [automatic idle sleep and wake-on-request](https://render.com/docs/free#spinning-down-on-idle) are available on free web services, which cannot attach the existing persistent disk. the pinned dashboard uses local SQLite, so changing its plan to `free` would lose required persistence. paid services [do not automatically spin down](https://render.com/docs/faq#why-is-my-free-service-sometimes-slow-to-respond). the blueprint therefore retains the approved paid size rather than discarding data or adding a database or wake-up service.
+
+kas approved manual suspend/resume of only `oh-my-cpa`, including possible usage-history gaps, for preparation on 2026-10-22. after deployment is separately authorized and the data restore and parity checks pass, keep the dashboard normally suspended. before each check, run `render workspace current -o json` and require `tea-d4b575ripnbc73ammo1g`, then select only `autokas/production/oh-my-cpa` in Render and resume it. wait for `/omc/api/healthz` and `/omc/`, perform the check, then suspend it again. opening its URL is not a resume action. retain `/data` and its matching master key, and keep `cli-proxy` running. after the first authorized suspend/resume cycle, verify that historical data is readable and the proxy still serves clients. [suspend](https://api-docs.render.com/reference/suspend-service-1) and [resume](https://api-docs.render.com/reference/resume-service-1) are operational actions, not a blueprint idle setting. budget for retained disks and active compute rather than calling this free. live suspension, resume and billing behavior remain unverified under the no-resource gate.
+
+the pinned dashboard [collects usage in the background](https://github.com/WizisCool/oh-my-cpa/blob/v0.2.9/README.md#features), even with no browser open. while it is suspended, collection and scheduled work stop. complete replay after resuming has not been established, so usage history can have gaps. kas accepted those gaps and manual resume through confirmation `3c3f3978-f30a-4589-b0ce-0cc249e1546e` on [the task plan](https://paperclip.kasthe.dev/KCO/issues/KCO-3515#document-plan). the blueprint retains the approved memory limit and does not enforce suspension. this decision does not authorize deployment, spend, data transfer, client changes or Railway mutation.
+
+the blueprint keeps CPA pinned to `eceasy/cli-proxy-api:v8.0.27` through the existing [proxy Dockerfile](../.railway/Dockerfile.proxy), and keeps `wiziscool/oh-my-cpa:v0.2.9`. nginx exposes only `/v1/` and `/healthz` on public port 8317 using the existing [allowlist](../.railway/nginx.conf). CPA listens on port 8318 for private dashboard access. `MANAGEMENT_PASSWORD` enables remote management despite `allow-remote: false`, so nginx is the public access boundary. require Render's public HTTP port to be 8317, never 8318, and do not add a public route to CPA's listener. before moving clients, verify authenticated management requests return 404 through the public hostname while the same requests succeed through the private hostname on port 8318.
+
+the startup command encodes `CLI_PROXY_API_KEY` as YAML Unicode escapes with the Debian image's `iconv`, `od`, `tr` and `sed` tools. quotes, backslashes and whitespace in a supplied UTF-8 key stay unchanged when CPA reads the config. the command does not generate or rotate the credential.
+
+provide `CLI_PROXY_API_KEY` and `MANAGEMENT_PASSWORD` from the corresponding Railway proxy variables, and `OMCPA_MASTER_KEY` from the deployed Railway dashboard variable. also provide the dashboard's `OMCPA_CPA_MANAGEMENT_KEY` as a separate input with exactly the same credential as the proxy's `MANAGEMENT_PASSWORD`. all four secret inputs are `sync: false`. preserve the existing master key with the copied database, never generate a replacement.
+
+initial setup must have two phases, only after separate resource and migration authorization. Render [prompts for `sync: false` values before creating services](https://render.com/docs/blueprint-spec#prompting-for-secret-values), so do not submit the full blueprint with a guessed hostname or a placeholder URL:
+
+1. create only `cli-proxy` first, using its exact block from `render.yaml`, either manually or with a temporary proxy-only blueprint. keep the same service name, project, environment and region. obtain its assigned private hostname from Render and confirm nginx is the public listener on 8317.
+2. set the complete `OMCPA_CPA_BASE_URL` to `http://<private-hostname>:8318` before creating or starting `oh-my-cpa`. create the dashboard manually with its exact blueprint settings and all its environment inputs, after the disk rehearsal below passes. then adopt it into the same blueprint by syncing the full file. Render can [adopt an existing service](https://render.com/docs/infrastructure-as-code#adding-an-existing-resource), but check the sync preview targets both existing services instead of creating suffixed duplicates. stop if it doesn't. existing blueprint updates ignore `sync: false` inputs, so don't rely on a later sync to prompt for the dashboard's new values. maintain their values in the dashboard and keep both management credentials matched during rotations.
+
+omit Railway-only `RAILWAY_RUN_UID`. the pinned dashboard runs as UID/GID `10001:10001`, and its image's `/data` ownership doesn't prove that a mounted disk or restored files are writable. before any production migration, require a disposable Render service with the same pinned image, region, disk mount and restore method, using synthetic SQLite data and no production credentials. this rehearsal needs separate resource authorization too. keep the application stopped during restoration. prepare `/data` for `10001:10001` before copying, and normalize restored files to that owner after copying rather than preserving incompatible source ownership. if Render's supported tooling can't do this, stop migration rather than starting the application as root or making the disk world-writable.
+
+in that disposable service, require `id -u` and `id -g` to return `10001`. verify `test -w /data`, verify every restored database and existing `-wal`/`-shm` file is readable and writable as that user, and create and remove a probe file in `/data`. then start the unmodified pinned image as `10001:10001`, perform a dashboard write against the synthetic restored database, restart it and confirm that write persists without SQLite permission errors. repeat the ownership and write checks on the actual restored disk before cutover. record the successful procedure and results before migration proceeds. a successful copy or an image-layer ownership check alone isn't sufficient.
+
+`OMCPA_PUBLIC_URL` is a separate, nonsecret `sync: false` input. before the first sign-in, set the dashboard's complete public HTTPS URL, including its assigned hostname, for example `https://<dashboard-hostname>/omc/`. the pinned image uses this URL's HTTPS scheme to set the session cookie's `Secure` attribute behind Render's TLS termination. do not leave it blank, use HTTP, or reuse the private `OMCPA_CPA_BASE_URL`. during cutover, verify that the browser's `omc_session` cookie has `Secure` set before using the dashboard.
+
+validation creates no resources:
+
+```sh
+render workspace current -o json
+# require tea-d4b575ripnbc73ammo1g before continuing.
+render blueprints validate render.yaml --workspace tea-d4b575ripnbc73ammo1g -o json
+```
+
+the saved [inventory](https://paperclip.kasthe.dev/KCO/issues/KCO-3515#document-inventory) and [cutover procedure](https://paperclip.kasthe.dev/KCO/issues/KCO-3515#document-cutover) contain the names-only secret mappings, consistent file-copy requirements and client switch order. the complete host provider registry, sealed credential availability, Render disk ownership and production runtime parity remain execution checks, not claims of this preparation.
 
 ## deploy and update
 
