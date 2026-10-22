@@ -5,6 +5,9 @@ projects:
   - name: autokas
     environments:
       - name: production
+        # keep private CPA management reachable only inside this two-service environment.
+        networking:
+          isolation: enabled
         services:
           - name: cli-proxy
             type: web
