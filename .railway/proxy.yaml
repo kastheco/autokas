@@ -19,3 +19,8 @@ requests:
             protocol: "codex"
         params:
           service_tier: priority
+      - models:
+          - name: "gpt-6-astra-ultrafast"
+            protocol: "codex"
+        params:
+          service_tier: ultrafast
