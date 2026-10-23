@@ -103,4 +103,4 @@ projects:
             disk:
               name: oh-my-cpa-data
               mountPath: /data
-              sizeGB: 1
+              sizeGB: 2
