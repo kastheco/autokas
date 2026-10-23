@@ -73,9 +73,9 @@ projects:
               sizeGB: 1
           - name: oh-my-cpa
             type: web
-            runtime: image
-            image:
-              url: docker.io/wiziscool/oh-my-cpa:v0.2.9
+            runtime: docker
+            dockerfilePath: images/oh-my-cpa/Dockerfile
+            dockerContext: .
             region: virginia
             plan: 1c-2g
             # paid disk-backed services do not sleep automatically. see docs/operations.md.
