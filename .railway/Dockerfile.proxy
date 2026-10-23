@@ -5,3 +5,4 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY .railway/nginx.conf /CLIProxyAPI/nginx.conf
+COPY .railway/start-render-proxy.sh /CLIProxyAPI/start-render-proxy.sh

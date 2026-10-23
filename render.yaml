@@ -18,48 +18,7 @@ projects:
             plan: 0.5c-512mb
             numInstances: 1
             healthCheckPath: /healthz
-            dockerCommand: |
-              /bin/bash -ec 'umask 077
-              : "${CLI_PROXY_API_KEY:?CLI_PROXY_API_KEY is required}"
-              mkdir -p /data/auths
-              chmod 700 /data/auths
-              # YAML double-quoted escapes preserve quotes, controls and Unicode line breaks.
-              escaped_key=$(printf "%s" "$CLI_PROXY_API_KEY" | iconv -f UTF-8 -t UTF-32BE | od -An -v -tx1 | tr -d " \n" | sed "s/......../\\\\U&/g")
-              printf "%s\n" "host: \"\"
-              port: 8318
-              auth-dir: /data/auths
-              api-keys:
-                - \"${escaped_key}\"
-              remote-management:
-                allow-remote: false
-                secret-key: \"\"
-                disable-control-panel: true
-              ws-auth: true
-              usage-statistics-enabled: true
-              logging-to-file: false
-              request-log: false
-              requests:
-                payload:
-                  override:
-                    - models:
-                        - name: \"gpt-*\"
-                          protocol: \"codex\"
-                      params:
-                        service_tier: priority
-                    - models:
-                        - name: \"gpt-6-astra-ultrafast\"
-                          protocol: \"codex\"
-                      params:
-                        service_tier: ultrafast" > /CLIProxyAPI/config.yaml
-              pids=""
-              trap '\''kill $pids 2>/dev/null || true; wait'\'' EXIT
-              trap '\''exit 143'\'' TERM INT
-              /usr/sbin/nginx -c /CLIProxyAPI/nginx.conf -g "daemon off;" &
-              pids="$!"
-              /CLIProxyAPI/CLIProxyAPI -config /CLIProxyAPI/config.yaml &
-              pids="$pids $!"
-              wait -n $pids
-              exit 1'
+            dockerCommand: /bin/bash /CLIProxyAPI/start-render-proxy.sh
             envVars:
               - key: PORT
                 value: "8317"
