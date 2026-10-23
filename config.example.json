@@ -55,7 +55,7 @@
     "max_fix_rounds": 5
   },
   "timeout_seconds": 3600,
-  "node_version": "22.22.0",
+  "node_version": "22.23.4",
   "omp_version": "18.10.3",
   "bun_version": "1.4.2",
   "model": "railway-codex/gpt-6.1-sol",
@@ -127,6 +127,5 @@
     },
     "app_id_env": "GITHUB_APP_ID",
     "private_key_env": "GITHUB_APP_PRIVATE_KEY"
-  },
-  "node_version": "22.22.0"
+  }
 }
