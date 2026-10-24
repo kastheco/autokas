@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import modal
 import linear_intake
@@ -45,8 +45,19 @@ def team_config(config: dict[str, Any], environment: str) -> dict[str, Any]:
     if len(matches) != 1:
         raise ValueError("Configure exactly one team for the current Modal environment")
     team = matches[0]
-    if not re.fullmatch(r"ghcr\.io/kastheco/autokas-teams/[a-z0-9-]+@sha256:[0-9a-f]{64}", team.get("image", "")):
+    image_pattern = r"ghcr\.io/kastheco/autokas-teams/[a-z0-9-]+@sha256:[0-9a-f]{64}"
+    if not isinstance(team.get("image"), str) or not re.fullmatch(image_pattern, team["image"]):
         raise ValueError("Team image must be a ghcr.io/kastheco/autokas-teams digest")
+    repo_images = team.get("repo_images", {})
+    if not isinstance(repo_images, dict):
+        raise ValueError("Team repo_images must be an owner/repo to image map")
+    repositories = set()
+    for repo, image in repo_images.items():
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or repo.lower() in repositories:
+            raise ValueError("Team repo_images requires unique owner/repo names, ignoring case")
+        repositories.add(repo.lower())
+        if not isinstance(image, str) or not re.fullmatch(image_pattern, image):
+            raise ValueError("Repository image must be a ghcr.io/kastheco/autokas-teams digest")
     if team.get("pull_secret") != "autokas-ghcr-pull" or not team.get("worker_secret"):
         raise ValueError("Team pull and worker secret names are required")
     return team
@@ -55,6 +66,7 @@ def team_config(config: dict[str, Any], environment: str) -> dict[str, Any]:
 if not os.environ.get("MODAL_ENVIRONMENT"):
     raise ValueError("Set MODAL_ENVIRONMENT explicitly before importing runner")
 TEAM = team_config(CONFIG, os.environ["MODAL_ENVIRONMENT"])
+REPO_IMAGES = {repo.lower(): image for repo, image in TEAM.get("repo_images", {}).items()}
 WORKER_SECRET = modal.Secret.from_name(
     TEAM["worker_secret"], environment_name=TEAM["modal_environment"],
     required_keys=["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "CLI_PROXY_API_KEY", "JARVIS_RUNNER_TOKEN"],
@@ -120,11 +132,17 @@ def with_runner_files(image: modal.Image) -> modal.Image:
 
 
 BASE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi==0.135.1")
-IMAGE = with_runner_files(modal.Image.from_registry(
-    TEAM["image"], add_python="3.12", setup_dockerfile_commands=["USER root"],
-    secret=modal.Secret.from_name(TEAM["pull_secret"], environment_name=TEAM["modal_environment"],
-                                  required_keys=["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]),
-).pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1").dockerfile_commands("USER node"))
+def team_image(reference: str) -> modal.Image:
+    return with_runner_files(modal.Image.from_registry(
+        reference, add_python="3.12", setup_dockerfile_commands=["USER root"],
+        secret=modal.Secret.from_name(TEAM["pull_secret"], environment_name=TEAM["modal_environment"],
+                                      required_keys=["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]),
+    ).pip_install("fastapi==0.135.1", "PyJWT[crypto]==2.10.1").dockerfile_commands("USER node"))
+
+
+IMAGE = team_image(TEAM["image"])
+OVERRIDE_IMAGES = {reference: team_image(reference)
+                   for reference in sorted(set(REPO_IMAGES.values()) - {TEAM["image"]})}
 
 def image_settings() -> dict[str, Any]:
     """Overlay runtime settings on team defaults, then let callers set job model roles."""
@@ -286,8 +304,8 @@ comment for a !kas command, replace that comment's body with the full overall
 outcome, keeping its acknowledgment_marker. That edited comment is the single
 overall PR outcome, so don't post another one. Use gh api --method PATCH
 <acknowledgment.path> with the replacement body as JSON on stdin. Before editing,
-fetch the comment and verify its author against the GitHub user identified by
-trusted acknowledgment_author and its exact marker. For issue commands, verify
+fetch the comment and verify its author is the trusted bot_login account and its
+body has the exact acknowledgment_marker. For issue commands, verify
 issue_url matches https://api.github.com/repos/<repo>/issues/<pr>. For PR commands,
 verify its PR relationship. Never edit another author's comment. Read back an
 uncertain PATCH once rather than blindly repeating it. Post a new outcome comment
@@ -300,8 +318,8 @@ single overall PR outcome described below, and resolve only the exact targeted
 threads whose findings were actually fixed.
 Before reporting an obsolete finding, check whether an earlier runner job already
 published and reported its fix on this same PR. Read and paginate PR conversation
-comments and the source review thread replies; verify authors against the
-authenticated GitHub identity. A queued acknowledgment is not a fix outcome.
+comments and the source review thread replies; verify authors against the trusted
+bot_login account, never GET /user. A queued acknowledgment is not a fix outcome.
 Require a confirmed earlier fix outcome covering this exact source finding, a
 published commit reachable from the current PR head, and current code that still
 addresses the finding. A whole-review outcome can cover an inline finding only
@@ -314,13 +332,21 @@ outcome comment: <!-- omp-runner:fix {"commit":"<confirmed full SHA>","findings"
 use only the exact keys from trusted context finding_keys, and include only findings
 actually fixed by that commit. never add this marker for rejected or blocked work.
 for an already-handled exit, write {"outcome_comment_id":<earlier PR conversation
-comment ID>} to outcome_evidence_file before writing outcome_file. the earlier
-comment must have this marker covering every finding key. the host requires its
-own publication receipt binding every marker key to the publishing job's trusted
-finding_keys. it also verifies the comment's author, PR relationship, age and
-reachable commit, and requires the current Git tree to equal that fixed commit's
-tree. missing receipts or later tree changes leave verification unconfirmed.
-report that limit on the PR and finish uncertain instead.
+comment ID>} to outcome_evidence_file before writing outcome_file. if the earlier
+marker doesn't cover a current finding key, optionally include "duplicates":
+{"<current key>":["<original covered key>", ...]}. map every uncovered current key,
+including the job key and all target keys, only after reading the current finding,
+the original finding, the fix diff and the current checkout and confirming the
+same defect is fixed. shared paths, nearby lines, similar wording, resolved or
+outdated threads and third-party replies aren't enough. if any finding isn't
+clearly the same fixed defect, take the normal fix or blocked path, never partial
+reuse. map only uncovered current keys to nonempty lists of original marker keys.
+the host requires its own publication receipt binding every original marker key
+to the publishing job's trusted finding_keys. duplicate keys never expand that
+receipt or extend its seven-day lifetime. it also verifies the comment's author,
+PR relationship, age and reachable commit, and requires the current Git tree to
+equal that fixed commit's tree. missing receipts or later tree changes leave
+verification unconfirmed. report that limit on the PR and finish uncertain instead.
 If every finding is already fixed and covered by that verified runner outcome,
 stop without any PR comment, thread reply, commit or push. Record "already handled"
 and the existing outcome URL in your final local output. For a mixed event, link
@@ -454,7 +480,7 @@ COMMAND_RETRY_POLICY = """this is a reporting-only retry of a !kas command.
 these retry rules override COMMAND_POLICY and the PR-fix policy where they differ.
 the trusted context's command_resume contains the runner's publication evidence.
 never execute the original command again, edit repository files, commit or push.
-use GitHub reads to reconcile earlier outcome comments from the authenticated bot
+use GitHub reads to reconcile earlier outcome comments from the trusted bot_login
 for this exact command before posting. update the existing queued acknowledgment
 and resume missing outcome reporting, with the source and Modal run links. don't
 post another overall outcome if a verified earlier one already covers this command.
@@ -533,6 +559,14 @@ def command_job(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     target_kind = "issue" if event == "issue_comment" and "pull_request" not in target else "pr"
     review = REVIEW_COMMAND.match(instruction) if target_kind == "pr" else None
     fix_review = re.fullmatch(r"fix review ([1-9][0-9]*)", instruction, re.IGNORECASE) if target_kind == "pr" else None
+    if re.match(r"settle(?:\b|_)", instruction, re.IGNORECASE):
+        settle = re.fullmatch(r"settle\s+review\s+([1-9][0-9]*)\s+(\S[\s\S]*)", instruction, re.IGNORECASE)
+        if target_kind != "pr" or author.get("type") != "User" or not settle:
+            return None
+        return {"mode": "review_settle", "repo": repo, "pr": target["number"],
+                "comment": int(settle[1]), "reason": settle[2], "author": author["login"],
+                "author_type": author["type"], "source_url": comment["html_url"],
+                "key": f"{repo}:settle:command:{comment['id']}"}
     if author.get("type") != "User" and not (
             author.get("type") == "Bot" and (review or fix_review) and trusted_reviewer(author)):
         return None
@@ -650,7 +684,8 @@ def docs_path_allowed(path: str, folders: list[str]) -> bool:
 
 def log(event: str, **fields: Any) -> None:
     """Write operational evidence without comment bodies or credentials."""
-    print(json.dumps({"event": event, "revision": REVISION, "team_image": TEAM["image"], **fields}), flush=True)
+    digest = REPO_IMAGES.get(str(fields.get("repo", "")).lower(), TEAM["image"])
+    print(json.dumps({"event": event, "revision": REVISION, "team_image": digest, **fields}), flush=True)
 
 
 def agent_prompt(body: str) -> str:
@@ -709,11 +744,14 @@ def pr_agent_findings(review: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
-def pr_agent_marker(head: str, round_: int, findings: list[dict[str, Any]], restack: bool = False) -> str:
+def pr_agent_marker(head: str, round_: int, findings: list[dict[str, Any]], restack: bool = False,
+                    patch: str = "") -> str:
     """Record the reviewed head, round and findings; restack reviews do not advance the budget."""
     state = {"head": head, "round": round_, "findings": findings}
     if restack:
         state["restack"] = True
+    if patch:
+        state["patch"] = patch
     data = json.dumps(state, separators=(",", ":"))
     return "<!-- autokas:pr-agent " + data.replace("<", "\\u003c").replace(">", "\\u003e") + " -->"
 
@@ -760,7 +798,7 @@ def depth_note(round_: int, comment_id: int) -> str:
 
 
 def pr_agent_comment(review: dict[str, Any], repo: str, head: str, round_: int, findings: list[dict[str, Any]],
-                     restack: bool = False, note: str = "") -> str:
+                     restack: bool = False, note: str = "", patch: str = "") -> str:
     """Render PR-Agent's structured review and its state into one comment, measured in UTF-8 bytes.
     The glance lines and `note` stay whole; only the details fold is trimmed. The state marker trims
     content, then headers, while preserving every finding's severity and location.
@@ -790,13 +828,13 @@ def pr_agent_comment(review: dict[str, Any], repo: str, head: str, round_: int, 
     sub = f"\n\n<sub>{notes}</sub>\n\n"
     marker_limit = min(GITHUB_COMMENT_LIMIT // 2,
                        GITHUB_COMMENT_LIMIT - len(sub.encode()) - len(REVIEW_TRIMMED.encode()))
-    marker = pr_agent_marker(head, round_, findings, restack)
+    marker = pr_agent_marker(head, round_, findings, restack, patch)
     for field in ("content", "header"):
         cap = max((len(finding[field].encode()) for finding in findings), default=0)
         while len(marker.encode()) > marker_limit and cap:
             cap //= 2
             findings = [{**finding, field: utf8_cut(finding[field], cap)} for finding in findings]
-            marker = pr_agent_marker(head, round_, findings, restack)
+            marker = pr_agent_marker(head, round_, findings, restack, patch)
     footer = sub + marker
     room = GITHUB_COMMENT_LIMIT - len(prefix.encode()) - len(footer.encode()) - wrapper_size
     if room < len(REVIEW_TRIMMED.encode()):
@@ -821,12 +859,13 @@ def pr_agent_review_state(body: str) -> dict[str, Any] | None:
     return state if isinstance(state, dict) and isinstance(state.get("findings"), list) else None
 
 
-def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, list[dict[str, Any]]]]:
-    """Read the next counted round and completed heads in latest-review order from bot-authored comments."""
+def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, dict[str, Any]], dict[str, Any] | None]:
+    """Read the next counted round, reviewed heads and latest state from bot-authored reviews."""
     highest = 0
-    reviews: dict[str, list[dict[str, Any]]] = {}
+    reviews: dict[str, dict[str, Any]] = {}
+    latest = None
     for page in range(1, 1000):
-        batch = github(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
+        batch = github(f"repos/{repo}/pulls/{number}/reviews?per_page=100&page={page}")
         for comment in batch:
             user = comment.get("user") or {}
             if any(user.get(field) != CONFIG["pr_agent"][field] for field in ("login", "id")):
@@ -837,13 +876,14 @@ def pr_agent_history(repo: str, number: int) -> tuple[int, dict[str, list[dict[s
             head = state.get("head")
             if isinstance(head, str) and re.fullmatch(r"[0-9a-fA-F]{40}", head):
                 reviews.pop(head, None)
-                reviews[head] = state["findings"]
+                latest = {**state, "comment": comment.get("id"), "html_url": comment.get("html_url")}
+                reviews[head] = latest
             round_ = state.get("round")
             if not state.get("restack") and type(round_) is int and round_ > highest:
                 highest = round_
         if len(batch) < 100:
-            return highest + 1, reviews
-    raise RuntimeError("PR-Agent review history exceeds the comment pagination limit")
+            return highest + 1, reviews, latest
+    raise RuntimeError("PR-Agent review history exceeds the review pagination limit")
 
 
 def pr_agent_round(repo: str, number: int) -> int:
@@ -922,7 +962,7 @@ def consume_fix_checkbox(job: dict[str, Any], body: str, status: str) -> None:
     updated = "\n".join(f"**fix anyway:** {status}" if line in
                         (FIX_ANYWAY_UNCHECKED, FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]"))
                         else line for line in body.split("\n"))
-    github_request("PATCH", f"repos/{job['repo']}/issues/comments/{job['comment']}", {"body": updated})
+    github_request("PUT", f"repos/{job['repo']}/pulls/{job['pr']}/reviews/{job['comment']}", {"body": updated})
 
 
 def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
@@ -933,7 +973,7 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
         if access.get("permission") not in {"admin", "write"}:
             log("command_unauthorized", key=job["key"])
             return None
-    comment = github(f"repos/{repo}/issues/comments/{job['comment']}")
+    comment = github(f"repos/{repo}/pulls/{number}/reviews/{job['comment']}")
     pr = github(f"repos/{repo}/pulls/{number}")
     body = comment.get("body") or ""
     state = pr_agent_review_state(body)
@@ -941,13 +981,14 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
                                         (FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]"))):
         return None
     if (reviewer_of(comment.get("user", {})) != "pr_agent"
-            or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
-            or not state or state.get("head") != pr["head"]["sha"]
+            or comment.get("pull_request_url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
+            or comment.get("state", "").lower() != "commented"
+            or not state or state.get("head") != pr["head"]["sha"] or comment.get("commit_id") != state["head"]
             or pr["state"] != "open" or generated_docs_pr(pr) or autokas_ignored(pr)
             or pr["head"]["repo"]["full_name"] != repo or pr["base"]["repo"]["full_name"] != repo):
         log("review_fix_outdated", key=job["key"])
         if (job.get("checkbox") and reviewer_of(comment.get("user", {})) == "pr_agent"
-                and comment.get("issue_url") == f"https://api.github.com/repos/{repo}/issues/{number}"
+                and comment.get("pull_request_url") == f"https://api.github.com/repos/{repo}/pulls/{number}"
                 and state and state.get("head") != pr["head"]["sha"]):
             consume_fix_checkbox(job, body, "stale head, no fixer was queued. request a new review.")
         return None
@@ -963,10 +1004,10 @@ def requested_review_fix(job: dict[str, Any]) -> dict[str, Any] | None:
             log("review_fix_invalid_check", key=job["key"])
             return None
     fingerprint = hashlib.sha256(prompt.encode()).hexdigest()
-    fix = {"repo": repo, "pr": number, "comment": job["comment"], "kind": "issue_comment",
+    fix = {"repo": repo, "pr": number, "comment": job["comment"], "kind": "pull_request_review",
            "reviewer": "pr_agent", "head": state["head"], "prompt": prompt,
            "bypass_depth": True, "author": job["author"], "author_id": job.get("author_id"),
-           "key": f"{repo}:issue_comment:{job['comment']}:{fingerprint}"}
+           "key": f"{repo}:pull_request_review:{job['comment']}:{fingerprint}"}
     if job.get("checkbox"):
         fix["checkbox_body"] = body
     return fix
@@ -984,8 +1025,8 @@ def allowed_repository(repo: Any) -> bool:
 
 def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, delivery: str = "") -> dict[str, Any] | None:
     """Dispatch docs merges separately while preserving review-bot intake. `posted_review` is set only by `pr_review`
-    for the comment it just posted: coding jobs also comment as autokas[bot], so a delivered or reconciled
-    autokas[bot] comment never starts a PR-Agent fix."""
+    for the review it just posted: coding jobs also comment as autokas[bot], so a delivered or reconciled
+    autokas[bot] review or comment never starts a PR-Agent fix."""
     if not allowed_repository(payload.get("repository", {}).get("full_name")):
         return None
     if event == "check_run":
@@ -1009,7 +1050,7 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, 
                     "author": sender["login"],
                     "key": f"{repo}:pr_review:rerequest:{check['id']}:{delivery}"}
         action = re.fullmatch(r"fix:([1-9][0-9]*)", payload.get("requested_action", {}).get("identifier", ""))
-        target = re.fullmatch(rf"https://github.com/{re.escape(repo)}/pull/([1-9][0-9]*)#issuecomment-([1-9][0-9]*)",
+        target = re.fullmatch(rf"https://github.com/{re.escape(repo)}/pull/([1-9][0-9]*)#pullrequestreview-([1-9][0-9]*)",
                               check.get("details_url") or "")
         if (payload.get("action") != "requested_action" or not action or not target
                 or target[2] != action[1] or sender.get("type") != "User" or not sender.get("login")
@@ -1020,24 +1061,25 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, 
                 "key": f"{repo}:review_fix:check:{check['id']}:{sender['login']}"}
     if event == "pull_request":
         return docs_event_job(payload) or review_event_job(payload)
-    if (event == "issue_comment" and payload.get("action") == "edited"
-            and reviewer_of(payload.get("comment", {}).get("user", {})) == "pr_agent"):
-        comment, issue, sender = (payload.get(key, {}) for key in ("comment", "issue", "sender"))
-        repo, number = payload["repository"]["full_name"], issue.get("number")
+    if (event == "pull_request_review" and payload.get("action") == "edited"
+            and reviewer_of(payload.get("review", {}).get("user", {})) == "pr_agent"):
+        comment, pr, sender = (payload.get(key, {}) for key in ("review", "pull_request", "sender"))
+        repo, number = payload["repository"]["full_name"], pr.get("number")
         before = payload.get("changes", {}).get("body", {}).get("from")
         body = comment.get("body") or ""
         state = pr_agent_review_state(body)
         if (reviewer_of(comment.get("user", {})) != "pr_agent" or sender.get("type") != "User"
                 or not sender.get("login") or type(comment.get("id")) is not int
                 or type(number) is not int or number <= 0
-                or issue.get("pull_request", {}).get("url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
-                or comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
+                or pr.get("base", {}).get("repo", {}).get("full_name") != repo
+                or comment.get("pull_request_url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
+                or comment.get("state", "").lower() != "commented"
                 or not isinstance(before, str) or FIX_ANYWAY_UNCHECKED not in before.splitlines()
                 or any(line in before.splitlines() for line in (FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]")))
                 or not any(line in body.splitlines() for line in (FIX_ANYWAY_CHECKED, FIX_ANYWAY_CHECKED.replace("[x]", "[X]")))
                 or FIX_ANYWAY_UNCHECKED in body.splitlines() or not state
                 or not isinstance(state.get("head"), str) or not re.fullmatch(r"[0-9a-fA-F]{40}", state["head"])
-                or state != pr_agent_review_state(before)):
+                or comment.get("commit_id") != state["head"] or state != pr_agent_review_state(before)):
             return None
         return {"mode": "review_fix_request", "repo": repo, "pr": number, "comment": comment["id"],
                 "checkbox": True, "author": sender["login"], "author_id": sender.get("id"),
@@ -1056,7 +1098,7 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, 
         return None
     if reviewer == "bugbot" and event != "pull_request_review_comment":
         return None
-    if reviewer == "pr_agent" and (event != "issue_comment" or not posted_review):
+    if reviewer == "pr_agent" and (event != "pull_request_review" or not posted_review):
         return None
     comment = payload.get("review" if event == "pull_request_review" else "comment", {})
     if event == "pull_request_review" and comment.get("state", "").lower() not in {"commented", "approved", "changes_requested"}:
@@ -1096,7 +1138,8 @@ def event_job(event: str, payload: dict[str, Any], posted_review: bool = False, 
            "reviewer": reviewer, "key": f"{repo}:{event}:{comment['id']}:{fingerprint}"}
     if reviewer == "pr_agent":
         state = pr_agent_review_state(comment.get("body") or "")
-        if not state or not isinstance(state.get("head"), str):
+        if (not state or not isinstance(state.get("head"), str)
+                or comment.get("state", "").lower() != "commented" or comment.get("commit_id") != state["head"]):
             return None
         job["head"] = state["head"]
     return job
@@ -1122,10 +1165,15 @@ async def webhook(request: Request) -> JSONResponse:
     if job is None:
         return JSONResponse({"status": "ignored", "revision": REVISION})
     if not await CLAIMS.put.aio(job["key"], "claimed", skip_if_exists=True):
-        return JSONResponse({"status": "duplicate", "revision": REVISION})
+        previous = await CLAIMS.get.aio(job["key"], None)
+        if not finding_job(job) or (isinstance(previous, dict) and previous.get("state") != "intake"):
+            return JSONResponse({"status": "duplicate", "revision": REVISION})
     try:
+        await register_fix_intake_async(job)
         call = await worker.spawn.aio(job)
     except Exception:
+        if job.get("fix_receipt"):
+            await retain_uncertain_launch_async(job)
         log("dispatch_uncertain", key=job["key"])
         raise HTTPException(503, "dispatch uncertain; inspect Modal logs, do not replay") from None
     log("dispatched", key=job["key"], call_id=call.object_id)
@@ -1177,12 +1225,13 @@ def redeliver_latest() -> dict[str, Any]:
     raise RuntimeError("redelivered App delivery was not recorded")
 
 
-def github_request(method: str, path: str, payload: Any = None) -> Any:
+def github_request(method: str, path: str, payload: Any = None, *, repo: str | None = None) -> Any:
     """Call GitHub without exposing the bearer in command arguments."""
     body = None if payload is None else json.dumps(payload).encode()
     headers = {"Accept": "application/vnd.github+json"}
     if path.startswith("repos/"):
         repo = "/".join(path.split("/")[1:3])
+    if repo is not None:
         headers["Authorization"] = f"Bearer {github_token(repo)}"
     if body is not None:
         headers["Content-Type"] = "application/json"
@@ -1200,6 +1249,301 @@ def github(path: str) -> Any:
 
 
 REVIEW_CHECK = "autokas review"
+FIX_RECEIPT_TTL = max(86400, 2 * CONFIG["timeout_seconds"])
+
+
+def pending_fix_jobs(repo: str, number: int, *, exclude_receipt: str | None = None,
+                     include_finalizing: bool = True) -> bool:
+    """Intake, routed work and recoverable finalization all hold the review gate."""
+    prefixes = [f"intake-fix:{repo}:{number}:", f"pending-fix:{repo}:{number}:"]
+    if include_finalizing:
+        prefixes.append(f"finalize-fix:{repo}:{number}:")
+    return any(isinstance(key, str) and key.startswith(tuple(prefixes)) and key != exclude_receipt
+               for key in CLAIMS.keys())
+
+
+def retain_fix_reconciliation(repo: str, number: int) -> None:
+    # This marker is never cleared: concurrent uncertain webhook launches must
+    # not lose their wake-up when the serialized worker finishes another job.
+    CLAIMS.put(f"fix-reconcile:{repo}:{number}", True)
+
+
+def retained_fix_work(repo: str, number: int) -> list[dict[str, Any]]:
+    if CLAIMS.get(f"fix-reconcile:{repo}:{number}", None) is not True:
+        return []
+    prefixes = tuple(f"{kind}:{repo}:{number}:" for kind in ("finalize-fix", "intake-fix", "pending-fix", "followup-review"))
+    records = []
+    for key in list(CLAIMS.keys()):
+        if isinstance(key, str) and key.startswith(prefixes):
+            record = CLAIMS.get(key, None)
+            if isinstance(record, dict) and (key.startswith("finalize-fix:") or record.get("launch") == "uncertain" or record.get("followup")):
+                records.append(record)
+    return records
+
+
+def recover_fix_work(repo: str, number: int) -> None:
+    """Run in the serialized worker on every kind of PR delivery or gate decision."""
+    for record in retained_fix_work(repo, number):
+        job = record["job"]
+        if record.get("followup"):
+            try:
+                if CLAIMS.get("review-started:" + job["key"], None) is None:
+                    CLAIMS.pop(job["key"], None)
+                    dispatch(job)
+                CLAIMS.pop(f"followup-review:{repo}:{number}:{job['key']}", None)
+            except Exception as error:
+                log("followup_dispatch_uncertain", key=job["key"], reason=type(error).__name__)
+        elif record.get("launch") == "uncertain":
+            try:
+                if job["fix_receipt"].startswith("intake-fix:"):
+                    worker.spawn(job)
+                elif CLAIMS.get("started:" + job["key"], None) is None:
+                    pool = REPO_WORKERS.get(repo.lower(), PRWorker)
+                    pool(pr_key=f"{repo.lower()}#{number}").run.spawn(job)
+                    record.pop("launch", None)
+                    CLAIMS.put(job["fix_receipt"], record)
+                else:
+                    record.pop("launch", None)
+                    CLAIMS.put(job["fix_receipt"], record)
+            except Exception as error:
+                log("fix_launch_uncertain", key=job["key"], reason=type(error).__name__)
+        else:
+            reconcile_fix_work(job, record["state"])
+
+
+def unresolved_review_findings(repo: str, number: int) -> bool:
+    """Check unresolved root findings from the reviewers whose fixes we own."""
+    owner, name = repo.split("/")
+    cursor = None
+    query = """query($owner:String!,$name:String!,$number:Int!,$cursor:String) {
+      repository(owner:$owner,name:$name) { pullRequest(number:$number) {
+        reviewThreads(first:100,after:$cursor) {
+          nodes { isResolved comments(first:1) { nodes { body author { __typename login } } } }
+          pageInfo { hasNextPage endCursor }
+        }
+      } }
+    }"""
+    for _ in range(1000):
+        response = github_request("POST", "graphql", {
+            "query": query, "variables": {"owner": owner, "name": name, "number": number, "cursor": cursor},
+        }, repo=repo)
+        if response.get("errors"):
+            raise RuntimeError("review thread lookup failed")
+        threads = response["data"]["repository"]["pullRequest"]["reviewThreads"]
+        for thread in threads["nodes"]:
+            if thread["isResolved"]:
+                continue
+            for comment in thread["comments"]["nodes"]:
+                author = comment.get("author") or {}
+                login = author.get("login", "").removesuffix("[bot]")
+                reviewer = next((kind for kind in REVIEWER_NAMES
+                                 if author.get("__typename") == "Bot"
+                                 and login == CONFIG[kind]["login"].removesuffix("[bot]")), None)
+                if reviewer and finding_prompt(reviewer, comment["body"]):
+                    return True
+        if not threads["pageInfo"]["hasNextPage"]:
+            return False
+        cursor = threads["pageInfo"]["endCursor"]
+    raise RuntimeError("review threads exceed the pagination limit")
+
+
+def review_fixes_pending(repo: str, number: int, *, exclude_receipt: str | None = None,
+                         pr: dict[str, Any] | None = None, recover: bool = True) -> bool:
+    """Require positive evidence before allowing a review's success."""
+    if recover and exclude_receipt is None and retained_fix_work(repo, number):
+        worker.remote({"repo": repo, "pr": number, "mode": "fix_reconcile",
+                       "key": f"{repo}:fix_reconcile:{number}"})
+        pr = None  # Re-read labels after serialized recovery.
+    pr = pr if pr is not None else github(f"repos/{repo}/pulls/{number}")
+    return (any(label["name"] == "autokas:fixing" for label in pr.get("labels", []))
+            or pending_fix_jobs(repo, number, exclude_receipt=exclude_receipt)
+            or unresolved_review_findings(repo, number))
+
+
+def finding_job(job: dict[str, Any]) -> bool:
+    return bool(job.get("prompt") and job.get("mode") != "command"
+                and job.get("reviewer") in REVIEWER_NAMES)
+
+
+def register_fix_intake(job: dict[str, Any]) -> None:
+    """Persist finding intake without making GitHub calls in the webhook."""
+    if not finding_job(job):
+        return
+    CLAIMS.put(job["key"], {"state": "intake"})
+    job["intake_key"] = job["key"]
+    job["fix_receipt"] = f"intake-fix:{job['repo']}:{job['pr']}:{job['key']}"
+    CLAIMS.put(job["fix_receipt"], {"job": dict(job), "expires_at": time.time() + FIX_RECEIPT_TTL},
+               skip_if_exists=True)
+
+
+async def register_fix_intake_async(job: dict[str, Any]) -> None:
+    """Persist webhook intake without blocking the event loop."""
+    if not finding_job(job):
+        return
+    await CLAIMS.put.aio(job["key"], {"state": "intake"})
+    job["intake_key"] = job["key"]
+    job["fix_receipt"] = f"intake-fix:{job['repo']}:{job['pr']}:{job['key']}"
+    await CLAIMS.put.aio(job["fix_receipt"],
+                         {"job": dict(job), "expires_at": time.time() + FIX_RECEIPT_TTL},
+                         skip_if_exists=True)
+
+
+def recover_expired_fix_work(repo: str, number: int) -> None:
+    """Reconcile abandoned work only after an operator confirms its workers have stopped."""
+    prefixes = tuple(f"{stage}-fix:{repo}:{number}:" for stage in ("intake", "pending", "finalize"))
+    now = time.time()
+    for key in list(CLAIMS.keys()):
+        if not isinstance(key, str) or not key.startswith(prefixes):
+            continue
+        record = CLAIMS.get(key, None)
+        if not isinstance(record, dict) or not isinstance(record.get("job"), dict):
+            raise RuntimeError("fix receipt needs manual inspection")
+        if "expires_at" not in record:
+            # Legacy work gets a full recovery window, never an assumed age.
+            record["expires_at"] = now + FIX_RECEIPT_TTL
+            CLAIMS.put(key, record)
+        if record["expires_at"] > now:
+            continue
+        job = {**record["job"], "fix_receipt": key}
+        if key.startswith("finalize-fix:"):
+            job["fix_receipt"] = f"pending-fix:{repo}:{number}:{job['key']}"
+        finish_fix_work(job, record.get("state", "blocked"))
+        log("fix_expired", key=job["key"], repo=repo, pr=number)
+    if not pending_fix_jobs(repo, number):
+        # Also clear an orphan label after Modal has removed an inactive receipt.
+        pr = github(f"repos/{repo}/pulls/{number}")
+        if any(label["name"] == "autokas:fixing" for label in pr.get("labels", [])):
+            set_fix_label(repo, number, "blocked", "fix-recovery", pr=pr, strict=True)
+
+
+def retain_uncertain_launch(job: dict[str, Any]) -> None:
+    """A lost spawn reply isn't proof that the queued job doesn't exist."""
+    receipt = job["fix_receipt"]
+    record = CLAIMS.get(receipt, None)
+    if not isinstance(record, dict):
+        return  # An accepted worker may already have transferred or finished it.
+    record.update(launch="uncertain", job=dict(job))
+    CLAIMS.put(receipt, record)
+    retain_fix_reconciliation(job["repo"], job["pr"])
+
+
+async def retain_uncertain_launch_async(job: dict[str, Any]) -> None:
+    receipt = job["fix_receipt"]
+    record = await CLAIMS.get.aio(receipt, None)
+    if not isinstance(record, dict):
+        return
+    record.update(launch="uncertain", job=dict(job))
+    await CLAIMS.put.aio(receipt, record)
+    await CLAIMS.put.aio(f"fix-reconcile:{job['repo']}:{job['pr']}", True)
+
+
+def queue_fix_work(job: dict[str, Any], pr: dict[str, Any]) -> None:
+    """Open one check only after the serialized router has consolidated a review."""
+    intake = job.get("fix_receipt")
+    receipt = f"pending-fix:{job['repo']}:{job['pr']}:{job['key']}"
+    job["fix_receipt"] = receipt
+    record = {"head": pr["head"]["sha"], "job": dict(job),
+              "expires_at": time.time() + FIX_RECEIPT_TTL}
+    CLAIMS.put(receipt, record)
+    if intake and intake != receipt:
+        CLAIMS.pop(intake, None)
+    record["check"] = start_review_check(job["repo"], record["head"], receipt)
+    CLAIMS.put(receipt, record)
+    set_fix_label(job["repo"], job["pr"], "fixing", job["key"], pr=pr, strict=True)
+
+
+def reconcile_held_checks(repo: str, number: int, pr: dict[str, Any], state: str,
+                          exclude_receipt: str, fix_head: str | None) -> None:
+    """Restore only passing reviews held for fixes, and only on the current head."""
+    prefix = f"held-review:{repo}:{number}:"
+    held = [(key, CLAIMS.get(key)) for key in CLAIMS.keys()
+            if isinstance(key, str) and key.startswith(prefix)]
+    held = [(key, record) for key, record in held
+            if isinstance(record, dict) and record["head"] == pr["head"]["sha"]]
+    if not held or review_fixes_pending(repo, number, exclude_receipt=exclude_receipt, pr=pr):
+        return
+    for key, record in held:
+        payload = record["payload"]
+        if state != "fixed" and record["head"] == fix_head:
+            payload = {"status": "completed", "conclusion": "failure",
+                       "output": {"title": f"fix {state}", "summary": f"fix {state}"}}
+        github_request("PATCH", f"repos/{repo}/check-runs/{record['check']}", payload)
+        CLAIMS.pop(key, None)
+
+
+def finish_fix_work(job: dict[str, Any], state: str) -> None:
+    """Run only in the serialized intake worker, releasing work before reconciling labels."""
+    receipt = job.get("fix_receipt")
+    if not receipt:
+        return
+    repo, number = job["repo"], job["pr"]
+    if receipt.startswith("intake-fix:"):
+        CLAIMS.pop(receipt, None)
+        if not pending_fix_jobs(repo, number, include_finalizing=False):
+            outcome = CLAIMS.get(f"fix-outcome:{repo}:{number}", None)
+            if isinstance(outcome, dict):
+                previous = outcome["job"]
+                CLAIMS.put(f"finalize-fix:{repo}:{number}:{previous['key']}", outcome)
+                retain_fix_reconciliation(repo, number)
+                finish_fix_work(previous, outcome["state"])
+        return
+    finalizing = f"finalize-fix:{repo}:{number}:{job['key']}"
+    record = CLAIMS.get(finalizing, None) or CLAIMS.get(receipt, None)
+    if not isinstance(record, dict):
+        return
+    state = record.setdefault("state", state)
+    record.pop("launch", None)  # An observed outcome settles any uncertain launch.
+    CLAIMS.put(finalizing, record)
+    retain_fix_reconciliation(repo, number)
+    CLAIMS.pop(receipt, None)
+    pr = github(f"repos/{repo}/pulls/{number}")
+    pending = pending_fix_jobs(repo, number, include_finalizing=False)
+    superseded = record["head"] != pr["head"]["sha"]
+    label = "fixing" if pending else state
+    if not pending and superseded and state in {"blocked", "rejected"}:
+        for item in pr.get("labels", []):
+            if item["name"] in {f"autokas:{name}" for name in FIX_LABELS}:
+                github_request("DELETE", f"repos/{repo}/issues/{number}/labels/"
+                               + urllib.parse.quote(item["name"], safe=""))
+        label = None
+    else:
+        set_fix_label(repo, number, label, job["key"], pr=pr, strict=True)
+    pr = {**pr, "labels": [item for item in pr.get("labels", [])
+                          if item["name"] not in {f"autokas:{name}" for name in FIX_LABELS}]
+          + ([{"name": f"autokas:{label}"}] if label else [])}
+    finish_review_check(repo, record.get("check"), job["key"],
+                        "success" if state == "fixed" else "failure",
+                        "fix published" if state == "fixed" else f"fix {state}", number=number,
+                        exclude_receipt=finalizing, pr=pr, strict=True)
+    CLAIMS.put(f"fix-outcome:{repo}:{number}", record)
+    if not pending:
+        reconcile_held_checks(repo, number, pr, state, finalizing, record.get("head"))
+    CLAIMS.pop(finalizing, None)
+
+
+def finalize_fix_work(job: dict[str, Any], state: str) -> None:
+    """Finalize through the existing serialized worker, independent of follow-up reviews."""
+    if not job.get("fix_receipt"):
+        return
+    record = CLAIMS.get(job["fix_receipt"], None)
+    if isinstance(record, dict):
+        state = record.setdefault("state", state)
+        CLAIMS.put(job["fix_receipt"], record)
+    execution = CLAIMS.get("started:" + job["key"], None)
+    if isinstance(execution, dict):
+        CLAIMS.put("started:" + job["key"], {**execution, "state": "finished"})
+    request = {**job, "mode": "fix_finalize", "fix_state": state}
+    try:
+        worker.remote(request)
+    except Exception as error:
+        log("fix_finalize_uncertain", key=job["key"], reason=type(error).__name__)
+        # A lost reply is safe to replay: finalization has its own durable receipt.
+        try:
+            worker.spawn(request)
+        except Exception as spawn_error:
+            log("fix_finalize_deferred", key=job["key"], reason=type(spawn_error).__name__)
+            return
+    job.pop("fix_receipt", None)
 
 
 def start_review_check(repo: str, head: str, key: str) -> int | None:
@@ -1211,17 +1555,43 @@ def start_review_check(repo: str, head: str, key: str) -> int | None:
         log("check_uncertain", key=key, reason=type(error).__name__,
             status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
         return None
+    CLAIMS.put(f"review-check:{repo}:{check['id']}", {"head": head})
     return check["id"]
 
 
 def finish_review_check(repo: str, check: int | None, key: str, conclusion: str, title: str,
-                        details_url: str | None = None, fix_comment: int | None = None) -> None:
+                        details_url: str | None = None, fix_comment: int | None = None,
+                        *, external_id: str | None = None, number: int | None = None,
+                        exclude_receipt: str | None = None, strict: bool = False,
+                        pr: dict[str, Any] | None = None, recover: bool = True) -> None:
     if check is None:
         return
+    desired = {"status": "completed", "conclusion": conclusion,
+               "output": {"title": title, "summary": title}}
+    if details_url:
+        desired["details_url"] = details_url
+    held_key = f"held-review:{repo}:{number}:{check}"
+    if conclusion in {"success", "neutral", "skipped"} and number is not None:
+        try:
+            pending = review_fixes_pending(repo, number, exclude_receipt=exclude_receipt, pr=pr, recover=recover)
+        except Exception as error:
+            log("fix_gate_uncertain", key=key, reason=type(error).__name__)
+            pending = True
+        if pending:
+            conclusion, title = "failure", "review fixes pending or unresolved"
+            metadata = CLAIMS.get(f"review-check:{repo}:{check}", None)
+            if isinstance(metadata, dict):
+                CLAIMS.put(held_key, {**metadata, "check": check, "payload": desired})
+        else:
+            CLAIMS.pop(held_key, None)
+    elif number is not None:
+        CLAIMS.pop(held_key, None)
     payload: dict[str, Any] = {"status": "completed", "conclusion": conclusion,
                                "output": {"title": title, "summary": title}}
     if details_url:
         payload["details_url"] = details_url
+    if external_id is not None:
+        payload["external_id"] = external_id
     if fix_comment is not None:
         payload["actions"] = [{"label": "fix anyway", "description": "Run one fixer beyond the depth limit",
                                "identifier": f"fix:{fix_comment}"}]
@@ -1230,6 +1600,92 @@ def finish_review_check(repo: str, check: int | None, key: str, conclusion: str,
     except Exception as error:
         log("check_uncertain", key=key, reason=type(error).__name__,
             status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
+        if strict:
+            raise
+
+def latest_review_check(repo: str, head: str, *, exclude_check: int | None = None,
+                        ignore_unknown_settlement: bool = False) -> dict[str, Any] | None:
+    """Select an originating review or settlement, never a fix-work gate."""
+    latest = None
+    for page in range(1, 1000):
+        batch = github(f"repos/{repo}/commits/{head}/check-runs?check_name=autokas%20review&filter=all&per_page=100&page={page}")["check_runs"]
+        for check in batch:
+            if (check.get("name") == REVIEW_CHECK
+                    and check.get("app", {}).get("slug") == CONFIG["github_app"]["name"]
+                    and check.get("head_sha") == head
+                    and check["id"] != exclude_check
+                    and not (check.get("external_id") or "").startswith(("pending-fix:", "fix-work:"))
+                    and not (ignore_unknown_settlement
+                             and (check.get("external_id") or "").startswith("settlement-unknown:"))
+                    and (latest is None or check["id"] > latest["id"])):
+                latest = check
+        if len(batch) < 100:
+            return latest
+    raise RuntimeError("review checks exceed the pagination limit")
+
+
+def settled_review(repo: str, state: dict[str, Any], *, exclude_check: int | None = None) -> dict[str, Any] | Literal[False] | None:
+    """Return the settlement, False for confirmed absence, or None when the lookup fails."""
+    if state.get("comment") is None:
+        return False
+    try:
+        check = latest_review_check(repo, state["head"], exclude_check=exclude_check,
+                                    ignore_unknown_settlement=True)
+    except Exception as error:
+        log("settlement_uncertain", repo=repo, head=state["head"], reason=type(error).__name__,
+            status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
+        return None
+    return check if check and check.get("external_id") == f"settled:{state['comment']}" else False
+
+
+def settle_review(job: dict[str, Any]) -> None:
+    """Record human adjudication without rewriting the reviewer or starting a fixer."""
+    repo, number = job["repo"], job["pr"]
+    if job.get("author_type") != "User" or not job.get("reason", "").strip():
+        log("review_settle_unauthorized", key=job["key"])
+        return
+    access = github(f"repos/{repo}/collaborators/{job['author']}/permission")
+    if access.get("permission") not in {"admin", "write"}:
+        log("command_unauthorized", key=job["key"])
+        return
+    recover_fix_work(repo, number)
+    try:
+        comment = github(f"repos/{repo}/pulls/{number}/reviews/{job['comment']}")
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        log("review_settle_missing", key=job["key"])
+        return
+    pr = github(f"repos/{repo}/pulls/{number}")
+    state = pr_agent_review_state(comment.get("body") or "")
+    if (reviewer_of(comment.get("user", {})) != "pr_agent"
+            or comment.get("pull_request_url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
+            or comment.get("state", "").lower() != "commented"
+            or not state or state.get("head") != pr["head"]["sha"] or pr["state"] != "open"
+            or comment.get("commit_id") != state["head"]
+            or (pr["head"].get("repo") or {}).get("full_name") != repo
+            or (pr["base"].get("repo") or {}).get("full_name") != repo):
+        log("review_settle_outdated", key=job["key"])
+        return
+    check = latest_review_check(repo, state["head"])
+    if (not check or check.get("status") != "completed" or check.get("conclusion") != "failure"
+            or check.get("details_url") != comment.get("html_url")):
+        log("review_settle_invalid_check", key=job["key"])
+        return
+    conclusion, counts = review_conclusion(state["findings"])
+    if conclusion != "failure":
+        counts += f", fix threshold {CONFIG['pr_review'].get('fix_severity')}"
+    title = f"adjudicated false positive by @{job['author']} · {counts}"
+    reason = "\n".join("> " + line for line in job["reason"].splitlines())
+    summary = (f"[review]({comment['html_url']}) adjudicated false positive by @{job['author']}.\n\n"
+               f"[original failed run]({check['html_url']}) · [settlement command]({job['source_url']})\n\n{reason}")
+    # Neutral passes required checks. adjudication must not clear the merge gate.
+    github_request("POST", f"repos/{repo}/check-runs", {
+        "name": REVIEW_CHECK, "head_sha": state["head"], "status": "completed", "conclusion": "failure",
+        "external_id": f"settled:{job['comment']}", "details_url": job["source_url"],
+        "output": {"title": title, "summary": summary}})
+    log("review_settled", key=job["key"], head=state["head"], comment=job["comment"])
+
 
 
 def review_conclusion(findings: list[dict[str, Any]]) -> tuple[str, str]:
@@ -1249,18 +1705,26 @@ FIX_LABELS = {
     "rejected": ("c5def5", "autokas checked the latest findings and changed nothing"),
     "blocked": ("d93f0b", "autokas couldn't finish the latest findings, read its outcome"),
 }
+_known_fix_labels: set[tuple[str, str]] = set()
 
 
-def set_fix_label(repo: str, number: int, state: str, key: str) -> None:
-    """Replace this PR's autokas fix label. a label-API failure never stops or fails the job."""
+
+def set_fix_label(repo: str, number: int, state: str, key: str, *,
+                  pr: dict[str, Any] | None = None, strict: bool = False) -> bool:
+    """Replace the fix label; reconciliation callers retain observable failures."""
     name = f"autokas:{state}"
+    current = {label["name"] for label in (pr or {}).get("labels", [])}
+    if current.intersection({f"autokas:{item}" for item in FIX_LABELS}) == {name}:
+        return True
     color, description = FIX_LABELS[state]
     try:
         try:
-            github_request("POST", f"repos/{repo}/labels", {"name": name, "color": color, "description": description})
+            if (repo, name) not in _known_fix_labels and name not in current:
+                github_request("POST", f"repos/{repo}/labels", {"name": name, "color": color, "description": description})
         except urllib.error.HTTPError as error:
             if error.code != 422:  # already exists
                 raise
+        _known_fix_labels.add((repo, name))
         labels = github_request("POST", f"repos/{repo}/issues/{number}/labels", {"labels": [name]})
         for label in labels:
             other = label.get("name", "")
@@ -1268,8 +1732,11 @@ def set_fix_label(repo: str, number: int, state: str, key: str) -> None:
                 github_request("DELETE", f"repos/{repo}/issues/{number}/labels/{urllib.parse.quote(other, safe='')}")
     except Exception as error:
         log("label_uncertain", key=key, label=name, reason=type(error).__name__)
-        return
+        if strict:
+            raise
+        return False
     log("label_set", key=key, label=name)
+    return True
 
 
 def fix_state(code: int, pushed: bool, reported: str, handled_confirmed: bool = False) -> str:
@@ -1316,8 +1783,17 @@ def already_handled_confirmed(job: dict[str, Any], pr: dict[str, Any], branch: s
         outcome = json.loads(markers[0])
         covered = outcome["findings"]
         commit = outcome["commit"]
-        if (not isinstance(covered, list) or not all(key in covered for key in finding_keys(job))
+        current_keys = finding_keys(job)
+        duplicates = evidence.get("duplicates", {})
+        if (not isinstance(covered, list) or not isinstance(duplicates, dict)
                 or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+            return False
+        for key, originals in duplicates.items():
+            if (key not in current_keys or key in covered or not isinstance(originals, list)
+                    or not originals or not all(isinstance(original, str) and original in covered
+                                                for original in originals)):
+                return False
+        if not all(key in covered or key in duplicates for key in current_keys):
             return False
         publication = CLAIMS.get(f"fix:{repo}:{number}:{commit}", None)
         if (not isinstance(publication, dict) or publication.get("branch") != branch
@@ -1445,12 +1921,20 @@ def review_job(job: dict[str, Any], pr: dict[str, Any]) -> dict[str, Any] | None
     if type(review_id) is not int:
         return None
     review = github(f"repos/{repo}/pulls/{number}/reviews/{review_id}")
-    review_prompt = finding_prompt(reviewer, review.get("body") or "")
+    review_prompt = (pr_agent_prompt(review.get("body") or "", bypass_depth=True)
+                     if job.get("bypass_depth") else finding_prompt(reviewer, review.get("body") or ""))
     if (reviewer_of(review["user"]) != reviewer or review.get("pull_request_url") != expected
             or review.get("state", "").lower() not in {"commented", "approved", "changes_requested"}
             or (job["kind"] == "pull_request_review"
                 and review_prompt != job.get("review_prompt", job["prompt"]))):
         return None
+    if reviewer == "pr_agent":
+        state = pr_agent_review_state(review.get("body") or "")
+        if (not state or state.get("head") != job.get("head") or state["head"] != pr["head"]["sha"]
+                or review.get("commit_id") != state["head"] or review.get("state", "").lower() != "commented"):
+            return None
+        return {**job, "mode": "review", "review_prompt": review_prompt,
+                "finding_url": review["html_url"], "targets": []}
     targets = []
     page = 1
     while True:
@@ -1508,9 +1992,10 @@ def acknowledge_review(job: dict[str, Any]) -> dict[str, Any] | None:
         listing = f"{path}?per_page=100&sort=created&direction=desc"
         text = f"### ⏳ queued · [source](https://github.com/{repo}/pull/{pr}#{anchor})"
     if status == "clean":
-        text = (f"### ✅ clean · CodeRabbit found nothing actionable on "
+        text = (f"### CodeRabbit range reviewed · no new actionable comments in the commit range ending at "
                 f"[`{job['head'][:7]}`](https://github.com/{repo}/commit/{job['head']}) · "
-                f"[review](https://github.com/{repo}/pull/{pr}#issuecomment-{source})")
+                f"[review](https://github.com/{repo}/pull/{pr}#issuecomment-{source})\n\n"
+                "this covers only that commit range, not other open findings or fixes on this PR.")
 
     call_id = modal.current_function_call_id()
     links = f"\n\n<sub>[Modal dispatcher](https://modal.com/id/{call_id})</sub>" if call_id else ""
@@ -1894,8 +2379,8 @@ def pr_agent_env(home: str, instructions: str = "", model: str | None = None) ->
     return env
 
 
-def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> str:
-    """Check out the exact head and return its diff from diff_base. the token stays in git's env."""
+def pr_git(repo: str, checkout: Path):
+    """Return an authenticated git runner, keeping credentials in the environment."""
     token = github_token(repo)
     header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     env = {"PATH": os.environ["PATH"], "HOME": str(checkout.parent), "GIT_TERMINAL_PROMPT": "0",
@@ -1903,14 +2388,32 @@ def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> st
            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
            "GIT_CONFIG_VALUE_0": f"Authorization: Basic {header}"}
 
-    def git(*args: str) -> str:
-        result = subprocess.run(["git", *args], cwd=checkout, env=env, capture_output=True, text=True, timeout=120)
+    def git(*args: str) -> bytes:
+        result = subprocess.run(["git", *args], cwd=checkout, env=env,
+                                capture_output=True, timeout=120)
         if result.returncode:
-            detail = redact(result.stderr.strip(), (token, header))
+            detail = redact(result.stderr.decode("utf-8", errors="replace").strip(), (token, header))
             raise RuntimeError(f"git {args[0]} failed ({result.returncode}): {detail[-2000:]}")
         return result.stdout
 
-    checkout.mkdir()
+    return git
+
+
+def merge_base_patch(repo: str, base: str, commit: str, checkout: Path) -> str:
+    """Identify the exact merge-base diff, including edited locations and blob identities."""
+    checkout.mkdir(exist_ok=True)
+    git = pr_git(repo, checkout)
+    if not (checkout / ".git").is_dir():
+        git("init", "-q")
+    git("fetch", "-q", "--depth=1", "--no-tags", f"https://github.com/{repo}.git", base, commit)
+    diff = git("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", base, commit)
+    return hashlib.sha256(diff).hexdigest() if diff else ""
+
+
+def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> str:
+    """Check out the exact head and return its diff from diff_base. the token stays in git's env."""
+    git = pr_git(repo, checkout)
+    checkout.mkdir(exist_ok=True)
     git("init", "-q")
     git("fetch", "-q", "--depth=1", "--no-tags", f"https://github.com/{repo}.git", diff_base, head)
     git("checkout", "-q", "--detach", head)
@@ -1918,7 +2421,7 @@ def checkout_pr_diff(repo: str, diff_base: str, head: str, checkout: Path) -> st
     # PR-Agent tries to load `[tool.pr-agent]` from its working directory's root pyproject.toml at import.
     # 0.47.0 doesn't apply it, but the checkout is PR-controlled, so never give a later version the chance.
     (checkout / "pyproject.toml").unlink(missing_ok=True)
-    return diff
+    return diff.decode("utf-8", errors="replace")
 
 
 @app.function(image=PR_AGENT_IMAGE, secrets=[WORKER_SECRET], retries=0, timeout=420, cpu=0.5, memory=1024)
@@ -1927,6 +2430,13 @@ def pr_review(job: dict[str, Any]) -> None:
     if not allowed_repository(job.get("repo")):
         return
     repo, number = job["repo"], job["pr"]
+    if job.get("kind") == "fix":
+        call_id = modal.current_function_call_id()
+        if not CLAIMS.put("review-started:" + job["key"], {"call": call_id}, skip_if_exists=True):
+            previous = CLAIMS.get("review-started:" + job["key"], None)
+            if isinstance(previous, dict) and previous.get("call") != call_id:
+                log("duplicate_followup_review", key=job["key"])
+                return
     # automatic: a PR became ready (`pull_request`) or an autokas fix landed (`fix`). anything else is a command.
     automatic = job["kind"] in {"pull_request", "fix"}
     if not automatic and not trusted_reviewer({"login": job.get("author"), "id": job.get("author_id")}):
@@ -1947,59 +2457,90 @@ def pr_review(job: dict[str, Any]) -> None:
         log("review_outdated", key=job["key"])
         finish_review_check(repo, check, job["key"], "cancelled", "the queued PR head was superseded")
         return
+    review_started = False
     try:
         merge_base = github(f"repos/{repo}/compare/{pr['base']['sha']}...{head}?per_page=1")["merge_base_commit"]["sha"]
         pushed = job.get("action") == "synchronize"
-        next_round, reviews = pr_agent_history(repo, number)
-        round_ = max(job.get("round", 1), next_round)
-        diff_base = merge_base
-        restack = False
-        previous_is_ancestor = False
-        previous_findings = None
-        if (job["kind"] == "fix" or pushed) and job.get("previous_head"):
-            previous = job["previous_head"]
-            try:
-                compared = github(f"repos/{repo}/compare/{previous}...{head}?per_page=1")
-            except urllib.error.HTTPError as error:
-                if error.code != 404:
-                    raise
-                # a force-push can make the old reviewed commit unavailable.
-            else:
-                previous_is_ancestor = compared["merge_base_commit"]["sha"] == previous
-                if previous_is_ancestor and job["kind"] == "fix":
-                    diff_base = previous
-            restack = pushed and not previous_is_ancestor
-        if pushed and not restack:
-            # the event's before head may never have completed a review. cover every push
-            # since the latest reviewed ancestor and keep that review's unresolved findings.
-            for reviewed_head, findings in reversed(reviews.items()):
-                if reviewed_head == job.get("previous_head"):
-                    ancestor = previous_is_ancestor
-                else:
-                    try:
-                        compared = github(f"repos/{repo}/compare/{reviewed_head}...{head}?per_page=1")
-                    except urllib.error.HTTPError as error:
-                        if error.code != 404:
-                            raise
-                        continue
-                    ancestor = compared["merge_base_commit"]["sha"] == reviewed_head
-                if ancestor:
-                    diff_base, previous_findings = reviewed_head, findings
-                    break
-        if restack:
-            round_ = next_round - 1
-        model = CONFIG["pr_review"]["restack_model" if restack else "model"]
-        check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
+        next_round, reviews, latest = pr_agent_history(repo, number)
         with tempfile.TemporaryDirectory(prefix="pr-agent-") as home:
             checkout, diff_file = Path(home, "repo"), Path(home, "pr.diff")
+            patch = merge_base_patch(repo, merge_base, head, checkout)
+            if pushed and latest and latest.get("patch") and patch == latest["patch"]:
+                settlement = settled_review(repo, latest, exclude_check=check)
+                conclusion, counts = review_conclusion(latest["findings"])
+                title = f"diff unchanged since {latest['head'][:7]}, review skipped · {counts}"
+                if settlement:
+                    conclusion, title = "failure", settlement["output"]["title"]
+                elif settlement is None:
+                    conclusion = "failure"
+                    title = f"settlement status unknown, prior failure retained · {counts}"
+                finish_review_check(repo, check, job["key"], conclusion, title,
+                                    details_url=latest.get("html_url"),
+                                    external_id=(settlement["external_id"] if settlement else
+                                                 f"settlement-unknown:{latest['comment']}" if settlement is None else None),
+                                    number=number, recover=not job.get("review_only"))
+                log("pr_review_skipped", repo=repo, pr=number, key=job["key"], head=head,
+                    reviewed_head=latest["head"], round=latest.get("round"))
+                return
+            round_ = max(job.get("round", 1), next_round)
+            diff_base = merge_base
+            restack = False
+            previous_is_ancestor = False
+            previous_findings = None
+            if (job["kind"] == "fix" or pushed) and job.get("previous_head"):
+                previous = job["previous_head"]
+                try:
+                    compared = github(f"repos/{repo}/compare/{previous}...{head}?per_page=1")
+                except urllib.error.HTTPError as error:
+                    if error.code != 404:
+                        raise
+                    # a force-push can make the old reviewed commit unavailable.
+                else:
+                    previous_is_ancestor = compared["merge_base_commit"]["sha"] == previous
+                    if previous_is_ancestor and job["kind"] == "fix":
+                        diff_base = previous
+                restack = pushed and not previous_is_ancestor
+            if pushed and not restack:
+                # the event's before head may never have completed a review. cover every push
+                # since the latest reviewed ancestor and keep that review's unresolved findings.
+                for reviewed_head, review_state in reversed(reviews.items()):
+                    if reviewed_head == job.get("previous_head"):
+                        ancestor = previous_is_ancestor
+                    else:
+                        try:
+                            compared = github(f"repos/{repo}/compare/{reviewed_head}...{head}?per_page=1")
+                        except urllib.error.HTTPError as error:
+                            if error.code != 404:
+                                raise
+                            continue
+                        ancestor = compared["merge_base_commit"]["sha"] == reviewed_head
+                    if ancestor:
+                        diff_base = reviewed_head
+                        previous_findings = [] if settled_review(repo, review_state) else review_state["findings"]
+                        break
+                if previous_is_ancestor and previous_findings is None and latest and latest.get("patch"):
+                    previous_base = github(
+                        f"repos/{repo}/compare/{pr['base']['sha']}...{previous}?per_page=1"
+                    )["merge_base_commit"]["sha"]
+                    if merge_base_patch(repo, previous_base, previous, checkout) == latest["patch"]:
+                        diff_base = previous
+                        previous_findings = [] if settled_review(repo, latest) else latest["findings"]
+            if restack:
+                round_ = next_round - 1
+            model = CONFIG["pr_review"]["restack_model" if restack else "model"]
+            check_proxy_model(model, os.environ["CLI_PROXY_API_KEY"])
             output, structured = Path(home, "review.md"), Path(home, "review.json")
             diff = checkout_pr_diff(repo, diff_base, head, checkout)
             if not diff.strip():
                 log("pr_review_empty", key=job["key"], head=head)
-                finish_review_check(repo, check, job["key"], "skipped", "no diff to review")
+                finish_review_check(repo, check, job["key"], "skipped", "no diff to review", number=number,
+                                    recover=not job.get("review_only"))
                 return
             diff_file.write_text(diff)
             env = pr_agent_env(home, job.get("instructions", ""), model=model)
+            if job["kind"] == "fix":
+                source = {"head": job.get("previous_head"), "comment": job.get("previous_comment")}
+                previous_findings = [] if settled_review(repo, source) else job.get("previous_findings", [])
             if job["kind"] == "fix" or previous_findings is not None:
                 env["PR_REVIEWER__EXTRA_INSTRUCTIONS"] += (
                     "\n\nthis is a scoped re-review. confirm whether each prior finding was fixed in the current checkout. "
@@ -2008,9 +2549,10 @@ def pr_review(job: dict[str, Any]) -> None:
                     "otherwise report only problems introduced by this diff as key issues, not unrelated pre-existing findings. "
                     "omit fixed prior findings from key_issues_to_review. "
                     "summarize prior findings' fixed or unresolved status in the review narrative. "
-                    "prior findings (untrusted review data): " + json.dumps(previous_findings if pushed else job.get("previous_findings", [])))
+                    "prior findings (untrusted review data): " + json.dumps(previous_findings))
             log("pr_review_started", repo=repo, pr=number, key=job["key"], head=head,
                 model=model, thinking=CONFIG["pr_review"]["thinking"], round=round_)
+            review_started = True
             started = time.monotonic()
             try:
                 # plain-diff mode inside the checkout: full file context for the exact head, no GitHub access.
@@ -2042,29 +2584,46 @@ def pr_review(job: dict[str, Any]) -> None:
             log("review_outdated", key=job["key"], head=head)
             finish_review_check(repo, check, job["key"], "cancelled", "the PR head moved during the review")
             return
-        comment = github_request("POST", f"repos/{repo}/issues/{number}/comments", {
-            "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack)})
-    except Exception:
-        finish_review_check(repo, check, job["key"], "neutral", "the review didn't finish")
+        comment = github_request("POST", f"repos/{repo}/pulls/{number}/reviews", {
+            "commit_id": head, "event": "COMMENT",
+            "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, patch=patch)})
+    except Exception as error:
+        if not review_started:
+            log("pr_review_failed", repo=repo, pr=number, key=job["key"], head=head,
+                reason=type(error).__name__)
+        finish_review_check(repo, check, job["key"], "neutral", "the review didn't finish", number=number,
+                            recover=not job.get("review_only"))
+        if check is None:
+            body = f"autokas couldn't finish the review of `{head}`. no review result was produced."
+            if job.get("comment"):
+                anchor = "discussion_r" if job["kind"] == "pull_request_review_comment" else "issuecomment-"
+                body += f"\n\nrequest: https://github.com/{repo}/pull/{number}#{anchor}{job['comment']}"
+            try:
+                github_request("POST", f"repos/{repo}/issues/{number}/comments", {"body": body})
+            except Exception as report_error:
+                log("pr_review_report_uncertain", key=job["key"], reason=type(report_error).__name__)
         raise
     exhausted = bool(pr_agent_prompt(comment["body"], bypass_depth=True)) and not pr_agent_prompt(comment["body"])
     finish_review_check(repo, check, job["key"], *review_conclusion(findings), details_url=comment.get("html_url"),
-                        fix_comment=comment["id"] if exhausted else None)
+                        fix_comment=comment["id"] if exhausted else None, number=number,
+                        recover=not job.get("review_only"))
     if exhausted:
-        # the fallback command names this comment, so the note is added once its ID exists.
+        # the fallback command names this review, so the note is added once its ID exists.
         note = depth_note(round_, comment["id"])
         try:
-            comment = {**comment, **github_request("PATCH", f"repos/{repo}/issues/comments/{comment['id']}", {
-                "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, note=note)})}
+            comment = {**comment, **github_request("PUT", f"repos/{repo}/pulls/{number}/reviews/{comment['id']}", {
+                "body": pr_agent_comment(rendered, repo, head, round_, findings, restack=restack, note=note, patch=patch)})}
         except Exception as error:
             log("fix_limit_note_uncertain", key=job["key"], reason=type(error).__name__,
                 status_code=error.code if isinstance(error, urllib.error.HTTPError) else None)
     log("pr_review_done", repo=repo, pr=number, key=job["key"], head=head, model=model, round=round_,
         findings=[finding["severity"] for finding in findings], seconds=round(time.monotonic() - started))
-    # automatic intake only: delivered review comments never start a fix without an authorized bypass request.
-    fix = event_job("issue_comment", {
-        "action": "created", "repository": {"full_name": repo}, "sender": comment["user"], "comment": comment,
-        "issue": {**current, "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/{number}"}},
+    if job.get("review_only"):
+        return
+    # automatic intake only: delivered reviews never start a fix without an authorized bypass request.
+    fix = event_job("pull_request_review", {
+        "action": "submitted", "repository": {"full_name": repo}, "sender": comment["user"], "review": comment,
+        "pull_request": current,
     }, posted_review=True)
     if fix is None:
         log("pr_review_no_fix", key=job["key"], round=round_)
@@ -2077,17 +2636,28 @@ def dispatch(job: dict[str, Any]) -> None:
     if not allowed_repository(job.get("repo")):
         return
     if not CLAIMS.put(job["key"], "claimed", skip_if_exists=True):
-        log("duplicate", key=job["key"])
-        return
-    call = worker.spawn(job)
+        previous = CLAIMS.get(job["key"], None)
+        if not finding_job(job) or (isinstance(previous, dict) and previous.get("state") != "intake"):
+            log("duplicate", key=job["key"])
+            return
+    try:
+        register_fix_intake(job)
+        call = worker.spawn(job)
+    except Exception:
+        if job.get("fix_receipt"):
+            retain_uncertain_launch(job)
+        else:
+            CLAIMS.pop(job["key"], None)
+        raise
     log("dispatched", key=job["key"], call_id=call.object_id)
 
 
-def next_review_job(repo: str, number: int, review_body: str, head: str) -> dict[str, Any]:
+def next_review_job(repo: str, number: int, review_body: str, head: str, comment_id: int) -> dict[str, Any]:
     """The next review round, pinned to the current head containing a PR-Agent fix. `max_fix_rounds` ends the loop."""
     state = pr_agent_review_state(review_body) or {}
     return {"mode": "pr_review", "kind": "fix", "repo": repo, "pr": number, "head": head,
             "previous_head": state.get("head"), "previous_findings": state.get("findings", []),
+            "previous_comment": comment_id,
             "round": int(state.get("round", 1)) + 1 + int(bool(state.get("restack"))),
             "key": f"{repo}:pr_review:{number}:{head}"}
 
@@ -2109,13 +2679,78 @@ class LinearOAuthRefresher:
 @app.function(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
               timeout=180, cpu=0.125, memory=256)
 def worker(job: dict[str, Any]) -> None:
-    """Keep the durable intake queue while routing work to one pool per PR."""
+    """Serialize intake and finalization; every failed route releases or reconciles its work."""
+    if not allowed_repository(job.get("repo")):
+        receipt = job.get("fix_receipt", "")
+        if receipt.startswith("intake-fix:"):
+            CLAIMS.pop(receipt, None)
+            CLAIMS.pop(job.get("intake_key", job["key"]), None)
+        if job.get("linear"):
+            linear_intake.authorize_worker(job)
+            linear_intake.set_state(job, "error", reason="Repository is not allowed")
+            linear_intake.activity(job, "error", "Repository is not allowed")
+        return
+    if job.get("mode") == "fix_recover":
+        recover_expired_fix_work(job["repo"], job["pr"])
+        return
+    if job.get("mode") in {"fix_finalize", "fix_reconcile"}:
+        if job["mode"] == "fix_finalize":
+            reconcile_fix_work(job, job["fix_state"])
+        else:
+            recover_fix_work(job["repo"], job["pr"])
+        return
+    transferred = False
+    failed = False
+    try:
+        receipt = job.get("fix_receipt", "")
+        if receipt.startswith("intake-fix:"):
+            record = CLAIMS.get(receipt, None)
+            if isinstance(record, dict) and record.pop("launch", None):
+                CLAIMS.put(receipt, record)  # This worker's acceptance is now observed.
+        if not job.get("review_only"):
+            recover_fix_work(job["repo"], job["pr"])
+        transferred = route_worker(job)
+    except Exception:
+        failed = True
+        if job.get("fix_receipt") and not job.get("launch_uncertain"):
+            CLAIMS.pop(job.get("intake_key", job["key"]), None)
+            if job.get("routing_claim"):
+                CLAIMS.pop(job["routing_claim"], None)
+        raise
+    finally:
+        if not transferred and job.get("fix_receipt") and not job.get("launch_uncertain"):
+            reconcile_fix_work(job, "blocked")
+        if job.get("intake_key") and not failed:
+            CLAIMS.put(job["intake_key"], {"state": "routed" if transferred else "finished",
+                                           "canonical": job["key"]})
+
+
+def reconcile_fix_work(job: dict[str, Any], state: str) -> None:
+    """Retry finalization without losing its original outcome or blocking the next review."""
+    try:
+        finish_fix_work(job, state)
+    except Exception as error:
+        log("fix_finalize_uncertain", key=job["key"], reason=type(error).__name__)
+        attempt = job.get("finalize_attempt", 0)
+        if attempt < 2:
+            try:
+                worker.spawn({**job, "mode": "fix_finalize", "fix_state": state,
+                              "finalize_attempt": attempt + 1})
+            except Exception as spawn_error:
+                log("fix_finalize_deferred", key=job["key"], reason=type(spawn_error).__name__)
+
+
+def route_worker(job: dict[str, Any]) -> bool | None:
+    """Consolidate findings before opening their check and transferring the receipt."""
     if job.get("linear"):
         linear_intake.authorize_worker(job)
     if not allowed_repository(job.get("repo")):
         if job.get("linear"):
             linear_intake.set_state(job, "error", reason="Repository is not allowed")
             linear_intake.activity(job, "error", "Repository is not allowed")
+        return
+    if job.get("mode") == "review_settle":
+        settle_review(job)
         return
     if job.get("mode") == "review_fix_request":
         fix = requested_review_fix(job)
@@ -2132,7 +2767,7 @@ def worker(job: dict[str, Any]) -> None:
             log("command_unauthorized", key=job["key"])
             return
     if job.get("mode") == "pr_review":
-        # reviews post one comment from their own small image; they never start a coding container.
+        # reviews post from their own small image; they never start a coding container.
         call = pr_review.spawn(job)
         log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
         return
@@ -2176,16 +2811,27 @@ def worker(job: dict[str, Any]) -> None:
             if canonical is None:
                 log("review_outdated", key=job["key"])
                 return
-            job = canonical
+            job.update(canonical)
         if not CLAIMS.put("routed:" + job["key"], "routing", skip_if_exists=True):
             log("review_already_routed", key=job["key"])
             return
+        job["routing_claim"] = "routed:" + job["key"]
+        if job.get("fix_receipt"):
+            queue_fix_work(job, pr)
     call_id = modal.current_function_call_id()
     job["modal_run_links"] = {"Modal dispatcher": f"https://modal.com/id/{call_id}"} if call_id else {}
     pr_key = (f"{job['repo'].lower()}#docs:{job['base_branch']}" if job.get("mode") == "docs_update"
               else f"{job['repo'].lower()}#{job['pr']}")
-    call = PRWorker(pr_key=pr_key).run.spawn(job)
+    pool = REPO_WORKERS.get(job["repo"].lower(), PRWorker)
+    try:
+        call = pool(pr_key=pr_key).run.spawn(job)
+    except Exception:
+        if job.get("fix_receipt"):
+            retain_uncertain_launch(job)
+            job["launch_uncertain"] = True
+        raise
     log("routed", repo=job["repo"], pr=job["pr"], key=job["key"], call_id=call.object_id)
+    return True
 
 
 def command_publication(job: dict[str, Any]) -> dict[str, Any] | None:
@@ -2442,8 +3088,6 @@ def linear_rpc(args: list[str], worktree: Path, env: dict[str, str], job: dict[s
             process.stdin.close()
 
 
-@app.function(image=IMAGE, secrets=[], retries=0, single_use_containers=True,
-              timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192)
 def linear_planner(job: dict[str, Any], checkout: bytes, proxy_key: str,
                    expires_at: float) -> tuple[int, str]:
     """Run outside the credential worker's filesystem and process namespace."""
@@ -2473,6 +3117,8 @@ def linear_planner(job: dict[str, Any], checkout: bytes, proxy_key: str,
                 "--config", str(settings), "--tools", "read,grep,glob", "--approval-mode", "yolo",
                 "--append-system-prompt", str(policy), "--max-time", str(max(1, int(deadline - time.monotonic()) - 10))]
         return linear_rpc(args, worktree, env, job, job["prompt"], deadline, mark_finishing=False)
+
+
 
 
 def linear_plan(text: str) -> list[dict[str, str]]:
@@ -2518,8 +3164,6 @@ def linear_finish(job: dict[str, Any], summary: str, publication: dict[str, Any]
 
 
 
-@app.cls(image=IMAGE, secrets=[WORKER_SECRET], max_containers=1, retries=0,
-         single_use_containers=True, timeout=CONFIG["timeout_seconds"], cpu=4, memory=8192)
 class PRWorker:
     pr_key: str = modal.parameter()
 
@@ -2535,7 +3179,15 @@ class PRWorker:
         # Modal can redeliver preempted inputs even with retries=0. Commands need
         # their own publication evidence before another agent may execute them.
         start_value = "command_started_v2" if job.get("mode") == "command" else "started"
+        call_id = modal.current_function_call_id()
+        if job.get("fix_receipt"):
+            start_value = {"call": call_id, "state": "started"}
         first_start = CLAIMS.put("started:" + job["key"], start_value, skip_if_exists=True)
+        if not first_start and job.get("fix_receipt"):
+            previous = CLAIMS.get("started:" + job["key"], None)
+            if isinstance(previous, dict) and (previous.get("call") != call_id or previous.get("state") == "finished"):
+                log("duplicate_fixer", key=job["key"])
+                return
         if not first_start:
             log("preempted_retry", repo=job["repo"], pr=job["pr"], key=job["key"])
         if plan_only and not first_start:
@@ -2589,6 +3241,7 @@ class PRWorker:
                 if job.get("linear"):
                     linear_intake.set_state(job, "error", reason=str(error))
                     linear_intake.activity(job, "error", str(error))
+                finalize_fix_work(job, "blocked")
                 raise
 
             def run(args: list[str], cwd: Path = root) -> str:
@@ -2626,6 +3279,12 @@ class PRWorker:
                                 if job.get("bypass_depth") else finding_prompt(reviewer, comment.get("body") or ""))
                             != job.get("review_prompt", job["prompt"])):
                         raise RuntimeError("comment changed or PR relationship is invalid")
+                    if reviewer == "pr_agent":
+                        state = pr_agent_review_state(comment.get("body") or "")
+                        if (not state or state.get("head") != job.get("head")
+                                or comment.get("commit_id") != state["head"]
+                                or comment.get("state", "").lower() != "commented"):
+                            raise RuntimeError("PR-Agent review head or state changed")
                 worktree = root / "repo"
                 if command_resume is not None:
                     worktree.mkdir(exist_ok=True)
@@ -2641,8 +3300,14 @@ class PRWorker:
                     if generated_docs_pr(pr) and job.get("mode") != "command":
                         log("ignored_generated_docs_pr", repo=repo, pr=number)
                         return
-                    if pr["state"] != "open" or pr["base"]["repo"]["full_name"] != repo or pr["head"]["repo"]["full_name"] != repo:
+                    if pr["base"]["repo"]["full_name"] != repo or pr["head"]["repo"]["full_name"] != repo:
                         raise RuntimeError("PR closed or head repository not approved (forks are not enabled)")
+                    if pr["state"] != "open":
+                        if job.get("mode") == "command":
+                            raise RuntimeError("PR closed or head repository not approved (forks are not enabled)")
+                        log("pr_closed_while_queued", repo=repo, pr=number, key=job["key"],
+                            merged=bool(pr.get("merged_at")))
+                        return
                     if job.get("mode") == "review":
                         current = review_job(job, pr)
                         if current is None or current["key"] != job["key"]:
@@ -2663,9 +3328,10 @@ class PRWorker:
                     checkout = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=worktree,
                                               env=env, capture_output=True, check=True,
                                               timeout=max(1, deadline - time.monotonic())).stdout
-                    code, summary = linear_planner.remote(linear_intake.stored_job(job), checkout,
-                                                          env["CLI_PROXY_API_KEY"],
-                                                          time.time() + max(1, deadline - time.monotonic()))
+                    planner = REPO_PLANNERS.get(job["repo"].lower(), linear_planner)
+                    code, summary = planner.remote(linear_intake.stored_job(job), checkout,
+                                                   env["CLI_PROXY_API_KEY"],
+                                                   time.time() + max(1, deadline - time.monotonic()))
                     if code:
                         raise RuntimeError(f"omp RPC exited with {code}")
                     if not summary.strip():
@@ -2683,6 +3349,7 @@ class PRWorker:
                 if call_id:
                     modal_run_links["Modal coding run"] = f"https://modal.com/id/{call_id}"
                 context = {"repo": repo, "pr": number, "branch": branch, "starting_head": head,
+                           "bot_login": CONFIG["git_author"]["name"],
                            "modal_run_links": modal_run_links,
                            "source_kind": job["kind"], "source_comment_id": job["comment"],
                            "target": job.get("target", "pr"),
@@ -2699,8 +3366,7 @@ class PRWorker:
                 started_at = time.time()
                 if job.get("mode") == "command":
                     context["command_commit_trailer"] = "Autokas-Command: " + hashlib.sha256(job["key"].encode()).hexdigest()
-                    context.update(acknowledgment_author=CONFIG["git_author"]["name"],
-                                   acknowledgment=job.get("acknowledgment"),
+                    context.update(acknowledgment=job.get("acknowledgment"),
                                    acknowledgment_marker="<!-- omp-runner:queued:"
                                    + hashlib.sha256(job["key"].encode()).hexdigest() + " -->")
                 else:
@@ -2788,7 +3454,8 @@ class PRWorker:
                         "branch": job.get("branch", f"autokas/issue-{number}") if job.get("target") == "issue" else branch,
                     })
                 if job.get("mode") != "command":
-                    set_fix_label(repo, number, "fixing", job["key"])
+                    if not job.get("fix_receipt"):
+                        set_fix_label(repo, number, "fixing", job["key"])
                     labeled = True
                 process = subprocess.Popen(args, cwd=worktree, env=env, start_new_session=True)
                 try:
@@ -2843,7 +3510,28 @@ class PRWorker:
                             "branch": branch, "findings": finding_keys(job)}, skip_if_exists=True)
                     handled = (code == 0 and reported == "already handled" and final_head == head
                                and already_handled_confirmed(job, pr, branch, evidence_file, started_at))
-                    set_fix_label(repo, number, fix_state(code, publication_confirmed, reported, handled), job["key"])
+                    state = fix_state(code, publication_confirmed, reported, handled)
+                    if job.get("fix_receipt"):
+                        publication = CLAIMS.get(job["fix_receipt"], None)
+                        if isinstance(publication, dict):
+                            publication.setdefault("state", state)
+                            CLAIMS.put(job["fix_receipt"], publication)
+                    if publication_confirmed:
+                        followup = (next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"])
+                                    if job.get("reviewer") == "pr_agent" else
+                                    {"mode": "pr_review", "kind": "pull_request", "repo": repo, "pr": number,
+                                     "head": remote_head, "key": f"{repo}:pr_review:{number}:{remote_head}"})
+                        try:
+                            dispatch(followup)
+                        except Exception as error:
+                            CLAIMS.put(f"followup-review:{repo}:{number}:{followup['key']}",
+                                       {"job": followup, "followup": True})
+                            retain_fix_reconciliation(repo, number)
+                            log("followup_dispatch_uncertain", key=job["key"], reason=type(error).__name__)
+                    if job.get("fix_receipt"):
+                        finalize_fix_work(job, state)
+                    else:
+                        set_fix_label(repo, number, state, job["key"])
                     labeled = False
                 if not handled:
                     change = ("no changes" if final_head == head else
@@ -2854,8 +3542,6 @@ class PRWorker:
                         f"### ⛔ blocked · fixer exited{reason} without an outcome · {change}\n\n"
                         f"start head: `{head}` · end head: `{final_head}` · remote head: `{remote_head}`"
                         + (f"\n\n<sub>{links}</sub>" if links else ""))
-                if job.get("reviewer") == "pr_agent" and publication_confirmed:
-                    dispatch(next_review_job(repo, number, comment.get("body") or "", remote_head))
                 if code:
                     raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
             except Exception as error:
@@ -2863,9 +3549,44 @@ class PRWorker:
                     linear_intake.set_state(job, "error", reason=str(error))
                     linear_intake.activity(job, "error", str(error))
                 if labeled:
-                    set_fix_label(job["repo"], job["pr"], "blocked", job["key"])
+                    if not job.get("fix_receipt"):
+                        set_fix_label(job["repo"], job["pr"], "blocked", job["key"])
                 log("stopped", repo=job["repo"], pr=job["pr"], reason=str(error))
                 raise
+            finally:
+                finalize_fix_work(job, "blocked")
+
+
+def bind_worker(worker_class: type, image: modal.Image) -> modal.Cls:
+    return app.cls(image=image, secrets=[WORKER_SECRET], max_containers=1, retries=0,
+                   single_use_containers=True, timeout=CONFIG["timeout_seconds"], cpu=4, memory=8192)(worker_class)
+
+
+def bind_planner(image: modal.Image, name: str):
+    return app.function(image=image, name=name, secrets=[], retries=0, single_use_containers=True,
+                        timeout=CONFIG["timeout_seconds"], cpu=2, memory=8192)(_linear_planner)
+
+
+# Each image needs a definition-time binding, but all pools share the same job implementation.
+_linear_planner = linear_planner
+linear_planner = bind_planner(IMAGE, "linear_planner")
+_PRWorker = PRWorker
+PRWorker = bind_worker(_PRWorker, IMAGE)
+REPO_WORKERS = {}
+REPO_PLANNERS = {}
+for reference, image in OVERRIDE_IMAGES.items():
+    suffix = hashlib.sha256(reference.encode()).hexdigest()[:16]
+    name = "PRWorker_" + suffix
+    pool = bind_worker(type(name, (), {
+        "__module__": __name__, "__annotations__": {"pr_key": str},
+        "pr_key": modal.parameter(), "run": _PRWorker.run,
+    }), image)
+    globals()[name] = pool
+    planner = bind_planner(image, "linear_planner_" + suffix)
+    for repo, repo_image in REPO_IMAGES.items():
+        if repo_image == reference:
+            REPO_WORKERS[repo] = pool
+            REPO_PLANNERS[repo] = planner
 
 
 linear_intake.register(sys.modules[__name__])

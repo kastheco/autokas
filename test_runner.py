@@ -506,6 +506,58 @@ class CommandPublicationTests(unittest.TestCase):
         self.assertIn("TimeoutError", result["reason"])
 
 
+class QueuedPRGuardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        event = review_event()
+        self.job = event_job("pull_request_review", event)
+        self.pr = {"state": "closed", "merged_at": "2026-10-13T00:00:00Z",
+                   "base": {"repo": {"full_name": REPO}},
+                   "head": {"repo": {"full_name": REPO}, "ref": "feature/fix", "sha": "a" * 40}}
+
+        def read_github(path):
+            if path == f"repos/{REPO}/pulls/142/reviews/{event['review']['id']}":
+                return event["review"]
+            if path == f"repos/{REPO}/pulls/142":
+                return self.pr
+            raise AssertionError(f"unexpected GitHub read: {path}")
+
+        def run(args, **kwargs):
+            if args != ["gh", "auth", "setup-git"]:
+                raise AssertionError(f"unexpected subprocess (including clone): {args}")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        self.log = Mock()
+        self.process = Mock(side_effect=run)
+        for patcher in (patch.dict(CONFIG, {"allowed_owners": ["example-org"], "jarvis_owner": ""}),
+                        patch.dict("runner.os.environ", {"PATH": os.defpath, "BUN_INSTALL": "/unused",
+                                                         "CLI_PROXY_API_KEY": "disposable-proxy-key"}),
+                        patch("runner.CLAIMS", Mock()),
+                        patch("runner.github_token", return_value="disposable-token"),
+                        patch("runner.check_proxy_model"),
+                        patch("runner.github", side_effect=read_github),
+                        patch("runner.subprocess.run", self.process),
+                        patch("runner.log", self.log)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_merged_review_returns_without_cloning(self) -> None:
+        PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
+        self.log.assert_any_call("pr_closed_while_queued", repo=REPO, pr=142,
+                                 key=self.job["key"], merged=True)
+        self.assertEqual([call.args[0] for call in self.process.call_args_list],
+                         [["gh", "auth", "setup-git"]])
+
+    def test_fork_repository_still_raises(self) -> None:
+        for state in ("open", "closed"):
+            for side in ("base", "head"):
+                with self.subTest(state=state, side=side):
+                    self.pr["state"] = state
+                    self.pr[side]["repo"]["full_name"] = "fork-owner/example-app"
+                    with self.assertRaisesRegex(RuntimeError, "repository not approved"):
+                        PRWorker(pr_key=f"{REPO}#142").run.local(self.job)
+                    self.pr[side]["repo"]["full_name"] = REPO
+
+
 class CommandInitializationTests(unittest.TestCase):
     class Interrupted(Exception):
         pass

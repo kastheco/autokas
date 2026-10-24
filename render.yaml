@@ -1,0 +1,65 @@
+# prep only. do not sync without separate approval to create resources and incur spend.
+# target workspace: kas the co (tea-d4b575ripnbc73ammo1g).
+# reuse the pinned proxy image with the existing nginx public-path allowlist.
+projects:
+  - name: autokas
+    environments:
+      - name: production
+        # keep private CPA management reachable only inside this two-service environment.
+        networking:
+          isolation: enabled
+        services:
+          - name: cli-proxy
+            type: web
+            runtime: docker
+            dockerfilePath: .railway/Dockerfile.proxy
+            dockerContext: .
+            region: virginia
+            plan: 0.5c-512mb
+            numInstances: 1
+            healthCheckPath: /healthz
+            dockerCommand: /bin/bash /CLIProxyAPI/start-render-proxy.sh
+            envVars:
+              - key: PORT
+                value: "8317"
+              - key: CLI_PROXY_API_KEY
+                sync: false
+              - key: MANAGEMENT_PASSWORD
+                sync: false
+            disk:
+              name: cli-proxy-auth
+              mountPath: /data/auths
+              sizeGB: 1
+          - name: oh-my-cpa
+            type: web
+            runtime: docker
+            dockerfilePath: images/oh-my-cpa/Dockerfile
+            dockerContext: .
+            region: virginia
+            plan: 1c-2g
+            # paid disk-backed services do not sleep automatically. see docs/operations.md.
+            numInstances: 1
+            healthCheckPath: /omc/api/healthz
+            # retain the image entrypoint and UID 10001. prepare disk ownership before startup.
+            envVars:
+              - key: PORT
+                value: "8080"
+              - key: OMCPA_DATA_DIR
+                value: /data
+              # nonsecret: require the dashboard's complete https:// URL before sign-in.
+              # the HTTPS scheme makes the image set Secure on its session cookie.
+              - key: OMCPA_PUBLIC_URL
+                sync: false
+              # nonsecret: create cli-proxy first, then use its private hostname on port 8318.
+              # see docs/operations.md for the required two-phase setup.
+              - key: OMCPA_CPA_BASE_URL
+                sync: false
+              # set the same credential as cli-proxy's MANAGEMENT_PASSWORD at setup.
+              - key: OMCPA_CPA_MANAGEMENT_KEY
+                sync: false
+              - key: OMCPA_MASTER_KEY
+                sync: false
+            disk:
+              name: oh-my-cpa-data
+              mountPath: /data
+              sizeGB: 2

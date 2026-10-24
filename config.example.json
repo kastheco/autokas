@@ -4,6 +4,7 @@
   "teams": {
     "example": {
       "image": "ghcr.io/kastheco/autokas-teams/example@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "repo_images": {},
       "modal_environment": "main",
       "pull_secret": "autokas-ghcr-pull",
       "worker_secret": "omp-runner-worker"
@@ -54,7 +55,7 @@
     "max_fix_rounds": 5
   },
   "timeout_seconds": 3600,
-  "node_version": "22.22.0",
+  "node_version": "22.23.4",
   "omp_version": "18.10.3",
   "bun_version": "1.4.2",
   "model": "railway-codex/gpt-6.1-sol",
@@ -75,7 +76,7 @@
   "omp_models": {
     "providers": {
       "railway-codex": {
-        "baseUrl": "https://proxy.example.invalid/v1",
+        "baseUrl": "https://cli-proxy-vgun.onrender.com/v1",
         "api": "openai-responses",
         "apiKey": "CLI_PROXY_API_KEY",
         "models": [
@@ -126,6 +127,5 @@
     },
     "app_id_env": "GITHUB_APP_ID",
     "private_key_env": "GITHUB_APP_PRIVATE_KEY"
-  },
-  "node_version": "22.22.0"
+  }
 }

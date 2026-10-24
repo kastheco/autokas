@@ -102,7 +102,9 @@ class CleanReviewTests(unittest.TestCase):
             fake = CleanGitHub()
             mutate(fake)
             with self.subTest(mutate=mutate), patch.object(runner, "github_token", return_value="test"), \
-                    patch.object(runner.urllib.request, "urlopen", fake), patch.object(runner, "PRWorker") as worker:
+                    patch.object(runner.urllib.request, "urlopen", fake), patch.object(runner, "PRWorker") as worker, \
+                    patch.object(runner, "CLAIMS") as claims:
+                claims.get.return_value = None
                 runner.worker.local(runner.event_job("issue_comment", event()))
                 worker.assert_not_called()
             self.assertEqual(fake.comments, [])
