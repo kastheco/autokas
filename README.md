@@ -157,7 +157,7 @@ autokas is a GitHub App owned by `kastheco`. a repository needs the App installe
 
 events arrive through one App-level webhook subscribed to `check_run`, `issue_comment`, `pull_request`, `pull_request_review` and `pull_request_review_comment`, so installing the App on a repo is all it takes. installation alone doesn't authorize spending model quota or Modal balance, which is what `allowed_owners` is for. the public example denies all owners.
 
-the Modal app is `omp-runner`. the repo was renamed to `autokas`, but app, function and secret names stay as they were so the webhook and secrets keep working. models come from the Railway CLIProxyAPI service (`omp_models` in the config) through omp's native `models.yml`.
+the Modal app is `omp-runner`. the repo was renamed to `autokas`, but app, function and secret names stay as they were so the webhook and secrets keep working. models come from CLIProxyAPI on Render through omp's native `models.yml`. deployments use `omp_models` from the tracked `config.example.json`, ignoring any stale copy in `AUTOKAS_CONFIG_JSON`. the provider name `railway-codex` stays unchanged, and `CLI_PROXY_API_KEY` comes from the existing Modal worker secret.
 
 ## set up
 
