@@ -76,7 +76,7 @@
   "omp_models": {
     "providers": {
       "railway-codex": {
-        "baseUrl": "https://cli-proxy-vgun.onrender.com/v1",
+        "baseUrl": "https://cli-proxy-production-533a.up.railway.app/v1",
         "api": "openai-responses",
         "apiKey": "CLI_PROXY_API_KEY",
         "models": [
