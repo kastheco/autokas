@@ -998,8 +998,13 @@ class PRReviewRunTests(unittest.TestCase):
             with self.subTest(name):
                 pulls = iter([PR, {**PR, "head": {**PR["head"], "sha": pushed if push else HEAD}}])
                 heads = iter([HEAD, pushed if push else HEAD])
+                outcomes = []
 
                 def github(path):
+                    if path.startswith("users/"):
+                        return {"login": "autokas[bot]", "id": 334744567}
+                    if "/issues/42/comments?" in path:
+                        return outcomes
                     if "/pulls?" in path:
                         return []
                     return comment if path.endswith("/pulls/42/reviews/777") else copy.deepcopy(next(pulls))
@@ -1016,6 +1021,8 @@ class PRReviewRunTests(unittest.TestCase):
                             outcome_file.write_bytes(reported)
                         else:
                             outcome_file.write_text(reported + "\n")
+                        outcomes.append({"body": "### ⛔ blocked · agent outcome\n\n" + context["outcome_marker"],
+                                         "user": {"login": "autokas[bot]", "id": 334744567}})
                     return Mock(pid=1, wait=Mock(return_value=code))
 
                 labels = []
@@ -1037,11 +1044,12 @@ class PRReviewRunTests(unittest.TestCase):
                     else:
                         runner.PRWorker(pr_key=f"{REPO}#42").run.local(copy.deepcopy(fix))
                 self.assertEqual(labels, ["fixing", label])
-                if code == 0 and reported is None:
+                if reported is None:
                     request.assert_called_once()
                     method, path, payload = request.call_args.args
                     self.assertEqual((method, path), ("POST", f"repos/{REPO}/issues/42/comments"))
-                    self.assertIn("fixer exited without an outcome", payload["body"])
+                    reason = f" with {code}" if code else ""
+                    self.assertIn(f"fixer exited{reason} without an outcome", payload["body"])
                     self.assertIn("fc-missing-outcome", payload["body"])
                     self.assertIn(f"start head: `{HEAD}`", payload["body"])
                     self.assertIn(f"end head: `{pushed if push else HEAD}`", payload["body"])
@@ -1542,8 +1550,10 @@ class FixPublicationTests(unittest.TestCase):
 
     def run_fix(self, movement="restack", pr_changes=None, compare_error=None, code=0, prior_outcome=None,
                 write_evidence=True, commit_owner=None, duplicate_evidence=None, dispatch_error=None,
-                receipt_error=None):
+                receipt_error=None, reported="published", publish_outcome=True):
         self.dispatched, self.logs, self.labels = [], [], []
+        outcomes = []
+        self.requests = Mock()
         comment = {"body": self.body, "user": {**runner.CONFIG[self.job["reviewer"]], "type": "Bot"},
                    "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
                    "state": "COMMENTED", "commit_id": self.starting_head,
@@ -1562,6 +1572,8 @@ class FixPublicationTests(unittest.TestCase):
                      get=Mock(side_effect=lambda key, default=None: copy.deepcopy(self.claims.get(key, default))))
 
         def github(path):
+            if "/issues/42/comments?" in path:
+                return outcomes
             if path == f"repos/{REPO}/issues/comments/888":
                 return prior_outcome
             if path.startswith("users/"):
@@ -1595,7 +1607,11 @@ class FixPublicationTests(unittest.TestCase):
         def capture_omp(args, *, cwd, **kwargs):
             policy = Path(args[args.index("--append-system-prompt") + 1]).read_text()
             context = self.context = json.loads(policy.rsplit("Trusted job context:\n", 1)[1])
-            Path(context["outcome_file"]).write_text("already handled\n" if movement == "handled" else "published\n")
+            if reported is not None:
+                Path(context["outcome_file"]).write_text("already handled\n" if movement == "handled" else reported + "\n")
+            if publish_outcome and movement != "handled":
+                outcomes.append({"body": "### ✅ fixed · agent outcome\n\n" + context["outcome_marker"],
+                                 "user": {"login": "autokas[bot]", "id": 334744567}})
             if movement == "handled" and write_evidence:
                 Path(context["outcome_evidence_file"]).write_text(json.dumps(
                     {"outcome_comment_id": 888, **(duplicate_evidence or {})}))
@@ -1634,6 +1650,8 @@ class FixPublicationTests(unittest.TestCase):
               patch.object(runner, "github_token", return_value="disposable-token"),
               patch.object(runner, "check_proxy_model"),
               patch.object(runner, "github", side_effect=github),
+              patch.object(runner, "github_request", self.requests),
+              patch.object(runner.modal, "current_function_call_id", return_value="fc-fixer-outcome"),
               patch.object(runner.subprocess, "run", side_effect=self.smoke.run),
               patch.object(runner.subprocess, "Popen", side_effect=self.smoke.popen),
               patch.object(runner.os, "killpg"),
@@ -1641,6 +1659,32 @@ class FixPublicationTests(unittest.TestCase):
               patch.object(runner, "set_fix_label", side_effect=lambda repo, pr, state, key: self.labels.append(state)),
               patch.object(runner, "log", side_effect=lambda event, **fields: self.logs.append((event, fields)))):
             runner.PRWorker(pr_key=f"{REPO}#42").run.local(self.job)
+
+    def test_failed_fixer_without_outcome_comments_and_preserves_raise(self):
+        self.job["modal_run_links"] = {"Modal dispatcher": "https://modal.com/id/fc-dispatch"}
+        with self.assertRaisesRegex(RuntimeError, "omp exited with -9"):
+            self.run_fix("exact", code=-9, reported=None, publish_outcome=False)
+        self.assertEqual(self.labels, ["fixing", "blocked"])
+        self.requests.assert_called_once()
+        method, path, payload = self.requests.call_args.args
+        self.assertEqual((method, path), ("POST", f"repos/{REPO}/issues/42/comments"))
+        self.assertIn("fixer exited with -9 without an outcome", payload["body"])
+        for text in (self.starting_head, self.fix_head, self.remote_head, "fc-fixer-outcome", "fc-dispatch"):
+            self.assertIn(text, payload["body"])
+
+    def test_local_outcome_without_github_delivery_still_gets_fallback(self):
+        self.run_fix("exact", publish_outcome=False)
+        self.requests.assert_called_once()
+        self.assertIn("fixer exited without an outcome", self.requests.call_args.args[2]["body"])
+
+    def test_github_outcome_without_local_file_is_not_duplicated(self):
+        self.run_fix("exact", reported=None)
+        self.requests.assert_not_called()
+
+    def test_failed_fixer_with_published_outcome_is_not_duplicated(self):
+        with self.assertRaisesRegex(RuntimeError, "omp exited with -9"):
+            self.run_fix("exact", code=-9)
+        self.requests.assert_not_called()
 
     def external_review(self):
         self.body = "<details><summary>Prompt for AI Agents</summary>\n\n```\nFix parser validation.\n```\n</details>"
