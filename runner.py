@@ -1514,20 +1514,22 @@ def finish_fix_work(job: dict[str, Any], state: str) -> None:
     finish_review_check(repo, record.get("check"), job["key"],
                         "success" if state == "fixed" else "failure",
                         "fix published" if state == "fixed" else f"fix {state}", number=number,
-                        exclude_receipt=finalizing, pr=pr, strict=True)
+                        exclude_receipt=finalizing, pr=pr, strict=True, summary=record.get("reason"))
     CLAIMS.put(f"fix-outcome:{repo}:{number}", record)
     if not pending:
         reconcile_held_checks(repo, number, pr, state, finalizing, record.get("head"))
     CLAIMS.pop(finalizing, None)
 
 
-def finalize_fix_work(job: dict[str, Any], state: str) -> None:
+def finalize_fix_work(job: dict[str, Any], state: str, reason: str | None = None) -> None:
     """Finalize through the existing serialized worker, independent of follow-up reviews."""
     if not job.get("fix_receipt"):
         return
     record = CLAIMS.get(job["fix_receipt"], None)
     if isinstance(record, dict):
         state = record.setdefault("state", state)
+        if reason:
+            record.setdefault("reason", reason)
         CLAIMS.put(job["fix_receipt"], record)
     execution = CLAIMS.get("started:" + job["key"], None)
     if isinstance(execution, dict):
@@ -1559,15 +1561,29 @@ def start_review_check(repo: str, head: str, key: str) -> int | None:
     return check["id"]
 
 
+def report_fix_progress(job: dict[str, Any], title: str, summary: str) -> None:
+    """Show an in-progress recovery step on the fix check. a check-API failure never stops the fixer."""
+    record = CLAIMS.get(job["fix_receipt"], None) if job.get("fix_receipt") else None
+    check = record.get("check") if isinstance(record, dict) else None
+    if check is None:
+        return
+    try:
+        github_request("PATCH", f"repos/{job['repo']}/check-runs/{check}",
+                       {"status": "in_progress", "output": {"title": title, "summary": summary}})
+    except Exception as error:
+        log("check_uncertain", key=job["key"], reason=type(error).__name__)
+
+
 def finish_review_check(repo: str, check: int | None, key: str, conclusion: str, title: str,
                         details_url: str | None = None, fix_comment: int | None = None,
                         *, external_id: str | None = None, number: int | None = None,
                         exclude_receipt: str | None = None, strict: bool = False,
-                        pr: dict[str, Any] | None = None, recover: bool = True) -> None:
+                        pr: dict[str, Any] | None = None, recover: bool = True,
+                        summary: str | None = None) -> None:
     if check is None:
         return
     desired = {"status": "completed", "conclusion": conclusion,
-               "output": {"title": title, "summary": title}}
+               "output": {"title": title, "summary": summary or title}}
     if details_url:
         desired["details_url"] = details_url
     held_key = f"held-review:{repo}:{number}:{check}"
@@ -1587,7 +1603,7 @@ def finish_review_check(repo: str, check: int | None, key: str, conclusion: str,
     elif number is not None:
         CLAIMS.pop(held_key, None)
     payload: dict[str, Any] = {"status": "completed", "conclusion": conclusion,
-                               "output": {"title": title, "summary": title}}
+                               "output": {"title": title, "summary": summary or title}}
     if details_url:
         payload["details_url"] = details_url
     if external_id is not None:
@@ -1815,53 +1831,68 @@ def already_handled_confirmed(job: dict[str, Any], pr: dict[str, Any], branch: s
         return False
 
 
-def publish_missing_outcome(job: dict[str, Any], marker: str, body: str) -> None:
-    """Reconcile actual GitHub delivery before filling a missing agent outcome."""
+# outcome headings in POLICY's layout, mapped to the reported outcomes fix_state accepts.
+OUTCOME_HEADINGS = {"✅": "published", "🚫": "rejected", "⛔": "blocked", "❓": "uncertain", "↩️": "already handled"}
+
+
+def delivered_outcome(job: dict[str, Any], marker: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Find this job's delivered bot outcome, or else the queued acknowledgment to rewrite.
+
+    a failed GitHub read raises, because it cannot establish absence."""
     repo, number = job["repo"], job["pr"]
     queued_marker = "<!-- omp-runner:queued:" + hashlib.sha256(job["key"].encode()).hexdigest() + " -->"
     acknowledgment = None
-    try:
-        account = github(f"users/{CONFIG['git_author']['name']}")
+    account = github(f"users/{CONFIG['git_author']['name']}")
 
-        def owned(comment):
-            user = comment.get("user") or {}
-            return user.get("id") == account["id"] and user.get("login") == account["login"]
+    def owned(comment):
+        user = comment.get("user") or {}
+        return user.get("id") == account["id"] and user.get("login") == account["login"]
 
-        def delivered(comment):
-            text = comment.get("body") or ""
-            return owned(comment) and (marker in text or queued_marker in text) and bool(
-                re.match(r"^### (?:✅|🚫|⛔|❓|↩️) ", text))
+    def delivered(comment):
+        text = comment.get("body") or ""
+        return owned(comment) and (marker in text or queued_marker in text) and bool(
+            re.match(r"^### (?:✅|🚫|⛔|❓|↩️) ", text))
 
-        receipt = job.get("acknowledgment")
-        if receipt:
-            category = "pulls" if job["kind"] == "pull_request_review_comment" else "issues"
-            path = f"repos/{repo}/{category}/comments/{int(receipt['id'])}"
-            try:
-                comment = github(path)
-            except urllib.error.HTTPError as error:
-                if error.code != 404:
-                    raise
-            else:
-                relationship = (comment.get("pull_request_url") if category == "pulls" else comment.get("issue_url"))
-                expected = f"https://api.github.com/repos/{repo}/{'pulls' if category == 'pulls' else 'issues'}/{number}"
-                if relationship == expected and owned(comment) and queued_marker in (comment.get("body") or ""):
-                    if delivered(comment):
-                        return
-                    acknowledgment = path
-        for page in range(1, 1000):
-            comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
-            if any(delivered(comment) for comment in comments):
-                return
-            if len(comments) < 100:
-                break
+    receipt = job.get("acknowledgment")
+    if receipt:
+        category = "pulls" if job["kind"] == "pull_request_review_comment" else "issues"
+        path = f"repos/{repo}/{category}/comments/{int(receipt['id'])}"
+        try:
+            comment = github(path)
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
         else:
-            raise RuntimeError("Outcome comment pagination exceeded its limit")
+            relationship = (comment.get("pull_request_url") if category == "pulls" else comment.get("issue_url"))
+            expected = f"https://api.github.com/repos/{repo}/{'pulls' if category == 'pulls' else 'issues'}/{number}"
+            if relationship == expected and owned(comment) and queued_marker in (comment.get("body") or ""):
+                if delivered(comment):
+                    return comment, None
+                acknowledgment = path
+    for page in range(1, 1000):
+        comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
+        for comment in comments:
+            if delivered(comment):
+                return comment, None
+        if len(comments) < 100:
+            return None, acknowledgment
+    raise RuntimeError("Outcome comment pagination exceeded its limit")
+
+
+def publish_missing_outcome(job: dict[str, Any], marker: str, body: str) -> None:
+    """Reconcile actual GitHub delivery before filling a missing agent outcome."""
+    repo, number = job["repo"], job["pr"]
+    try:
+        outcome, acknowledgment = delivered_outcome(job, marker)
     except Exception as error:
         # A failed read cannot establish absence. Never duplicate an uncertain delivery.
         log("outcome_delivery_uncertain", key=job["key"], reason=type(error).__name__)
         return
+    if outcome is not None:
+        return
     body += "\n\n" + marker
     if acknowledgment:
+        queued_marker = "<!-- omp-runner:queued:" + hashlib.sha256(job["key"].encode()).hexdigest() + " -->"
         github_request("PATCH", acknowledgment, {"body": body + "\n\n" + queued_marker})
     else:
         github_request("POST", f"repos/{repo}/issues/{number}/comments", {"body": body})
@@ -3163,6 +3194,77 @@ def linear_finish(job: dict[str, Any], summary: str, publication: dict[str, Any]
     linear_intake.set_state(job, "completed", **metadata)
 
 
+def fix_outcome_marker(job: dict[str, Any]) -> str:
+    return "<!-- omp-runner:outcome:" + hashlib.sha256(job["key"].encode()).hexdigest() + " -->"
+
+
+def run_links(job: dict[str, Any]) -> dict[str, str]:
+    links = dict(job.get("modal_run_links", {}))
+    call_id = modal.current_function_call_id()
+    if call_id:
+        links["Modal coding run"] = f"https://modal.com/id/{call_id}"
+    return links
+
+
+def fix_stop_reason(error: Exception) -> str:
+    """One line for the PR check. subprocess output stays in the run log."""
+    return "the fixer stopped: " + (str(error).split("\n", 1)[0].split(": ", 1)[0][:200] or type(error).__name__)
+
+
+def dispatch_fix_followup(job: dict[str, Any], comment: dict[str, Any], head: str) -> None:
+    """Review the head carrying a published fix. an uncertain dispatch stays retained for recovery."""
+    repo, number = job["repo"], job["pr"]
+    followup = (next_review_job(repo, number, comment.get("body") or "", head, job["comment"])
+                if job.get("reviewer") == "pr_agent" else
+                {"mode": "pr_review", "kind": "pull_request", "repo": repo, "pr": number,
+                 "head": head, "key": f"{repo}:pr_review:{number}:{head}"})
+    try:
+        dispatch(followup)
+    except Exception as error:
+        CLAIMS.put(f"followup-review:{repo}:{number}:{followup['key']}", {"job": followup, "followup": True})
+        retain_fix_reconciliation(repo, number)
+        log("followup_dispatch_uncertain", key=job["key"], reason=type(error).__name__)
+
+
+def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict[str, Any],
+                          started: dict[str, Any]) -> bool:
+    """Reconcile a redelivered fixer whose interrupted omp run may already have published.
+
+    returns False only when the PR shows neither a new head nor this job's outcome, so omp
+    can restart without repeating published work."""
+    repo, number = job["repo"], job["pr"]
+    head, remote_head = started["head"], pr["head"]["sha"]
+    marker = fix_outcome_marker(job)
+    outcome, _ = delivered_outcome(job, marker)
+    if outcome is None and remote_head == head:
+        return False
+    # As after a normal exit, only a descendant of the start head confirms publication.
+    published = remote_head != head and github(f"repos/{repo}/compare/{head}...{remote_head}")["status"] == "ahead"
+    reported = (OUTCOME_HEADINGS[re.match(r"^### (✅|🚫|⛔|❓|↩️) ", outcome["body"]).group(1)]
+                if outcome else "")
+    state = fix_state(0, published, reported)
+    log("preempted_fix_reconciled", repo=repo, pr=number, key=job["key"], starting_head=head,
+        remote_head=remote_head, published=published, outcome=reported or None, state=state)
+    if published:
+        dispatch_fix_followup(job, comment, remote_head)
+    commit = f"[`{remote_head[:7]}`](https://github.com/{repo}/commit/{remote_head})"
+    if outcome is None:
+        links = " · ".join(f"[{title}]({url})" for title, url in run_links(job).items())
+        publish_missing_outcome(job, marker,
+            "### ⛔ blocked · fixer was preempted "
+            + ("after publishing" if published else "and the PR head changed")
+            + f", without an outcome · {commit}\n\n"
+            f"start head: `{head}` · remote head: `{remote_head}`. autokas didn't run omp again."
+            + (f"\n\n<sub>{links}</sub>" if links else ""))
+    if outcome is not None:
+        detail = "after it reported its outcome. autokas finalized from that outcome"
+    elif published:
+        detail = f"after it published {remote_head[:7]} but before it reported an outcome. autokas kept the fix"
+    else:
+        detail = f"and the PR head changed to {remote_head[:7]} without its outcome. autokas"
+    finalize_fix_work(job, state, f"Modal preempted the fixer {detail} and didn't run omp again.")
+    return True
+
 
 class PRWorker:
     pr_key: str = modal.parameter()
@@ -3176,18 +3278,29 @@ class PRWorker:
                 linear_intake.set_state(job, "error", reason="Repository is not allowed")
                 linear_intake.activity(job, "error", "Repository is not allowed")
             return
-        # Modal can redeliver preempted inputs even with retries=0. Commands need
-        # their own publication evidence before another agent may execute them.
+        # Modal redelivers a preempted input to the same function call, even with retries=0.
+        # Commands need their own publication evidence before another agent may execute them.
         start_value = "command_started_v2" if job.get("mode") == "command" else "started"
         call_id = modal.current_function_call_id()
         if job.get("fix_receipt"):
             start_value = {"call": call_id, "state": "started"}
         first_start = CLAIMS.put("started:" + job["key"], start_value, skip_if_exists=True)
+        preempted: dict[str, Any] | None = None
         if not first_start and job.get("fix_receipt"):
             previous = CLAIMS.get("started:" + job["key"], None)
-            if isinstance(previous, dict) and (previous.get("call") != call_id or previous.get("state") == "finished"):
+            if isinstance(previous, dict) and previous.get("call") != call_id:
                 log("duplicate_fixer", key=job["key"])
                 return
+            if isinstance(previous, dict) and previous.get("state") == "finished":
+                # The interrupted run already chose its outcome. only its finalization may be lost,
+                # and finalization is idempotent.
+                log("fix_finalization_resumed", repo=job["repo"], pr=job["pr"], key=job["key"])
+                finalize_fix_work(job, "blocked")
+                return
+            preempted = previous if isinstance(previous, dict) else {}
+            report_fix_progress(job, "recovering after preemption",
+                                "Modal redelivered the preempted fixer. autokas is checking the PR for "
+                                "published work before it restarts the fixer.")
         if not first_start:
             log("preempted_retry", repo=job["repo"], pr=job["pr"], key=job["key"])
         if plan_only and not first_start:
@@ -3241,7 +3354,7 @@ class PRWorker:
                 if job.get("linear"):
                     linear_intake.set_state(job, "error", reason=str(error))
                     linear_intake.activity(job, "error", str(error))
-                finalize_fix_work(job, "blocked")
+                finalize_fix_work(job, "blocked", fix_stop_reason(error))
                 raise
 
             def run(args: list[str], cwd: Path = root) -> str:
@@ -3254,6 +3367,8 @@ class PRWorker:
                 return result.stdout.strip()
 
             labeled = False
+            interrupted = False
+            stop_reason = None
             try:
                 check_proxy_model(execution["model"], env["CLI_PROXY_API_KEY"])
                 run(["gh", "auth", "setup-git"])
@@ -3308,6 +3423,10 @@ class PRWorker:
                         log("pr_closed_while_queued", repo=repo, pr=number, key=job["key"],
                             merged=bool(pr.get("merged_at")))
                         return
+                    if preempted and preempted.get("state") == "executing":
+                        if recover_preempted_fix(job, pr, comment, preempted):
+                            return
+                        log("preempted_fix_restarted", repo=repo, pr=number, key=job["key"])
                     if job.get("mode") == "review":
                         current = review_job(job, pr)
                         if current is None or current["key"] != job["key"]:
@@ -3344,10 +3463,7 @@ class PRWorker:
                 stacked = (upstack(repo, branch, head, pr["base"]["ref"])
                            if command_resume is None and job.get("target", "pr") == "pr" else [])
                 policy = root / "policy.txt"
-                modal_run_links = dict(job.get("modal_run_links", {}))
-                call_id = modal.current_function_call_id()
-                if call_id:
-                    modal_run_links["Modal coding run"] = f"https://modal.com/id/{call_id}"
+                modal_run_links = run_links(job)
                 context = {"repo": repo, "pr": number, "branch": branch, "starting_head": head,
                            "bot_login": CONFIG["git_author"]["name"],
                            "modal_run_links": modal_run_links,
@@ -3361,7 +3477,7 @@ class PRWorker:
                            "upstack": stacked}
                 outcome_file = root / "outcome.txt"
                 evidence_file = root / "outcome-evidence.json"
-                outcome_marker = "<!-- omp-runner:outcome:" + hashlib.sha256(job["key"].encode()).hexdigest() + " -->"
+                outcome_marker = fix_outcome_marker(job)
                 context["outcome_marker"] = outcome_marker
                 started_at = time.time()
                 if job.get("mode") == "command":
@@ -3457,6 +3573,10 @@ class PRWorker:
                     if not job.get("fix_receipt"):
                         set_fix_label(repo, number, "fixing", job["key"])
                     labeled = True
+                if job.get("fix_receipt"):
+                    # A redelivery after this point must reconcile publication from this head
+                    # instead of running omp again blindly.
+                    CLAIMS.put("started:" + job["key"], {"call": call_id, "state": "executing", "head": head})
                 process = subprocess.Popen(args, cwd=worktree, env=env, start_new_session=True)
                 try:
                     code = process.wait(timeout=max(1, deadline - time.monotonic()))
@@ -3517,19 +3637,12 @@ class PRWorker:
                             publication.setdefault("state", state)
                             CLAIMS.put(job["fix_receipt"], publication)
                     if publication_confirmed:
-                        followup = (next_review_job(repo, number, comment.get("body") or "", remote_head, job["comment"])
-                                    if job.get("reviewer") == "pr_agent" else
-                                    {"mode": "pr_review", "kind": "pull_request", "repo": repo, "pr": number,
-                                     "head": remote_head, "key": f"{repo}:pr_review:{number}:{remote_head}"})
-                        try:
-                            dispatch(followup)
-                        except Exception as error:
-                            CLAIMS.put(f"followup-review:{repo}:{number}:{followup['key']}",
-                                       {"job": followup, "followup": True})
-                            retain_fix_reconciliation(repo, number)
-                            log("followup_dispatch_uncertain", key=job["key"], reason=type(error).__name__)
+                        dispatch_fix_followup(job, comment, remote_head)
                     if job.get("fix_receipt"):
-                        finalize_fix_work(job, state)
+                        notes = [f"omp exited with {code}." if code else "",
+                                 "Modal preempted an earlier attempt before it published, so the fixer "
+                                 "restarted on a fresh checkout." if preempted is not None else ""]
+                        finalize_fix_work(job, state, " ".join(filter(None, notes)) or None)
                     else:
                         set_fix_label(repo, number, state, job["key"])
                     labeled = False
@@ -3544,7 +3657,18 @@ class PRWorker:
                         + (f"\n\n<sub>{links}</sub>" if links else ""))
                 if code:
                     raise RuntimeError(f"omp exited with {code}; inspect its stopping reason above")
+            except KeyboardInterrupt:
+                # Modal preemption: SIGINT now, then the same input is redelivered to this call.
+                # Finalizing here would mark the execution finished and turn that redelivery
+                # into a rejected duplicate, so recovery belongs to the redelivered run.
+                interrupted = True
+                report_fix_progress(job, "fixer preempted, waiting for Modal to restart it",
+                                    "Modal preempted the fixer. the redelivered run checks the PR for "
+                                    "published work before it restarts the fixer or reports the outcome.")
+                log("preempted", repo=job["repo"], pr=job["pr"], key=job["key"])
+                raise
             except Exception as error:
+                stop_reason = fix_stop_reason(error)
                 if job.get("linear"):
                     linear_intake.set_state(job, "error", reason=str(error))
                     linear_intake.activity(job, "error", str(error))
@@ -3554,7 +3678,8 @@ class PRWorker:
                 log("stopped", repo=job["repo"], pr=job["pr"], reason=str(error))
                 raise
             finally:
-                finalize_fix_work(job, "blocked")
+                if not interrupted:
+                    finalize_fix_work(job, "blocked", stop_reason)
 
 
 def bind_worker(worker_class: type, image: modal.Image) -> modal.Cls:

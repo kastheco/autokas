@@ -405,6 +405,16 @@ class FixLifecycleTests(unittest.TestCase):
         proxy.assert_not_called()
         self.assertTrue(runner.pending_fix_jobs(REPO, 42))
 
+    def test_fix_check_summary_carries_the_stop_reason(self):
+        self.deliver()
+        job = self.jobs[-1]
+        with patch.object(runner.worker, "remote", side_effect=lambda request: runner.worker.local(request)):
+            runner.finalize_fix_work(job, "blocked", "omp exited with -9")
+        output = self.api.checks[501]["output"]
+        self.assertEqual((self.api.checks[501]["conclusion"], output["title"], output["summary"]),
+                         ("failure", "fix blocked", "omp exited with -9"))
+        self.assertEqual(self.api.pr["labels"], [{"name": "autokas:blocked"}])
+
 
 class WebhookIntakeTests(unittest.IsolatedAsyncioTestCase):
     async def test_webhook_has_no_github_calls_and_failed_spawn_can_be_redelivered(self):

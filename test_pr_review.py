@@ -1550,9 +1550,9 @@ class FixPublicationTests(unittest.TestCase):
 
     def run_fix(self, movement="restack", pr_changes=None, compare_error=None, code=0, prior_outcome=None,
                 write_evidence=True, commit_owner=None, duplicate_evidence=None, dispatch_error=None,
-                receipt_error=None, reported="published", publish_outcome=True):
+                receipt_error=None, reported="published", publish_outcome=True, preempted=False, outcomes=None):
         self.dispatched, self.logs, self.labels = [], [], []
-        outcomes = []
+        outcomes = [] if outcomes is None else outcomes
         self.requests = Mock()
         comment = {"body": self.body, "user": {**runner.CONFIG[self.job["reviewer"]], "type": "Bot"},
                    "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42",
@@ -1635,6 +1635,9 @@ class FixPublicationTests(unittest.TestCase):
                 self.git(["push", "origin", f"parent:refs/heads/{PR['head']['ref']}"], self.parent)
             self.remote_head = self.git(["rev-parse", f"refs/heads/{PR['head']['ref']}"], self.origin)
             self.launched = True
+            if preempted:
+                # Modal preemption arrives as SIGINT while the runner waits on omp, which is then killed.
+                return Mock(pid=-1, **{"wait.side_effect": [KeyboardInterrupt(), -9]})
             return Mock(pid=-1, **{"wait.return_value": code})
         self.smoke.on_omp = capture_omp
 
@@ -1763,6 +1766,75 @@ class FixPublicationTests(unittest.TestCase):
         self.assertEqual(finalized[0]["fix_state"], "fixed")
         self.assertEqual(self.claims[receipt]["state"], "fixed")
         self.assertTrue(any(key.startswith("followup-review:") for key in self.claims))
+
+    def queued_receipt(self):
+        receipt = f"pending-fix:{REPO}:42:{self.job['key']}"
+        self.job["fix_receipt"] = receipt
+        self.claims[receipt] = {"head": self.starting_head, "job": copy.deepcopy(self.job), "check": 501}
+        return receipt
+
+    def finalizations(self):
+        finalized = []
+        remote = patch.object(runner.worker, "remote", side_effect=lambda job: finalized.append(job["fix_state"]))
+        remote.start()
+        self.addCleanup(remote.stop)
+        return finalized
+
+    def check_updates(self):
+        return [call.args[2] for call in self.requests.call_args_list
+                if call.args[:2] == ("PATCH", f"repos/{REPO}/check-runs/501")]
+
+    def test_preemption_before_publication_restarts_on_same_call_redelivery(self):
+        finalized = self.finalizations()
+        receipt = self.queued_receipt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fix("unpublished", preempted=True, publish_outcome=False, reported=None)
+        self.assertEqual(finalized, [])
+        self.assertEqual(self.claims["started:" + self.job["key"]]["state"], "executing")
+        self.assertEqual([(update["status"], update["output"]["title"]) for update in self.check_updates()],
+                         [("in_progress", "fixer preempted, waiting for Modal to restart it")])
+        self.run_fix("exact")
+        self.assertEqual(len(self.smoke.launches), 2)
+        self.assertEqual(finalized, ["fixed"])
+        self.assertEqual([job["head"] for job in self.dispatched], [self.fix_head])
+        self.assertIn("preempted", self.claims[receipt]["reason"])
+        self.assertEqual(self.git(["show", f"{self.remote_head}:parser.py"], self.origin), "result = 'fixed'")
+
+    def test_preemption_after_publication_finalizes_without_rerunning_omp(self):
+        finalized = self.finalizations()
+        self.queued_receipt()
+        outcomes = []
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fix("exact", preempted=True, outcomes=outcomes)
+        self.run_fix("exact", outcomes=outcomes)
+        self.assertEqual(len(self.smoke.launches), 1)
+        self.assertEqual(finalized, ["fixed"])
+        self.assertEqual([job["head"] for job in self.dispatched], [self.fix_head])
+        self.assertFalse(any(call.args[0] == "POST" for call in self.requests.call_args_list))
+
+    def test_preemption_after_push_without_outcome_reports_instead_of_rerunning(self):
+        finalized = self.finalizations()
+        receipt = self.queued_receipt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fix("exact", preempted=True, publish_outcome=False, reported=None)
+        self.run_fix("exact")
+        self.assertEqual(len(self.smoke.launches), 1)
+        self.assertEqual(finalized, ["blocked"])
+        self.assertEqual([job["head"] for job in self.dispatched], [self.fix_head])
+        posts = [call.args[2]["body"] for call in self.requests.call_args_list if call.args[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertIn("preempted after publishing", posts[0])
+        self.assertIn(self.fix_head, posts[0])
+        self.assertIn("preempted", self.claims[receipt]["reason"])
+
+    def test_same_call_redelivery_after_finish_replays_only_finalization(self):
+        finalized = self.finalizations()
+        receipt = self.queued_receipt()
+        self.claims[receipt]["state"] = "fixed"
+        self.claims["started:" + self.job["key"]] = {"call": "fc-fixer-outcome", "state": "finished"}
+        self.run_fix("exact")
+        self.assertEqual(self.smoke.launches, [])
+        self.assertEqual(finalized, ["fixed"])
 
     def test_explicit_depth_bypass_revalidates_and_publishes_one_fix(self):
         self.body = runner.pr_agent_marker(self.starting_head, 7, runner.pr_agent_findings(
