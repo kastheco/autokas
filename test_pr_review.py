@@ -1088,71 +1088,51 @@ class PRReviewRunTests(unittest.TestCase):
             self.assertNotIn("proxy-secret-key", fields["detail"])
             self.assertEqual(self.posts, [])
 
-    def test_failure_discards_response_content_before_help_tail(self):
-        diagnostic = 'RuntimeError: proxy-secret-key rejected private-request\n'
-        response = '{"response_text": "private-diff-content credential-from-diff"}\n'
+    def test_failure_retains_redacted_head_and_help_tail(self):
+        diagnostic = 'CustomProviderError: proxy-secret-key rejected request\n'
         help_tail = "usage: pr-agent review [options]\n" + "option help\n" * 600
+        output = diagnostic + help_tail
+        redacted = output.strip().replace("proxy-secret-key", "[redacted]")
+        expected = redacted[:2000] + "\n...[omitted]...\n" + redacted[-2000:]
         for kwargs in ({"code": 1}, {"review": ""}, {"json_output": "not JSON"}):
             with self.subTest(kwargs=kwargs):
                 self.logs.clear()
                 with self.assertRaises(RuntimeError):
-                    self.run_review(self.auto_job(), stderr=response + diagnostic + help_tail, **kwargs)
-                detail = self.logs[-1][1]["detail"]
-                self.assertIn("RuntimeError", detail)
-                for private in ("proxy-secret-key", "private-request", "private-diff-content", "credential-from-diff"):
-                    self.assertNotIn(private, json.dumps(self.logs))
-                self.assertNotIn("option help", detail)
+                    self.run_review(self.auto_job(), stderr=output, **kwargs)
+                self.assertEqual(self.logs[-1][1]["detail"], expected)
+                self.assertNotIn("proxy-secret-key", json.dumps(self.logs))
                 self.assertEqual(self.posts, [])
                 self.assertEqual(self.dispatched, [])
                 self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
 
-    def test_failure_retains_provider_error_hints_without_response_data(self):
-        help_tail = "usage: pr-agent review [options]\n" + "option help\n" * 600
-        names = ("BadRequestError", "NotFoundError", "ContextWindowExceededError",
-                 "InternalServerError", "KeyError", "HTTPError", "HTTPStatusError")
-        for name in names:
-            with self.subTest(name=name):
-                self.logs.clear()
-                with self.assertRaises(RuntimeError):
-                    self.run_review(self.auto_job(), code=1,
-                                    stderr=f"{name}: private-response proxy-secret-key\n" + help_tail)
-                detail = self.logs[-1][1]["detail"]
-                self.assertIn(name, detail)
-                self.assertIn("untrusted", detail)
-                for private in ("private-response", "proxy-secret-key", "option help"):
-                    self.assertNotIn(private, json.dumps(self.logs))
-                self.assertEqual(self.posts, [])
-                self.assertEqual(self.dispatched, [])
-                self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
-
-    def test_failure_retains_single_colorized_traceback_hint(self):
-        traceback = ('Traceback (most recent call last):\n'
-                     '  File "review.py", line 1, in review\n'
-                     '\x1b[31mKeyError\x1b[0m: private-response proxy-secret-key\n')
-        for kwargs in ({"code": 1}, {"json_output": "not JSON"}):
-            with self.subTest(kwargs=kwargs):
-                self.logs.clear()
-                with self.assertRaises(RuntimeError):
-                    self.run_review(self.auto_job(), stderr=traceback, **kwargs)
-                self.assertEqual(self.logs[-1][1]["detail"],
-                                 "exception name hints (untrusted output): KeyError")
-                for private in ("private-response", "proxy-secret-key", "review.py"):
-                    self.assertNotIn(private, json.dumps(self.logs))
-                self.assertEqual(self.posts, [])
-                self.assertEqual(self.dispatched, [])
-                self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
-
-    def test_failure_withholds_unknown_names_and_messages(self):
-        for stderr in ("PrivateCustomerError: private-response", "usage: pr-agent review [options]"):
+    def test_failure_retains_unknown_errors_and_usage_text(self):
+        for stderr in ("CustomProviderError: request rejected", "usage: pr-agent review [options]"):
             with self.subTest(stderr=stderr):
                 self.logs.clear()
                 with self.assertRaises(RuntimeError):
                     self.run_review(self.auto_job(), code=7, stderr=stderr)
                 fields = self.logs[-1][1]
                 self.assertEqual(fields["code"], 7)
-                self.assertNotIn("PrivateCustomerError", json.dumps(self.logs))
-                self.assertNotIn("private-response", json.dumps(self.logs))
-                self.assertNotIn("usage:", fields["detail"])
+                self.assertEqual(fields["detail"], stderr)
+
+    def test_failure_detail_redacts_before_truncating(self):
+        key = "disposable-proxy-key"
+        stdout = "a" * 1995 + key + "b" * 100
+        stderr = "c" * 1995 + key + "d" * 100
+        redacted = (stdout + "\n" + stderr).replace(key, "[redacted]")
+        self.assertEqual(runner.pr_agent_failure_detail(stdout, stderr, key),
+                         redacted[:2000] + "\n...[omitted]...\n" + redacted[-2000:])
+
+    def test_failure_detail_truncation_boundary(self):
+        for size in (3999, 4000, 4001):
+            with self.subTest(size=size):
+                output = "a" * (size - 1) + "z"
+                expected = output if size <= 4000 else output[:2000] + "\n...[omitted]...\n" + output[-2000:]
+                self.assertEqual(runner.pr_agent_failure_detail(output, "", ""), expected)
+
+    def test_failure_detail_separates_streams_and_handles_empty_output(self):
+        self.assertEqual(runner.pr_agent_failure_detail("stdout", "stderr", ""), "stdout\nstderr")
+        self.assertEqual(runner.pr_agent_failure_detail(" \n", "\t", ""), "no process output")
 
     def test_invalid_structured_output_logs_redacted_failure_and_posts_nothing(self):
         for output in ('{"review":', 'not JSON', '[]', 'null', 'true', '42', '"text"'):

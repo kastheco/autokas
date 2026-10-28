@@ -2330,17 +2330,13 @@ def redact(text: str, secrets: tuple[str, ...]) -> str:
 
 
 def pr_agent_failure_detail(stdout: str, stderr: str, key: str) -> str:
-    """Return fixed-name hints from untrusted output, never messages or response artifacts."""
-    detail = redact(stdout + "\n" + stderr, (key,))
-    detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", detail)
-    allowed = ("APIConnectionError", "APITimeoutError", "AuthenticationError", "PermissionDeniedError",
-               "BadRequestError", "NotFoundError", "ContextWindowExceededError", "ContentPolicyViolationError",
-               "UnprocessableEntityError", "RateLimitError", "InternalServerError", "ServiceUnavailableError",
-               "APIError", "APIStatusError", "HTTPError", "HTTPStatusError", "TimeoutError",
-               "RuntimeError", "ValueError", "TypeError", "KeyError", "AttributeError",
-               "JSONDecodeError", "ParserError", "ScannerError")
-    found = [name for name in allowed if re.search(r"\b" + name + r":", detail)]
-    return "exception name hints (untrusted output): " + ", ".join(found) if found else "process output withheld"
+    """Keep PR-Agent diagnostics, redacting the key before truncating long output."""
+    detail = redact((stdout + "\n" + stderr).strip(), (key,))
+    if not detail:
+        return "no process output"
+    if len(detail) > 4000:
+        detail = detail[:2000] + "\n...[omitted]...\n" + detail[-2000:]
+    return detail
 
 
 def check_proxy_model(model_ref: str, key: str) -> None:
