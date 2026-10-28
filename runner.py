@@ -2329,16 +2329,6 @@ def redact(text: str, secrets: tuple[str, ...]) -> str:
     return text
 
 
-def pr_agent_failure_detail(stdout: str, stderr: str, key: str) -> str:
-    """Keep PR-Agent diagnostics, redacting the key before truncating long output."""
-    detail = redact((stdout + "\n" + stderr).strip(), (key,))
-    if not detail:
-        return "no process output"
-    if len(detail) > 4000:
-        detail = detail[:2000] + "\n...[omitted]...\n" + detail[-2000:]
-    return detail
-
-
 def check_proxy_model(model_ref: str, key: str) -> None:
     """Fail before any agent work unless the proxy serves the configured model."""
     provider, model = model_ref.split("/", 1)
@@ -2577,16 +2567,15 @@ def pr_review(job: dict[str, Any]) -> None:
                 raise RuntimeError("PR-Agent review timed out") from None
             review = output.read_text().strip() if output.is_file() else ""
             if result.returncode or not review or not structured.is_file():
-                detail = pr_agent_failure_detail(result.stdout, result.stderr, env["OPENAI__KEY"])
-                log("pr_review_failed", key=job["key"], model=model, code=result.returncode, detail=detail)
+                log("pr_review_failed", key=job["key"], model=model, code=result.returncode,
+                    reason="process_failed" if result.returncode else "missing_output")
                 raise RuntimeError(f"PR-Agent exited with {result.returncode} and {len(review)} review characters")
             try:
                 structured_review = json.loads(structured.read_text())
             except ValueError:
                 structured_review = None
             if not isinstance(structured_review, dict):
-                detail = pr_agent_failure_detail(result.stdout, result.stderr, env["OPENAI__KEY"])
-                log("pr_review_failed", key=job["key"], model=model, reason="invalid_json_output", detail=detail)
+                log("pr_review_failed", key=job["key"], model=model, reason="invalid_json_output")
                 raise RuntimeError("PR-Agent wrote invalid structured output")
             findings = pr_agent_findings(structured_review)
             rendered = structured_review.get("review") if isinstance(structured_review.get("review"), dict) else {}
