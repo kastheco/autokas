@@ -279,7 +279,7 @@ class PRReviewRunTests(unittest.TestCase):
     def run_review(self, job, pr=None, permission="write", code=0, stderr="", review="## PR Reviewer Guide",
                    head_after=HEAD, issues=None, comments=None, prior_merge_base=None,
                    checks_denied=False, diff="diff --git a/parser.py b/parser.py\n", compare_bases=None,
-                   json_output=None, note_error=None, review_checks=None):
+                   json_output=None, note_error=None, review_checks=None, stdout=""):
         """Run pr_review with GitHub and the checkout faked; PR-Agent writes `review` and `issues` to its outputs."""
         pulls = iter([copy.deepcopy(pr or PR), {**copy.deepcopy(pr or PR), "head": {**PR["head"], "sha": head_after}}])
 
@@ -312,7 +312,7 @@ class PRReviewRunTests(unittest.TestCase):
                 Path(args[args.index("--json-output") + 1]).write_text(
                     json_output if json_output is not None else json.dumps(
                         {"review": {"key_issues_to_review": ISSUES if issues is None else issues}}))
-            return subprocess.CompletedProcess(args, code, "", stderr)
+            return subprocess.CompletedProcess(args, code, stdout, stderr)
 
         def post(method, path, payload):
             if "/check-runs" in path:
@@ -1078,28 +1078,82 @@ class PRReviewRunTests(unittest.TestCase):
                                  ("DELETE", f"repos/{REPO}/issues/42/labels/autokas%3Afixing")])
         self.assertEqual(self.events(), ["label_set"])
 
-    def test_failed_or_empty_review_logs_redacted_output_and_posts_nothing(self):
-        leak = "key proxy-secret-key rejected"
-        for code, review in ((1, "## partial"), (0, "")):
-            with self.subTest(code=code), self.assertRaises(RuntimeError):
-                self.run_review(self.auto_job(), code=code, stderr=leak, review=review)
-            event, fields = self.logs[-1]
-            self.assertEqual(event, "pr_review_failed")
-            self.assertNotIn("proxy-secret-key", fields["detail"])
-            self.assertIn("[redacted]", fields["detail"])
-            self.assertEqual(self.posts, [])
+    def test_failed_review_keeps_process_output_out_of_logs_and_reports(self):
+        private = ('response_text: private diff and model response\n'
+                   'extra instructions: private prompt\n'
+                   'Authorization: Bearer other-provider-secret\nproxy-secret-key\n')
+        for stream in ("stdout", "stderr"):
+            for kwargs in ({"code": 7}, {"review": ""}, {"json_output": "not JSON"}):
+                with self.subTest(stream=stream, kwargs=kwargs):
+                    self.logs.clear()
+                    with self.assertRaises(RuntimeError) as raised:
+                        self.run_review(self.auto_job(), **{stream: private}, **kwargs)
+                    event, fields = self.logs[-1]
+                    self.assertEqual(event, "pr_review_failed")
+                    published = json.dumps([self.logs, self.checks, self.posts, self.dispatched, str(raised.exception)])
+                    for value in ("private diff", "private prompt", "other-provider-secret", "proxy-secret-key"):
+                        self.assertNotIn(value, published)
+                    self.assertEqual(fields["detail"], "PR-Agent output withheld")
+                    self.assertEqual(self.posts, [])
+                    self.assertEqual(self.dispatched, [])
+                    self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+                    if kwargs.get("code"):
+                        self.assertEqual(fields["code"], 7)
+                        self.assertEqual(fields["reason"], "process_failed")
+                    elif "review" in kwargs:
+                        self.assertEqual(fields["reason"], "missing_output")
+                    else:
+                        self.assertEqual(fields["reason"], "invalid_json_output")
 
-    def test_invalid_structured_output_logs_redacted_failure_and_posts_nothing(self):
+    def test_failure_hints_survive_help_without_exposing_private_output(self):
+        names = ("APIConnectionError", "APITimeoutError", "AuthenticationError", "PermissionDeniedError",
+                 "BadRequestError", "NotFoundError", "ContextWindowExceededError", "ContentPolicyViolationError",
+                 "UnprocessableEntityError", "RateLimitError", "InternalServerError", "ServiceUnavailableError",
+                 "APIError", "APIStatusError", "HTTPError", "HTTPStatusError", "TimeoutError",
+                 "RuntimeError", "ValueError", "TypeError", "KeyError", "AttributeError",
+                 "JSONDecodeError", "ParserError", "ScannerError")
+        private = "private response diff credential message"
+        for stream in ("stdout", "stderr"):
+            for kwargs in ({"code": 7}, {"review": ""}, {"json_output": "not JSON"}):
+                for name in names:
+                    with self.subTest(stream=stream, kwargs=kwargs, name=name):
+                        self.logs.clear()
+                        output = (f"response_text: {private}\n\x1b[31m{name}\x1b[0m: {private}\n"
+                                  f"{name}: duplicate\nproxy-secret-key\nUnknownPrivateError: {private}\n"
+                                  + "Usage: private help text\n" * 500)
+                        with self.assertRaises(RuntimeError):
+                            self.run_review(self.auto_job(), **{stream: output}, **kwargs)
+                        detail = self.logs[-1][1]["detail"]
+                        self.assertEqual(detail, f"untrusted PR-Agent exception-name hints: {name}")
+                        published = json.dumps([self.logs, self.checks, self.posts, self.dispatched])
+                        for value in (private, "proxy-secret-key", "UnknownPrivateError", "private help", "duplicate"):
+                            self.assertNotIn(value, published)
+                        self.assertEqual(self.posts, [])
+                        self.assertEqual(self.dispatched, [])
+                        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+
+    def test_failure_hints_redact_before_matching_and_deduplicate_across_streams(self):
+        with patch.dict(runner.os.environ, {"CLI_PROXY_API_KEY": "AuthenticationError:"}):
+            with self.assertRaises(RuntimeError):
+                self.run_review(self.auto_job(), code=7,
+                                stdout="AuthenticationError: private\nValueError: private\n",
+                                stderr="ValueError: private\nNotFoundError: private\nUnknownPrivateError: private")
+        detail = self.logs[-1][1]["detail"]
+        self.assertIn("untrusted", detail)
+        self.assertEqual(detail.count("ValueError"), 1)
+        self.assertEqual(detail.count("NotFoundError"), 1)
+        self.assertNotIn("AuthenticationError", detail)
+        self.assertNotIn("private", json.dumps(self.logs))
+
+    def test_invalid_structured_output_reports_failure_and_posts_nothing(self):
         for output in ('{"review":', 'not JSON', '[]', 'null', 'true', '42', '"text"'):
             with self.subTest(output=output):
                 self.logs.clear()
                 with self.assertRaisesRegex(RuntimeError, "invalid structured output"):
-                    self.run_review(self.auto_job(), json_output=output, stderr="proxy-secret-key rejected")
+                    self.run_review(self.auto_job(), json_output=output)
                 event, fields = self.logs[-1]
                 self.assertEqual(event, "pr_review_failed")
                 self.assertEqual(fields["reason"], "invalid_json_output")
-                self.assertNotIn("proxy-secret-key", fields["detail"])
-                self.assertIn("[redacted]", fields["detail"])
                 self.assertEqual(self.posts, [])
                 self.assertEqual(self.dispatched, [])
                 self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")

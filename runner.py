@@ -2329,6 +2329,20 @@ def redact(text: str, secrets: tuple[str, ...]) -> str:
     return text
 
 
+def pr_agent_failure_detail(stdout: str, stderr: str, key: str) -> str:
+    """Return fixed-name hints from untrusted output, never messages or response artifacts."""
+    detail = redact(stdout + "\n" + stderr, (key,))
+    detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", detail)
+    allowed = ("APIConnectionError", "APITimeoutError", "AuthenticationError", "PermissionDeniedError",
+               "BadRequestError", "NotFoundError", "ContextWindowExceededError", "ContentPolicyViolationError",
+               "UnprocessableEntityError", "RateLimitError", "InternalServerError", "ServiceUnavailableError",
+               "APIError", "APIStatusError", "HTTPError", "HTTPStatusError", "TimeoutError",
+               "RuntimeError", "ValueError", "TypeError", "KeyError", "AttributeError",
+               "JSONDecodeError", "ParserError", "ScannerError")
+    found = [name for name in allowed if re.search(r"\b" + name + r":", detail)]
+    return "untrusted PR-Agent exception-name hints: " + ", ".join(found) if found else "PR-Agent output withheld"
+
+
 def check_proxy_model(model_ref: str, key: str) -> None:
     """Fail before any agent work unless the proxy serves the configured model."""
     provider, model = model_ref.split("/", 1)
@@ -2567,16 +2581,17 @@ def pr_review(job: dict[str, Any]) -> None:
                 raise RuntimeError("PR-Agent review timed out") from None
             review = output.read_text().strip() if output.is_file() else ""
             if result.returncode or not review or not structured.is_file():
-                detail = redact((result.stdout + result.stderr).strip(), (env["OPENAI__KEY"],))
-                log("pr_review_failed", key=job["key"], model=model, code=result.returncode, detail=detail[-2000:])
+                log("pr_review_failed", key=job["key"], model=model, code=result.returncode,
+                    reason="process_failed" if result.returncode else "missing_output",
+                    detail=pr_agent_failure_detail(result.stdout, result.stderr, env["OPENAI__KEY"]))
                 raise RuntimeError(f"PR-Agent exited with {result.returncode} and {len(review)} review characters")
             try:
                 structured_review = json.loads(structured.read_text())
             except ValueError:
                 structured_review = None
             if not isinstance(structured_review, dict):
-                detail = redact((result.stdout + result.stderr).strip(), (env["OPENAI__KEY"],))
-                log("pr_review_failed", key=job["key"], model=model, reason="invalid_json_output", detail=detail[-2000:])
+                log("pr_review_failed", key=job["key"], model=model, reason="invalid_json_output",
+                    detail=pr_agent_failure_detail(result.stdout, result.stderr, env["OPENAI__KEY"]))
                 raise RuntimeError("PR-Agent wrote invalid structured output")
             findings = pr_agent_findings(structured_review)
             rendered = structured_review.get("review") if isinstance(structured_review.get("review"), dict) else {}
