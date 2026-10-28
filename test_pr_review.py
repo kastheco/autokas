@@ -1086,22 +1086,22 @@ class PRReviewRunTests(unittest.TestCase):
             event, fields = self.logs[-1]
             self.assertEqual(event, "pr_review_failed")
             self.assertNotIn("proxy-secret-key", fields["detail"])
-            self.assertIn("[redacted]", fields["detail"])
             self.assertEqual(self.posts, [])
 
-    def test_failure_keeps_exception_before_help_tail_without_leaking_key(self):
-        diagnostic = "RuntimeError: proxy-secret-key rejected the review request\n"
+    def test_failure_discards_response_content_before_help_tail(self):
+        diagnostic = 'RuntimeError: proxy-secret-key rejected private-request\n'
+        response = '{"response_text": "private-diff-content credential-from-diff"}\n'
         help_tail = "usage: pr-agent review [options]\n" + "option help\n" * 600
         for kwargs in ({"code": 1}, {"review": ""}, {"json_output": "not JSON"}):
             with self.subTest(kwargs=kwargs):
                 self.logs.clear()
                 with self.assertRaises(RuntimeError):
-                    self.run_review(self.auto_job(), stderr=diagnostic + help_tail, **kwargs)
+                    self.run_review(self.auto_job(), stderr=response + diagnostic + help_tail, **kwargs)
                 detail = self.logs[-1][1]["detail"]
-                self.assertIn("RuntimeError: [redacted] rejected the review request", detail)
-                self.assertTrue(detail.endswith("option help"))
-                self.assertLessEqual(len(detail), 4100)
-                self.assertNotIn("proxy-secret-key", json.dumps(self.logs))
+                self.assertIn("RuntimeError", detail)
+                for private in ("proxy-secret-key", "private-request", "private-diff-content", "credential-from-diff"):
+                    self.assertNotIn(private, json.dumps(self.logs))
+                self.assertNotIn("option help", detail)
                 self.assertEqual(self.posts, [])
                 self.assertEqual(self.dispatched, [])
                 self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
@@ -1116,7 +1116,6 @@ class PRReviewRunTests(unittest.TestCase):
                 self.assertEqual(event, "pr_review_failed")
                 self.assertEqual(fields["reason"], "invalid_json_output")
                 self.assertNotIn("proxy-secret-key", fields["detail"])
-                self.assertIn("[redacted]", fields["detail"])
                 self.assertEqual(self.posts, [])
                 self.assertEqual(self.dispatched, [])
                 self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")

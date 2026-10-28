@@ -2330,11 +2330,12 @@ def redact(text: str, secrets: tuple[str, ...]) -> str:
 
 
 def pr_agent_failure_detail(stdout: str, stderr: str, key: str) -> str:
-    """Keep leading diagnostics and final output without logging the proxy key."""
-    detail = redact((stdout + "\n" + stderr).strip(), (key,))
-    if len(detail) > 4000:
-        return detail[:2000] + "\n... output omitted ...\n" + detail[-2000:]
-    return detail
+    """Keep only fixed exception names, never response artifacts or exception messages."""
+    detail = redact(stdout + "\n" + stderr, (key,))
+    allowed = ("APIConnectionError", "AuthenticationError", "RateLimitError", "TimeoutError",
+               "RuntimeError", "ValueError", "JSONDecodeError", "ParserError", "ScannerError")
+    found = [name for name in allowed if re.search(r"\b" + name + r":", detail)]
+    return "exception types: " + ", ".join(found) if found else "process output withheld"
 
 
 def check_proxy_model(model_ref: str, key: str) -> None:
