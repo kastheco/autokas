@@ -296,6 +296,27 @@ class ReviewIntakeTests(unittest.TestCase):
         assert job is not None
         self.assertEqual(job["prompt"], "Fix the validated scope mismatch.")
 
+    def test_picture_and_definition_list_prompts_start_finding_jobs(self) -> None:
+        icon = '<picture><source srcset="dark.svg"><img src="bot.svg"></picture>'
+        for heading in ("Prompt for AI Agents", "Prompt to fix review comments"):
+            for kind in ("pull_request_review", "pull_request_review_comment"):
+                event = review_event()
+                source = event["review"]
+                source["body"] = (
+                    "<details><summary>Proposed change</summary>\n\n```diff\n"
+                    "+unrelated suggestion\n```\n</details>\n"
+                    f"<details>\n<summary>{icon} {heading}</summary>\n<dl>\n<dd>\n\n"
+                    "```\nKeep cancellation accessible.\n```\n\n</dd>\n</dl>\n</details>"
+                )
+                if kind == "pull_request_review_comment":
+                    event["action"] = "created"
+                    event["comment"] = event.pop("review")
+                with self.subTest(heading=heading, kind=kind):
+                    job = event_job(kind, event)
+                    self.assertIsNotNone(job)
+                    assert job is not None
+                    self.assertEqual(job["prompt"], "Keep cancellation accessible.")
+
     def test_aggregate_does_not_duplicate_individual_findings(self) -> None:
         body = section("Prompt for AI Agents", "Fix finding A.")
         body += section("Prompt for AI Agents", "Fix finding B.")
