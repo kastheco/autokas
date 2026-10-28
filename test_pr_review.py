@@ -1093,7 +1093,7 @@ class PRReviewRunTests(unittest.TestCase):
                     published = json.dumps([self.logs, self.checks, self.posts, self.dispatched, str(raised.exception)])
                     for value in ("private diff", "private prompt", "other-provider-secret", "proxy-secret-key"):
                         self.assertNotIn(value, published)
-                    self.assertNotIn("detail", fields)
+                    self.assertEqual(fields["detail"], "PR-Agent output withheld")
                     self.assertEqual(self.posts, [])
                     self.assertEqual(self.dispatched, [])
                     self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
@@ -1104,6 +1104,46 @@ class PRReviewRunTests(unittest.TestCase):
                         self.assertEqual(fields["reason"], "missing_output")
                     else:
                         self.assertEqual(fields["reason"], "invalid_json_output")
+
+    def test_failure_hints_survive_help_without_exposing_private_output(self):
+        names = ("APIConnectionError", "APITimeoutError", "AuthenticationError", "PermissionDeniedError",
+                 "BadRequestError", "NotFoundError", "ContextWindowExceededError", "ContentPolicyViolationError",
+                 "UnprocessableEntityError", "RateLimitError", "InternalServerError", "ServiceUnavailableError",
+                 "APIError", "APIStatusError", "HTTPError", "HTTPStatusError", "TimeoutError",
+                 "RuntimeError", "ValueError", "TypeError", "KeyError", "AttributeError",
+                 "JSONDecodeError", "ParserError", "ScannerError")
+        private = "private response diff credential message"
+        for stream in ("stdout", "stderr"):
+            for kwargs in ({"code": 7}, {"review": ""}, {"json_output": "not JSON"}):
+                for name in names:
+                    with self.subTest(stream=stream, kwargs=kwargs, name=name):
+                        self.logs.clear()
+                        output = (f"response_text: {private}\n\x1b[31m{name}\x1b[0m: {private}\n"
+                                  f"{name}: duplicate\nproxy-secret-key\nUnknownPrivateError: {private}\n"
+                                  + "Usage: private help text\n" * 500)
+                        with self.assertRaises(RuntimeError):
+                            self.run_review(self.auto_job(), **{stream: output}, **kwargs)
+                        detail = self.logs[-1][1]["detail"]
+                        self.assertEqual(detail, f"untrusted PR-Agent exception-name hints: {name}")
+                        published = json.dumps([self.logs, self.checks, self.posts, self.dispatched])
+                        for value in (private, "proxy-secret-key", "UnknownPrivateError", "private help", "duplicate"):
+                            self.assertNotIn(value, published)
+                        self.assertEqual(self.posts, [])
+                        self.assertEqual(self.dispatched, [])
+                        self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+
+    def test_failure_hints_redact_before_matching_and_deduplicate_across_streams(self):
+        with patch.dict(runner.os.environ, {"CLI_PROXY_API_KEY": "AuthenticationError:"}):
+            with self.assertRaises(RuntimeError):
+                self.run_review(self.auto_job(), code=7,
+                                stdout="AuthenticationError: private\nValueError: private\n",
+                                stderr="ValueError: private\nNotFoundError: private\nUnknownPrivateError: private")
+        detail = self.logs[-1][1]["detail"]
+        self.assertIn("untrusted", detail)
+        self.assertEqual(detail.count("ValueError"), 1)
+        self.assertEqual(detail.count("NotFoundError"), 1)
+        self.assertNotIn("AuthenticationError", detail)
+        self.assertNotIn("private", json.dumps(self.logs))
 
     def test_invalid_structured_output_reports_failure_and_posts_nothing(self):
         for output in ('{"review":', 'not JSON', '[]', 'null', 'true', '42', '"text"'):
