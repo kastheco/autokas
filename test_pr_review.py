@@ -1106,6 +1106,37 @@ class PRReviewRunTests(unittest.TestCase):
                 self.assertEqual(self.dispatched, [])
                 self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
 
+    def test_failure_retains_provider_error_hints_without_response_data(self):
+        help_tail = "usage: pr-agent review [options]\n" + "option help\n" * 600
+        names = ("BadRequestError", "NotFoundError", "ContextWindowExceededError",
+                 "InternalServerError", "KeyError", "HTTPError", "HTTPStatusError")
+        for name in names:
+            with self.subTest(name=name):
+                self.logs.clear()
+                with self.assertRaises(RuntimeError):
+                    self.run_review(self.auto_job(), code=1,
+                                    stderr=f"{name}: private-response proxy-secret-key\n" + help_tail)
+                detail = self.logs[-1][1]["detail"]
+                self.assertIn(name, detail)
+                self.assertIn("untrusted", detail)
+                for private in ("private-response", "proxy-secret-key", "option help"):
+                    self.assertNotIn(private, json.dumps(self.logs))
+                self.assertEqual(self.posts, [])
+                self.assertEqual(self.dispatched, [])
+                self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+
+    def test_failure_withholds_unknown_names_and_messages(self):
+        for stderr in ("PrivateCustomerError: private-response", "usage: pr-agent review [options]"):
+            with self.subTest(stderr=stderr):
+                self.logs.clear()
+                with self.assertRaises(RuntimeError):
+                    self.run_review(self.auto_job(), code=7, stderr=stderr)
+                fields = self.logs[-1][1]
+                self.assertEqual(fields["code"], 7)
+                self.assertNotIn("PrivateCustomerError", json.dumps(self.logs))
+                self.assertNotIn("private-response", json.dumps(self.logs))
+                self.assertNotIn("usage:", fields["detail"])
+
     def test_invalid_structured_output_logs_redacted_failure_and_posts_nothing(self):
         for output in ('{"review":', 'not JSON', '[]', 'null', 'true', '42', '"text"'):
             with self.subTest(output=output):

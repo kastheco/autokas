@@ -2330,12 +2330,16 @@ def redact(text: str, secrets: tuple[str, ...]) -> str:
 
 
 def pr_agent_failure_detail(stdout: str, stderr: str, key: str) -> str:
-    """Keep only fixed exception names, never response artifacts or exception messages."""
+    """Return fixed-name hints from untrusted output, never messages or response artifacts."""
     detail = redact(stdout + "\n" + stderr, (key,))
-    allowed = ("APIConnectionError", "AuthenticationError", "RateLimitError", "TimeoutError",
-               "RuntimeError", "ValueError", "JSONDecodeError", "ParserError", "ScannerError")
+    allowed = ("APIConnectionError", "APITimeoutError", "AuthenticationError", "PermissionDeniedError",
+               "BadRequestError", "NotFoundError", "ContextWindowExceededError", "ContentPolicyViolationError",
+               "UnprocessableEntityError", "RateLimitError", "InternalServerError", "ServiceUnavailableError",
+               "APIError", "APIStatusError", "HTTPError", "HTTPStatusError", "TimeoutError",
+               "RuntimeError", "ValueError", "TypeError", "KeyError", "AttributeError",
+               "JSONDecodeError", "ParserError", "ScannerError")
     found = [name for name in allowed if re.search(r"\b" + name + r":", detail)]
-    return "exception types: " + ", ".join(found) if found else "process output withheld"
+    return "exception name hints (untrusted output): " + ", ".join(found) if found else "process output withheld"
 
 
 def check_proxy_model(model_ref: str, key: str) -> None:
