@@ -407,6 +407,89 @@ class FixLifecycleTests(unittest.TestCase):
 
 
 class WebhookIntakeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_signed_coderabbit_formats_queue_one_scoped_fixer(self):
+        for wrapped in (False, True):
+            for inline_first in (False, True):
+                with self.subTest(wrapped=wrapped, inline_first=inline_first):
+                    api = GateGitHub()
+                    api.review["body"] = "No aggregate prompt."
+                    prompts = ["Fix the empty-input parsing boundary.",
+                               "Preserve the trailing delimiter.", "Handle a third boundary."]
+                    shell = "```sh\ntouch /should-not-run-from-review\n```"
+                    for comment, prompt in zip(api.findings, prompts):
+                        if wrapped:
+                            comment["body"] = (
+                                "<details><summary>Shell example</summary>\n\n" + shell + "\n</details>\n"
+                                '<details>\n<summary><picture><source srcset="dark.svg">'
+                                '<img src="bot.svg"></picture> Prompt for AI Agents</summary>\n'
+                                "<dl>\n<dd>\n\n```\n" + prompt + "\n```\n\n</dd>\n</dl>\n</details>"
+                            )
+                    deliveries = [("pull_request_review", api.review)]
+                    inline = [("pull_request_review_comment", c) for c in api.findings]
+                    deliveries = (inline + deliveries if inline_first else deliveries + inline) * 2
+                    store = PendingStore()
+                    claims = Mock(wraps=store)
+                    claims.put.aio = AsyncMock(side_effect=store.put)
+                    claims.get.aio = AsyncMock(side_effect=store.get)
+                    claims.pop.aio = AsyncMock(side_effect=store.pop)
+                    queued, fixes = [], []
+                    with patch.dict(os.environ, GITHUB_WEBHOOK_SECRET="test-secret"), \
+                            patch.dict(runner.CONFIG, allowed_owners=[REPO.split("/")[0]]), \
+                            patch.object(runner, "CLAIMS", claims), \
+                            patch.object(runner, "github_token", return_value="test"), \
+                            patch.object(runner.urllib.request, "urlopen", api), \
+                            patch.object(runner.subprocess, "run", side_effect=AssertionError("review ran a command")), \
+                            patch.object(runner.worker, "spawn") as spawn, \
+                            patch.object(runner, "PRWorker") as pool:
+                        spawn.aio = AsyncMock(side_effect=lambda job: (
+                            queued.append(copy.deepcopy(job)) or Mock(object_id="queued")))
+                        pool.return_value.run.spawn.side_effect = lambda job: (
+                            fixes.append(copy.deepcopy(job)) or Mock(object_id="fixer"))
+                        for kind, source in deliveries:
+                            raw = json.dumps(event(kind, source)).encode()
+                            request = Mock(body=AsyncMock(return_value=raw), headers={
+                                "x-github-event": kind,
+                                "x-hub-signature-256": "sha256=" + hmac.new(
+                                    b"test-secret", raw, hashlib.sha256).hexdigest()})
+                            response = await runner.webhook.local(request)
+                            if kind == "pull_request_review":
+                                self.assertEqual(json.loads(response.body)["status"], "ignored")
+                            else:
+                                self.assertEqual(json.loads(response.body)["status"], "accepted")
+                        for job in queued:
+                            runner.worker.local(job)
+                    self.assertEqual(len(fixes), 1)
+                    self.assertEqual((fixes[0]["repo"], fixes[0]["pr"], fixes[0]["reviewer"]),
+                                     (REPO, 42, "coderabbit"))
+                    self.assertEqual({target["comment"] for target in fixes[0]["targets"]}, {123, 124, 125})
+                    self.assertEqual(fixes[0]["prompt"], "\n\n".join(prompts))
+                    self.assertEqual(api.comments, [])
+
+    async def test_signed_wrapped_comment_requires_trusted_author_and_sender(self):
+        for identity in ("sender", "author"):
+            with self.subTest(identity=identity):
+                payload = event("pull_request_review_comment", COMMENTS[0])
+                payload["comment"]["body"] = (
+                    '<details>\n<summary><picture><img src="bot.svg"></picture> '
+                    "Prompt for AI Agents</summary>\n<dl><dd>\n```\n"
+                    "Fix the empty-input parsing boundary.\n```\n</dd></dl></details>"
+                )
+                user = payload["sender"] if identity == "sender" else payload["comment"]["user"]
+                user["id"] = 1
+                raw = json.dumps(payload).encode()
+                request = Mock(body=AsyncMock(return_value=raw), headers={
+                    "x-github-event": "pull_request_review_comment",
+                    "x-hub-signature-256": "sha256=" + hmac.new(
+                        b"test-secret", raw, hashlib.sha256).hexdigest()})
+                with patch.dict(os.environ, GITHUB_WEBHOOK_SECRET="test-secret"), \
+                        patch.dict(runner.CONFIG, allowed_owners=[REPO.split("/")[0]]), \
+                        patch.object(runner, "CLAIMS") as claims, \
+                        patch.object(runner.worker, "spawn") as spawn:
+                    response = await runner.webhook.local(request)
+                self.assertEqual(json.loads(response.body)["status"], "ignored")
+                claims.put.aio.assert_not_called()
+                spawn.aio.assert_not_called()
+
     async def test_webhook_has_no_github_calls_and_failed_spawn_can_be_redelivered(self):
         payload = event("pull_request_review", REVIEW)
         raw = json.dumps(payload).encode()

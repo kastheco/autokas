@@ -331,6 +331,8 @@ export MODAL_ENVIRONMENT=main
 
 the script uses Python 3's stdlib venv and installs `requirements.txt` into `.venv`. it needs no `uv`, Modal tokens or GitHub tokens. it copies the example config only when `config.json` is absent and skips installation on repeat runs with unchanged requirements. use `.venv/bin/python` for the scoped test commands below, or `.venv/bin/python -m unittest discover -v` for full discovery. deployment setup still uses the `uv` steps above.
 
+`MODAL_ENVIRONMENT=main .venv/bin/python -m unittest test_fix_lifecycle.WebhookIntakeTests -v` exercises signed CodeRabbit deliveries through the receiver and canonical review dispatcher. it covers legacy and picture/definition-list prompts, both delivery orders, duplicate deliveries, three exact inline targets, unrelated shell fences, and spoofed author or sender IDs. GitHub transport, Modal storage and worker launches are local fakes. this does not prove live GitHub delivery, a deployed Modal queue or fixer execution.
+
 ## one live verification path
 
 1. select an approved repository and an open PR with an authorized publication scope. ensure the App is installed on it and the App webhook is active. core business-logic changes require real Jarvis consultation; only a business-intent mismatch needs explicit owner approval.
