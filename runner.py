@@ -2332,6 +2332,7 @@ def redact(text: str, secrets: tuple[str, ...]) -> str:
 def pr_agent_failure_detail(stdout: str, stderr: str, key: str) -> str:
     """Return fixed-name hints from untrusted output, never messages or response artifacts."""
     detail = redact(stdout + "\n" + stderr, (key,))
+    detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", detail)
     allowed = ("APIConnectionError", "APITimeoutError", "AuthenticationError", "PermissionDeniedError",
                "BadRequestError", "NotFoundError", "ContextWindowExceededError", "ContentPolicyViolationError",
                "UnprocessableEntityError", "RateLimitError", "InternalServerError", "ServiceUnavailableError",

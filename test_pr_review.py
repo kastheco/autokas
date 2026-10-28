@@ -1125,6 +1125,23 @@ class PRReviewRunTests(unittest.TestCase):
                 self.assertEqual(self.dispatched, [])
                 self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
 
+    def test_failure_retains_single_colorized_traceback_hint(self):
+        traceback = ('Traceback (most recent call last):\n'
+                     '  File "review.py", line 1, in review\n'
+                     '\x1b[31mKeyError\x1b[0m: private-response proxy-secret-key\n')
+        for kwargs in ({"code": 1}, {"json_output": "not JSON"}):
+            with self.subTest(kwargs=kwargs):
+                self.logs.clear()
+                with self.assertRaises(RuntimeError):
+                    self.run_review(self.auto_job(), stderr=traceback, **kwargs)
+                self.assertEqual(self.logs[-1][1]["detail"],
+                                 "exception name hints (untrusted output): KeyError")
+                for private in ("private-response", "proxy-secret-key", "review.py"):
+                    self.assertNotIn(private, json.dumps(self.logs))
+                self.assertEqual(self.posts, [])
+                self.assertEqual(self.dispatched, [])
+                self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+
     def test_failure_withholds_unknown_names_and_messages(self):
         for stderr in ("PrivateCustomerError: private-response", "usage: pr-agent review [options]"):
             with self.subTest(stderr=stderr):
