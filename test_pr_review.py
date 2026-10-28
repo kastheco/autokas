@@ -1089,6 +1089,23 @@ class PRReviewRunTests(unittest.TestCase):
             self.assertIn("[redacted]", fields["detail"])
             self.assertEqual(self.posts, [])
 
+    def test_failure_keeps_exception_before_help_tail_without_leaking_key(self):
+        diagnostic = "RuntimeError: proxy-secret-key rejected the review request\n"
+        help_tail = "usage: pr-agent review [options]\n" + "option help\n" * 600
+        for kwargs in ({"code": 1}, {"review": ""}, {"json_output": "not JSON"}):
+            with self.subTest(kwargs=kwargs):
+                self.logs.clear()
+                with self.assertRaises(RuntimeError):
+                    self.run_review(self.auto_job(), stderr=diagnostic + help_tail, **kwargs)
+                detail = self.logs[-1][1]["detail"]
+                self.assertIn("RuntimeError: [redacted] rejected the review request", detail)
+                self.assertTrue(detail.endswith("option help"))
+                self.assertLessEqual(len(detail), 4100)
+                self.assertNotIn("proxy-secret-key", json.dumps(self.logs))
+                self.assertEqual(self.posts, [])
+                self.assertEqual(self.dispatched, [])
+                self.assertEqual(self.checks[-1][2]["conclusion"], "neutral")
+
     def test_invalid_structured_output_logs_redacted_failure_and_posts_nothing(self):
         for output in ('{"review":', 'not JSON', '[]', 'null', 'true', '42', '"text"'):
             with self.subTest(output=output):
