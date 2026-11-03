@@ -1800,6 +1800,44 @@ class FixPublicationTests(unittest.TestCase):
         self.assertIn("preempted", self.claims[receipt]["reason"])
         self.assertEqual(self.git(["show", f"{self.remote_head}:parser.py"], self.origin), "result = 'fixed'")
 
+    def test_preemption_after_earlier_handling_reconciles_without_replaying_omp(self):
+        outcome = self.earlier_fix()
+        finalized = self.finalizations()
+        self.queued_receipt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fix("handled", prior_outcome=outcome, preempted=True)
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(finalized, ["fixed"])
+        self.assertEqual(len(self.smoke.launches), 1)
+        self.assertEqual(self.dispatched, [])
+        self.assertFalse(any(call.args[0] == "POST" for call in self.requests.call_args_list))
+        self.assertEqual(self.git(["rev-parse", f"refs/heads/{PR['head']['ref']}"], self.origin), self.fix_head)
+
+    def test_preemption_after_no_op_outcome_rechecks_evidence_before_finalizing(self):
+        outcome = self.earlier_fix()
+        finalized = self.finalizations()
+        self.queued_receipt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fix("handled", prior_outcome=outcome, preempted=True)
+        outcomes = [{"body": "### ↩️ already fixed · no changes\n\n" + runner.fix_outcome_marker(self.job),
+                     "user": {"login": "autokas[bot]", "id": 334744567}}]
+        self.run_fix("handled", prior_outcome=outcome, outcomes=outcomes)
+        self.assertEqual(finalized, ["fixed"])
+        self.assertEqual(len(self.smoke.launches), 1)
+        self.assertEqual(self.dispatched, [])
+
+    def test_preempted_no_op_without_publication_receipt_stays_blocked(self):
+        outcome = self.earlier_fix()
+        finalized = self.finalizations()
+        self.queued_receipt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fix("handled", prior_outcome=outcome, preempted=True)
+        del self.claims[f"fix:{REPO}:42:{self.fix_head}"]
+        self.run_fix("handled", prior_outcome=outcome)
+        self.assertEqual(finalized, ["blocked"])
+        self.assertEqual(len(self.smoke.launches), 1)
+        self.assertEqual(self.dispatched, [])
+
     def test_preemption_after_publication_finalizes_without_rerunning_omp(self):
         finalized = self.finalizations()
         self.queued_receipt()

@@ -1776,14 +1776,14 @@ def finding_keys(job: dict[str, Any]) -> list[str]:
 
 
 def already_handled_confirmed(job: dict[str, Any], pr: dict[str, Any], branch: str,
-                              evidence_file: Path, started_at: float) -> bool:
+                              evidence_file: Path | str, started_at: float) -> bool:
     """Accept an earlier bot outcome only while its published fixed tree is unchanged."""
     repo, number = job["repo"], job["pr"]
     try:
         if (pr.get("state") != "open" or (pr["head"].get("repo") or {}).get("full_name") != repo
                 or pr["head"]["ref"] != branch):
             return False
-        evidence = json.loads(evidence_file.read_text())
+        evidence = json.loads(evidence_file.read_text() if isinstance(evidence_file, Path) else evidence_file)
         comment_id = evidence["outcome_comment_id"]
         if type(comment_id) is not int or comment_id <= 0:
             return False
@@ -3240,13 +3240,18 @@ def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict
     head, remote_head = started["head"], pr["head"]["sha"]
     marker = fix_outcome_marker(job)
     outcome, _ = delivered_outcome(job, marker)
-    if outcome is None and remote_head == head:
+    no_op = started.get("already_handled")
+    if outcome is None and remote_head == head and no_op is None:
         return False
     # As after a normal exit, only a descendant of the start head confirms publication.
     published = remote_head != head and github(f"repos/{repo}/compare/{head}...{remote_head}")["status"] == "ahead"
     reported = (OUTCOME_HEADINGS[re.match(r"^### (✅|🚫|⛔|❓|↩️) ", outcome["body"]).group(1)]
                 if outcome else "")
-    state = fix_state(0, published, reported)
+    if not reported and no_op is not None:
+        reported = "already handled"
+    handled = (reported == "already handled" and remote_head == head and isinstance(no_op, dict)
+               and already_handled_confirmed(job, pr, started["branch"], no_op["evidence"], started["started_at"]))
+    state = fix_state(0, published, reported, handled)
     log("preempted_fix_reconciled", repo=repo, pr=number, key=job["key"], starting_head=head,
         remote_head=remote_head, published=published, outcome=reported or None, state=state)
     if published and reported == "published" and outcome is not None:
@@ -3265,7 +3270,7 @@ def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict
     if published:
         dispatch_fix_followup(job, comment, remote_head)
     commit = f"[`{remote_head[:7]}`](https://github.com/{repo}/commit/{remote_head})"
-    if outcome is None:
+    if outcome is None and not handled:
         links = " · ".join(f"[{title}]({url})" for title, url in run_links(job).items())
         publish_missing_outcome(job, marker,
             "### ⛔ blocked · fixer was preempted "
@@ -3273,7 +3278,9 @@ def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict
             + f", without an outcome · {commit}\n\n"
             f"start head: `{head}` · remote head: `{remote_head}`. autokas didn't run omp again."
             + (f"\n\n<sub>{links}</sub>" if links else ""))
-    if outcome is not None:
+    if handled:
+        detail = "after it reported earlier handling. autokas verified the earlier fix again"
+    elif outcome is not None:
         detail = "after it reported its outcome. autokas finalized from that outcome"
     elif published:
         detail = f"after it published {remote_head[:7]} but before it reported an outcome. autokas kept the fix"
@@ -3594,7 +3601,8 @@ class PRWorker:
                 if job.get("fix_receipt"):
                     # A redelivery after this point must reconcile publication from this head
                     # instead of running omp again blindly.
-                    CLAIMS.put("started:" + job["key"], {"call": call_id, "state": "executing", "head": head})
+                    CLAIMS.put("started:" + job["key"], {"call": call_id, "state": "executing", "head": head,
+                                                        "branch": branch, "started_at": started_at})
                 process = subprocess.Popen(args, cwd=worktree, env=env, start_new_session=True)
                 try:
                     code = process.wait(timeout=max(1, deadline - time.monotonic()))
@@ -3680,6 +3688,21 @@ class PRWorker:
                 # Finalizing here would mark the execution finished and turn that redelivery
                 # into a rejected duplicate, so recovery belongs to the redelivered run.
                 interrupted = True
+                if job.get("fix_receipt"):
+                    # The temporary worktree is removed on exit. retain only the no-op report's
+                    # evidence, which recovery must verify again rather than trusting its claim.
+                    try:
+                        no_op_reported = (root / "outcome.txt").read_text(encoding="utf-8", errors="replace").strip().lower() == "already handled"
+                    except OSError:
+                        no_op_reported = False
+                    if no_op_reported:
+                        try:
+                            evidence = (root / "outcome-evidence.json").read_text()
+                        except (OSError, UnicodeError):
+                            evidence = ""
+                        saved = CLAIMS.get("started:" + job["key"], {})
+                        saved["already_handled"] = {"evidence": evidence}
+                        CLAIMS.put("started:" + job["key"], saved)
                 report_fix_progress(job, "fixer preempted, waiting for Modal to restart it",
                                     "Modal preempted the fixer. the redelivered run checks the PR for "
                                     "published work before it restarts the fixer or reports the outcome.")
