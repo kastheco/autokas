@@ -1868,8 +1868,26 @@ class FixPublicationTests(unittest.TestCase):
         self.assertNotIn(f"fix:{REPO}:42:{self.remote_head}", self.claims)
         self.assertEqual([job["head"] for job in self.dispatched], [self.remote_head])
 
+    def test_preemption_after_branch_rewrite_blocks_dropped_fix(self):
+        finalized = self.finalizations()
+        self.queued_receipt()
+        outcomes = []
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fix("exact", preempted=True, outcomes=outcomes)
+        outcomes[0]["body"] += '\n<!-- omp-runner:fix ' + json.dumps({
+            "commit": self.fix_head, "findings": runner.finding_keys(self.job)}) + ' -->'
+        replacement = self.git(["rev-parse", "parent"], self.parent)
+        self.git(["fetch", str(self.parent), replacement], self.origin)
+        self.git(["update-ref", f"refs/heads/{PR['head']['ref']}", replacement], self.origin)
+        self.run_fix("exact", outcomes=outcomes)
+        self.assertEqual(finalized, ["blocked"])
+        self.assertEqual(len(self.smoke.launches), 1)
+        self.assertEqual([job["head"] for job in self.dispatched], [replacement])
+        self.assertNotIn(f"fix:{REPO}:42:{self.fix_head}", self.claims)
+        self.assertEqual(self.git(["show", f"{replacement}:parser.py"], self.origin), "result = 'broken'")
+
     def test_recovery_does_not_record_unconfirmed_outcome_commits(self):
-        self.finalizations()
+        finalized = self.finalizations()
         self.queued_receipt()
         outcomes = []
         with self.assertRaises(KeyboardInterrupt):
@@ -1889,11 +1907,14 @@ class FixPublicationTests(unittest.TestCase):
         ]
         for status, fix_marker in cases:
             with self.subTest(status=status, marker=fix_marker):
+                finalized.clear()
                 self.claims = copy.deepcopy(interrupted_claims)
                 self.job = copy.deepcopy(interrupted_job)
                 outcomes[0]["body"] = f"### {status} outcome\n{runner.fix_outcome_marker(self.job)}\n{fix_marker}"
                 self.run_fix("exact", outcomes=outcomes)
                 self.assertFalse(any(key.startswith("fix:") for key in self.claims))
+                if status == "✅":
+                    self.assertEqual(finalized, ["blocked"])
                 self.assertEqual([job["head"] for job in self.dispatched], [self.fix_head])
 
     def test_preemption_after_push_without_outcome_reports_instead_of_rerunning(self):

@@ -3253,9 +3253,7 @@ def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict
         reported = "already handled"
     handled = (reported == "already handled" and remote_head == head and isinstance(no_op, dict)
                and already_handled_confirmed(job, pr, started["branch"], no_op["evidence"], started["started_at"]))
-    state = fix_state(0, published, reported, handled)
-    log("preempted_fix_reconciled", repo=repo, pr=number, key=job["key"], starting_head=head,
-        remote_head=remote_head, published=published, outcome=reported or None, state=state)
+    fix_contained = False
     if published and reported == "published" and outcome is not None:
         markers = re.findall(r"<!-- omp-runner:fix (\{[^\n]*\}) -->", outcome["body"])
         if len(markers) == 1:
@@ -3264,11 +3262,16 @@ def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict
             except ValueError:
                 marker_data = None
             fix_commit = marker_data.get("commit") if isinstance(marker_data, dict) else None
-            if (isinstance(fix_commit, str) and re.fullmatch(r"[0-9a-f]{40}", fix_commit)
-                    and github(f"repos/{repo}/compare/{fix_commit}...{remote_head}")["status"]
-                    in {"ahead", "identical"}):
+            fix_contained = (isinstance(fix_commit, str) and re.fullmatch(r"[0-9a-f]{40}", fix_commit) is not None
+                             and github(f"repos/{repo}/compare/{fix_commit}...{remote_head}")["status"]
+                             in {"ahead", "identical"})
+            if fix_contained:
                 CLAIMS.put(f"fix:{repo}:{number}:{fix_commit}", {
                     "branch": pr["head"]["ref"], "findings": finding_keys(job)}, skip_if_exists=True)
+    state = ("blocked" if reported == "published" and not fix_contained
+             else fix_state(0, published, reported, handled))
+    log("preempted_fix_reconciled", repo=repo, pr=number, key=job["key"], starting_head=head,
+        remote_head=remote_head, published=published, outcome=reported or None, state=state)
     if published:
         dispatch_fix_followup(job, comment, remote_head)
     commit = f"[`{remote_head[:7]}`](https://github.com/{repo}/commit/{remote_head})"

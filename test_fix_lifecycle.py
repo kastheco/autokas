@@ -475,7 +475,8 @@ class FixLifecycleTests(unittest.TestCase):
                 raise RuntimeError("dispatch unavailable")
             return start_review(review)
 
-        with patch.object(runner, "delivered_outcome", return_value=({"body": "### ✅ fixed"}, None)), \
+        outcome = {"body": '### ✅ fixed\n<!-- omp-runner:fix ' + json.dumps({"commit": head}) + ' -->'}
+        with patch.object(runner, "delivered_outcome", return_value=(outcome, None)), \
                 patch.object(runner, "github", side_effect=published), \
                 patch.object(runner.worker, "spawn", side_effect=dispatch_review), \
                 patch.object(runner.worker, "remote", side_effect=lambda request: runner.worker.local(request)):
