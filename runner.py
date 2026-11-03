@@ -3245,6 +3245,19 @@ def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict
     state = fix_state(0, published, reported)
     log("preempted_fix_reconciled", repo=repo, pr=number, key=job["key"], starting_head=head,
         remote_head=remote_head, published=published, outcome=reported or None, state=state)
+    if published and reported == "published" and outcome is not None:
+        markers = re.findall(r"<!-- omp-runner:fix (\{[^\n]*\}) -->", outcome["body"])
+        if len(markers) == 1:
+            try:
+                marker_data = json.loads(markers[0])
+            except ValueError:
+                marker_data = None
+            fix_commit = marker_data.get("commit") if isinstance(marker_data, dict) else None
+            if (isinstance(fix_commit, str) and re.fullmatch(r"[0-9a-f]{40}", fix_commit)
+                    and github(f"repos/{repo}/compare/{fix_commit}...{remote_head}")["status"]
+                    in {"ahead", "identical"}):
+                CLAIMS.put(f"fix:{repo}:{number}:{fix_commit}", {
+                    "branch": pr["head"]["ref"], "findings": finding_keys(job)}, skip_if_exists=True)
     if published:
         dispatch_fix_followup(job, comment, remote_head)
     commit = f"[`{remote_head[:7]}`](https://github.com/{repo}/commit/{remote_head})"
@@ -3261,7 +3274,8 @@ def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict
     elif published:
         detail = f"after it published {remote_head[:7]} but before it reported an outcome. autokas kept the fix"
     else:
-        detail = f"and the PR head changed to {remote_head[:7]} without its outcome. autokas"
+        detail = (f"and the PR head changed to {remote_head[:7]} without its outcome. "
+                  "autokas left the PR unchanged")
     finalize_fix_work(job, state, f"Modal preempted the fixer {detail} and didn't run omp again.")
     return True
 

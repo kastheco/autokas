@@ -1806,11 +1806,57 @@ class FixPublicationTests(unittest.TestCase):
         outcomes = []
         with self.assertRaises(KeyboardInterrupt):
             self.run_fix("exact", preempted=True, outcomes=outcomes)
+        outcomes[0]["body"] += '\n<!-- omp-runner:fix ' + json.dumps({
+            "commit": self.fix_head, "findings": runner.finding_keys(self.job)}) + ' -->'
         self.run_fix("exact", outcomes=outcomes)
         self.assertEqual(len(self.smoke.launches), 1)
         self.assertEqual(finalized, ["fixed"])
         self.assertEqual([job["head"] for job in self.dispatched], [self.fix_head])
         self.assertFalse(any(call.args[0] == "POST" for call in self.requests.call_args_list))
+        self.assertEqual(self.claims[f"fix:{REPO}:42:{self.fix_head}"], {
+            "branch": PR["head"]["ref"], "findings": runner.finding_keys(self.job)})
+
+    def test_preemption_after_restack_records_original_fix_commit(self):
+        self.finalizations()
+        self.queued_receipt()
+        outcomes = []
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fix("restack", preempted=True, outcomes=outcomes)
+        outcomes[0]["body"] += '\n<!-- omp-runner:fix ' + json.dumps({
+            "commit": self.fix_head, "findings": runner.finding_keys(self.job)}) + ' -->'
+        self.run_fix("exact", outcomes=outcomes)
+        self.assertNotEqual(self.fix_head, self.remote_head)
+        self.assertIn(f"fix:{REPO}:42:{self.fix_head}", self.claims)
+        self.assertNotIn(f"fix:{REPO}:42:{self.remote_head}", self.claims)
+        self.assertEqual([job["head"] for job in self.dispatched], [self.remote_head])
+
+    def test_recovery_does_not_record_unconfirmed_outcome_commits(self):
+        self.finalizations()
+        self.queued_receipt()
+        outcomes = []
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fix("exact", preempted=True, outcomes=outcomes)
+        interrupted_claims = copy.deepcopy(self.claims)
+        interrupted_job = copy.deepcopy(self.job)
+        marker = '<!-- omp-runner:fix ' + json.dumps({"commit": self.fix_head}) + ' -->'
+        unrelated = self.git(["rev-parse", "parent"], self.parent)
+        self.git(["fetch", str(self.parent), unrelated], self.origin)
+        cases = [
+            ("✅", ""), ("✅", marker + "\n" + marker),
+            ("✅", '<!-- omp-runner:fix {invalid} -->'),
+            ("✅", '<!-- omp-runner:fix {"commit":"short"} -->'),
+            ("✅", '<!-- omp-runner:fix {"commit":123} -->'),
+            ("✅", '<!-- omp-runner:fix ' + json.dumps({"commit": unrelated}) + ' -->'),
+            ("⛔", marker), ("🚫", marker), ("❓", marker), ("↩️", marker),
+        ]
+        for status, fix_marker in cases:
+            with self.subTest(status=status, marker=fix_marker):
+                self.claims = copy.deepcopy(interrupted_claims)
+                self.job = copy.deepcopy(interrupted_job)
+                outcomes[0]["body"] = f"### {status} outcome\n{runner.fix_outcome_marker(self.job)}\n{fix_marker}"
+                self.run_fix("exact", outcomes=outcomes)
+                self.assertFalse(any(key.startswith("fix:") for key in self.claims))
+                self.assertEqual([job["head"] for job in self.dispatched], [self.fix_head])
 
     def test_preemption_after_push_without_outcome_reports_instead_of_rerunning(self):
         finalized = self.finalizations()
