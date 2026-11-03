@@ -296,6 +296,8 @@ modal.Function.from_name(runner.CONFIG["app"], "worker").remote({
 
 after a confirmed fix push and a successful `published` outcome, the runner records publication before dispatching the follow-up review. if recording fails, no follow-up starts. follow-up review dispatch failures log `followup_dispatch_uncertain` with the job key and exception class. they don't skip fix finalization, so a recorded published fix stays fixed. failed dispatch is retained for automatic recovery on the next PR delivery, gate check or settlement. recovery retries dispatch idempotently; an already-started follow-up review isn't started again.
 
+the runner saves follow-up recovery state before dispatch claims the review key. it keeps that state until the review worker writes `review-started:<job key>`, including after interruption or a duplicate dispatch. both native and external-reviewer follow-ups write this start marker. recovery keeps an accepted but not-yet-started review recoverable, and the worker's start claim prevents duplicate review execution.
+
 
 ## provider accounts
 

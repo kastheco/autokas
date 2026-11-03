@@ -1290,7 +1290,8 @@ def recover_fix_work(repo: str, number: int) -> None:
                 if CLAIMS.get("review-started:" + job["key"], None) is None:
                     CLAIMS.pop(job["key"], None)
                     dispatch(job)
-                CLAIMS.pop(f"followup-review:{repo}:{number}:{job['key']}", None)
+                if CLAIMS.get("review-started:" + job["key"], None) is not None:
+                    CLAIMS.pop(f"followup-review:{repo}:{number}:{job['key']}", None)
             except Exception as error:
                 log("followup_dispatch_uncertain", key=job["key"], reason=type(error).__name__)
         elif record.get("launch") == "uncertain":
@@ -2461,7 +2462,7 @@ def pr_review(job: dict[str, Any]) -> None:
     if not allowed_repository(job.get("repo")):
         return
     repo, number = job["repo"], job["pr"]
-    if job.get("kind") == "fix":
+    if job.get("kind") in {"pull_request", "fix"}:
         call_id = modal.current_function_call_id()
         if not CLAIMS.put("review-started:" + job["key"], {"call": call_id}, skip_if_exists=True):
             previous = CLAIMS.get("review-started:" + job["key"], None)
@@ -3218,11 +3219,14 @@ def dispatch_fix_followup(job: dict[str, Any], comment: dict[str, Any], head: st
                 if job.get("reviewer") == "pr_agent" else
                 {"mode": "pr_review", "kind": "pull_request", "repo": repo, "pr": number,
                  "head": head, "key": f"{repo}:pr_review:{number}:{head}"})
+    receipt = f"followup-review:{repo}:{number}:{followup['key']}"
+    CLAIMS.put(receipt, {"job": followup, "followup": True})
+    retain_fix_reconciliation(repo, number)
     try:
         dispatch(followup)
+        if CLAIMS.get("review-started:" + followup["key"], None) is not None:
+            CLAIMS.pop(receipt, None)
     except Exception as error:
-        CLAIMS.put(f"followup-review:{repo}:{number}:{followup['key']}", {"job": followup, "followup": True})
-        retain_fix_reconciliation(repo, number)
         log("followup_dispatch_uncertain", key=job["key"], reason=type(error).__name__)
 
 
@@ -3257,14 +3261,12 @@ def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict
                     and github(f"repos/{repo}/compare/{fix_commit}...{remote_head}")["status"]
                     in {"ahead", "identical"}):
                 CLAIMS.put(f"fix:{repo}:{number}:{fix_commit}", {
-
-        detail = "after it reported its outcome. autokas finalized from that outcome"
-    elif published:
-        detail = f"after it published {remote_head[:7]} but before it reported an outcome. autokas kept the fix"
-    else:
-        detail = f"and the PR head changed to {remote_head[:7]} without its outcome. autokas kept the PR as is"
-    finalize_fix_work(job, state, f"Modal preempted the fixer {detail} and didn't run omp again.")
-
+                    "branch": pr["head"]["ref"], "findings": finding_keys(job)}, skip_if_exists=True)
+    if published:
+        dispatch_fix_followup(job, comment, remote_head)
+    commit = f"[`{remote_head[:7]}`](https://github.com/{repo}/commit/{remote_head})"
+    if outcome is None:
+        links = " · ".join(f"[{title}]({url})" for title, url in run_links(job).items())
         publish_missing_outcome(job, marker,
             "### ⛔ blocked · fixer was preempted "
             + ("after publishing" if published else "and the PR head changed")
