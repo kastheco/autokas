@@ -3257,12 +3257,14 @@ def recover_preempted_fix(job: dict[str, Any], pr: dict[str, Any], comment: dict
                     and github(f"repos/{repo}/compare/{fix_commit}...{remote_head}")["status"]
                     in {"ahead", "identical"}):
                 CLAIMS.put(f"fix:{repo}:{number}:{fix_commit}", {
-                    "branch": pr["head"]["ref"], "findings": finding_keys(job)}, skip_if_exists=True)
-    if published:
-        dispatch_fix_followup(job, comment, remote_head)
-    commit = f"[`{remote_head[:7]}`](https://github.com/{repo}/commit/{remote_head})"
-    if outcome is None:
-        links = " · ".join(f"[{title}]({url})" for title, url in run_links(job).items())
+
+        detail = "after it reported its outcome. autokas finalized from that outcome"
+    elif published:
+        detail = f"after it published {remote_head[:7]} but before it reported an outcome. autokas kept the fix"
+    else:
+        detail = f"and the PR head changed to {remote_head[:7]} without its outcome. autokas kept the PR as is"
+    finalize_fix_work(job, state, f"Modal preempted the fixer {detail} and didn't run omp again.")
+
         publish_missing_outcome(job, marker,
             "### ⛔ blocked · fixer was preempted "
             + ("after publishing" if published else "and the PR head changed")
