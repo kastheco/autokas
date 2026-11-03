@@ -298,6 +298,8 @@ after a confirmed fix push and a successful `published` outcome, the runner reco
 
 the runner saves follow-up recovery state before dispatch claims the review key. it keeps that state until the review worker writes `review-started:<job key>`, including after interruption or a duplicate dispatch. both native and external-reviewer follow-ups write this start marker. recovery keeps an accepted but not-yet-started review recoverable, and the worker's start claim prevents duplicate review execution.
 
+after the last pending fix finishes, the serialized worker removes its finalization receipt and retries retained follow-ups immediately. this also applies when preemption recovery finalizes a published fix. recovery runs directly in that worker rather than calling the review gate, which would wait on another call to the same serialized worker.
+
 
 ## provider accounts
 

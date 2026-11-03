@@ -1520,6 +1520,8 @@ def finish_fix_work(job: dict[str, Any], state: str) -> None:
     if not pending:
         reconcile_held_checks(repo, number, pr, state, finalizing, record.get("head"))
     CLAIMS.pop(finalizing, None)
+    if not pending:
+        recover_fix_work(repo, number)
 
 
 def finalize_fix_work(job: dict[str, Any], state: str, reason: str | None = None) -> None:
