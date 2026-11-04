@@ -205,6 +205,8 @@ export MODAL_ENVIRONMENT=main
 
 the setup script needs Python 3 with venv support. it installs test dependencies without `uv` or credentials, leaves an existing `config.json` alone, and skips installation when `requirements.txt` hasn't changed. the suite covers intake and identity boundaries, reviews, checks and the fix loop, team image selection, installation token isolation, linear intake, deploy reconciliation and docs follow-up merge safety, all without external calls. `smoke_helper.GitOmpSmoke` runs real git and captures the omp launch for smoke tests.
 
+`RunnerRevisionTests` remaps mounted runtime paths with a `Path` subclass so runner imports still evaluate path type annotations. its startup smoke imports the separately loaded entry module and mounted dependencies in a fresh subprocess without a checkout. planner tests need a Python build with `tarfile` extraction filters, such as Python 3.12, matching CI.
+
 ## stop it
 
 add `autokas:ignore` or `@autokas ignore` anywhere in a PR body to skip automatic fixes, clean-review acknowledgments and docs jobs when it merges. markers are case-insensitive. [`!kas` commands](#kas-commands) from users with write access still run.

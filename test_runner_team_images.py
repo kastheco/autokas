@@ -100,30 +100,26 @@ class RunnerRevisionTests(unittest.TestCase):
 
     @contextmanager
     def imported_runner(self, local: bool, environment: str | None = "main"):
-        def runtime_path(*parts):
-            path = Path(*parts)
-            return {Path("/opt/autokas/runner"): self.runtime,
-                    Path("/opt/autokas/skills"): self.skills,
-                    Path("/opt/autokas/settings.json"): self.settings,
-                    Path("/workspace/repo"): self.workspace}.get(path, path)
+        class RuntimePath(Path):
+            # Keep Path usable in annotations while redirecting mounted paths.
+            def __new__(cls, *parts):
+                path = Path(*parts)
+                return {Path("/opt/autokas/runner"): self.runtime,
+                        Path("/opt/autokas/skills"): self.skills,
+                        Path("/opt/autokas/settings.json"): self.settings,
+                        Path("/workspace/repo"): self.workspace}.get(path, path)
 
         name = "revision_local" if local else "revision_remote"
         original_import = builtins.__import__
 
         def runtime_import(module_name, globals=None, locals=None, fromlist=(), level=0):
             if module_name == "pathlib" and globals and globals.get("__name__") == name:
-                return SimpleNamespace(Path=runtime_path)
+                return SimpleNamespace(Path=RuntimePath)
             return original_import(module_name, globals, locals, fromlist, level)
 
         root = self.checkout if local else self.runtime
         spec = importlib.util.spec_from_file_location(name, root / "runner.py")
         module = importlib.util.module_from_spec(spec)
-        original_import = builtins.__import__
-
-        def runtime_import(import_name, globals=None, locals=None, fromlist=(), level=0):
-            if import_name == "pathlib" and globals and globals.get("__name__") == name:
-                return SimpleNamespace(Path=runtime_path)
-            return original_import(import_name, globals, locals, fromlist, level)
 
         with patch.dict(sys.modules, {name: module}), \
                 patch.dict(os.environ, {"MODAL_ENVIRONMENT": environment or ""}), \
@@ -169,13 +165,14 @@ from pathlib import PosixPath as Path
 from unittest.mock import patch
 import modal
 runtime = Path({str(self.runtime)!r})
-def runtime_path(*parts):
-    path = Path(*parts)
-    return runtime if path == Path('/opt/autokas/runner') else path
+class RuntimePath(Path):
+    def __new__(cls, *parts):
+        path = Path(*parts)
+        return runtime if path == Path('/opt/autokas/runner') else path
 original_import = builtins.__import__
 def runtime_import(name, globals=None, locals=None, fromlist=(), level=0):
     if name == 'pathlib' and globals and globals.get('__name__') == 'runner':
-        return SimpleNamespace(Path=runtime_path)
+        return SimpleNamespace(Path=RuntimePath)
     return original_import(name, globals, locals, fromlist, level)
 with patch('modal.is_local', return_value=False), patch('builtins.__import__', side_effect=runtime_import):
     import runner
