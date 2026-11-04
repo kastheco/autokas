@@ -405,6 +405,131 @@ class FixLifecycleTests(unittest.TestCase):
         proxy.assert_not_called()
         self.assertTrue(runner.pending_fix_jobs(REPO, 42))
 
+    def test_fix_check_summary_carries_the_stop_reason(self):
+        self.deliver()
+        job = self.jobs[-1]
+        with patch.object(runner.worker, "remote", side_effect=lambda request: runner.worker.local(request)):
+            runner.finalize_fix_work(job, "blocked", "omp exited with -9")
+        output = self.api.checks[501]["output"]
+        self.assertEqual((self.api.checks[501]["conclusion"], output["title"], output["summary"]),
+                         ("failure", "fix blocked", "omp exited with -9"))
+        self.assertEqual(self.api.pr["labels"], [{"name": "autokas:blocked"}])
+
+    def test_followup_preemption_after_claim_recovers_before_finalization(self):
+        self.deliver()
+        job = self.jobs[-1]
+        head = self.api.pr["head"]["sha"]
+        key = f"{REPO}:pr_review:42:{head}"
+        receipt = f"followup-review:{REPO}:42:{key}"
+        started = []
+
+        def start_review(review):
+            started.append(review["head"])
+            with patch.object(runner, "github", return_value={"state": "closed"}), \
+                    patch.object(runner.modal, "current_function_call_id", return_value="review-call"):
+                runner.pr_review.local(review)
+            return Mock(object_id="review-call")
+
+        with patch.object(runner.worker, "spawn", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.dispatch_fix_followup(job, {}, head)
+        self.assertEqual(self.store.get(key), "claimed")
+        self.assertIn(receipt, self.store.values)
+        with patch.object(runner.worker, "spawn", side_effect=start_review):
+            runner.recover_fix_work(REPO, 42)
+            runner.recover_fix_work(REPO, 42)
+        self.finalize(job)
+        self.assertEqual(started, [head])
+        self.assertNotIn(receipt, self.store.values)
+        self.assertEqual(self.api.checks[501]["conclusion"], "success")
+
+    def test_preempted_published_fix_retries_followup_after_finalization(self):
+        self.deliver()
+        job = self.jobs[-1]
+        old_head = self.api.pr["head"]["sha"]
+        head = "b" * 40
+        self.api.pr["head"]["sha"] = head
+        key = f"{REPO}:pr_review:42:{head}"
+        receipt = f"followup-review:{REPO}:42:{key}"
+        started = []
+        github = runner.github
+
+        def published(path):
+            if path.startswith(f"repos/{REPO}/compare/"):
+                return {"status": "ahead"}
+            return github(path)
+
+        def start_review(review):
+            self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+            started.append(review["head"])
+            with patch.object(runner, "github", return_value={"state": "closed"}), \
+                    patch.object(runner.modal, "current_function_call_id", return_value="review-call"):
+                runner.pr_review.local(review)
+            return Mock(object_id="review-call")
+
+        attempts = [False]
+
+        def dispatch_review(review):
+            if not attempts[0]:
+                attempts[0] = True
+                raise RuntimeError("dispatch unavailable")
+            return start_review(review)
+
+        outcome = {"body": '### ✅ fixed\n<!-- omp-runner:fix ' + json.dumps({"commit": head}) + ' -->'}
+        with patch.object(runner, "delivered_outcome", return_value=(outcome, None)), \
+                patch.object(runner, "github", side_effect=published), \
+                patch.object(runner.worker, "spawn", side_effect=dispatch_review), \
+                patch.object(runner.worker, "remote", side_effect=lambda request: runner.worker.local(request)):
+            self.assertTrue(runner.recover_preempted_fix(job, self.api.pr, {}, {"head": old_head}))
+        self.assertEqual(started, [head])
+        self.assertNotIn(receipt, self.store.values)
+        self.assertFalse(runner.pending_fix_jobs(REPO, 42))
+        self.assertEqual(self.api.checks[501]["conclusion"], "success")
+
+    def test_retained_followup_waits_for_last_pending_fix(self):
+        self.deliver()
+        first = self.jobs[-1]
+        last = {**copy.deepcopy(first), "key": "second-review",
+                "fix_receipt": f"pending-fix:{REPO}:42:second-review"}
+        self.store.put(last["fix_receipt"], {"head": self.api.pr["head"]["sha"], "job": last})
+        head = self.api.pr["head"]["sha"]
+        key = f"{REPO}:pr_review:42:{head}"
+        receipt = f"followup-review:{REPO}:42:{key}"
+        with patch.object(runner.worker, "spawn", side_effect=RuntimeError("dispatch unavailable")):
+            runner.dispatch_fix_followup(first, {}, head)
+        reviews = []
+
+        def start_review(review):
+            reviews.append(review["head"])
+            self.store.put("review-started:" + review["key"], {"call": "review-call"})
+            return Mock(object_id="review-call")
+
+        with patch.object(runner.worker, "spawn", side_effect=start_review):
+            self.finalize(first)
+            self.assertEqual(reviews, [])
+            self.assertIn(receipt, self.store.values)
+            self.finalize(last)
+        self.assertEqual(reviews, [head])
+        self.assertNotIn(receipt, self.store.values)
+
+    def test_followup_duplicate_keeps_recovery_until_worker_starts(self):
+        job = {"repo": REPO, "pr": 42, "key": "fixer"}
+        head = self.api.pr["head"]["sha"]
+        key = f"{REPO}:pr_review:42:{head}"
+        receipt = f"followup-review:{REPO}:42:{key}"
+        self.store.put(key, "claimed")
+        runner.dispatch_fix_followup(job, {}, head)
+        self.assertIn(receipt, self.store.values)
+        with patch.object(runner.worker, "spawn", return_value=Mock(object_id="queued")):
+            runner.recover_fix_work(REPO, 42)
+        self.assertIn(receipt, self.store.values)
+        self.store.put("review-started:" + key, {"call": "queued"})
+        with patch.object(runner.worker, "spawn") as spawn:
+            runner.recover_fix_work(REPO, 42)
+        spawn.assert_not_called()
+        self.assertNotIn(receipt, self.store.values)
+
+
 
 class WebhookIntakeTests(unittest.IsolatedAsyncioTestCase):
     async def test_webhook_has_no_github_calls_and_failed_spawn_can_be_redelivered(self):
